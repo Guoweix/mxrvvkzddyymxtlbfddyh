@@ -2,3 +2,9 @@ rvv_sched_cost/rvv_sched_cost
 rvv_sched_cost/rvv_sched_cost.bpf.o
 rvv_sched_cost/vmlinux.btf
 rvv_sched_cost/results
+scx_llm_pin/build.log
+scx_llm_pin/scx_llm_pin
+scx_llm_pin/vmlinux.btf
+scx_llm_pin/scx_llm_pin.o
+scx_llm_pin/scx_llm_pin.bpf.o
+scx_llm_pin/llm_load.sh
