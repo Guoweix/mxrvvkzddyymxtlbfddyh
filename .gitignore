@@ -1,0 +1,3 @@
+rvv_sched_cost/rvv_sched_cost
+rvv_sched_cost/rvv_sched_cost.bpf.o
+rvv_sched_cost/vmlinux.btf
