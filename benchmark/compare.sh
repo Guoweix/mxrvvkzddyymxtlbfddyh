@@ -24,8 +24,8 @@ echo "测试2: $DIR2"
 echo ""
 
 # 提取整体吞吐量
-THROUGHPUT1=$(grep "Overall Throughput" "$DIR1/report.txt" | awk '{print $3}')
-THROUGHPUT2=$(grep "Overall Throughput" "$DIR2/report.txt" | awk '{print $3}')
+THROUGHPUT1=$(awk -F': ' '/总吞吐量/ {print $2; exit} /Overall Throughput/ {print $2; exit}' "$DIR1/report.txt" | awk '{print $1}')
+THROUGHPUT2=$(awk -F': ' '/总吞吐量/ {print $2; exit} /Overall Throughput/ {print $2; exit}' "$DIR2/report.txt" | awk '{print $1}')
 
 echo "整体吞吐量:"
 echo "  测试1: $THROUGHPUT1 tok/s"
@@ -47,16 +47,25 @@ for task in 1 2 3 4; do
     echo "Task $task:"
 
     # 提取首字延迟
-    TTFT1=$(grep "First Token Time" "$DIR1/task_$task.summary" | awk '{print $4}')
-    TTFT2=$(grep "First Token Time" "$DIR2/task_$task.summary" | awk '{print $4}')
+    summary1="$DIR1/task${task}.summary"
+    summary2="$DIR2/task${task}.summary"
+    if [ ! -f "$summary1" ]; then
+        summary1="$DIR1/task_${task}.summary"
+    fi
+    if [ ! -f "$summary2" ]; then
+        summary2="$DIR2/task_${task}.summary"
+    fi
+
+    TTFT1=$(awk -F': ' '/First Token Time/ {print $2; exit} /首字/ {print $2; exit}' "$summary1" 2>/dev/null)
+    TTFT2=$(awk -F': ' '/First Token Time/ {print $2; exit} /首字/ {print $2; exit}' "$summary2" 2>/dev/null)
 
     echo "  首字延迟:"
     echo "    测试1: $TTFT1"
     echo "    测试2: $TTFT2"
 
     # 提取平均tok/s
-    TOKS1=$(grep "Average tok/s" "$DIR1/task_$task.summary" | awk '{print $4}')
-    TOKS2=$(grep "Average tok/s" "$DIR2/task_$task.summary" | awk '{print $4}')
+    TOKS1=$(awk -F': ' '/Average tok\/s/ {print $2; exit} /平均.*tok\/s/ {print $2; exit}' "$summary1" 2>/dev/null)
+    TOKS2=$(awk -F': ' '/Average tok\/s/ {print $2; exit} /平均.*tok\/s/ {print $2; exit}' "$summary2" 2>/dev/null)
 
     echo "  平均tok/s:"
     echo "    测试1: $TOKS1"

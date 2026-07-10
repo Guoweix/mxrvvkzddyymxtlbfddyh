@@ -18,7 +18,7 @@ files=(
     "$SCRIPT_DIR/benchmark.sh"
     "$SCRIPT_DIR/generate_report.py"
     "$SCRIPT_DIR/compare.sh"
-    "$SCRIPT_DIR/BENCHMARK_SPEC.md"
+    "$SCRIPT_DIR/README.md"
 )
 
 for file in "${files[@]}"; do

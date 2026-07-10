@@ -8,3 +8,10 @@ scx_llm_pin/vmlinux.btf
 scx_llm_pin/scx_llm_pin.o
 scx_llm_pin/scx_llm_pin.bpf.o
 scx_llm_pin/llm_load.sh
+scx_rvv_exclusive/scx_rvv_exclusive
+scx_rvv_exclusive/scx_rvv_exclusive.o
+scx_rvv_exclusive/scx_rvv_exclusive.bpf.o
+benchmark/results
+benchmark/logs
+benchmark/__pycache__
+
