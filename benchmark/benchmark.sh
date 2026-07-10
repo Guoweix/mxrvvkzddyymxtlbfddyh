@@ -4,7 +4,7 @@
 # ========================================
 # 功能：
 # - 启动远程llama-server
-# - 并发4个任务测试5分钟
+# - 按配置扫描并发档位和重复轮数
 # - 记录首字延迟（TTFT）
 # - 记录每个任务的tok/s
 # - 生成详细的测试报告
@@ -17,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
 SCX_VECTOR_SLICE_OVERRIDE_MS=""
+SCX_DIRTY_THRESHOLD_OVERRIDE=""
 
 # ========================================
 # 工具函数
@@ -78,6 +79,16 @@ require_positive_int() {
 
     if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
         log_error "$name 必须是正整数，当前值: $value"
+        exit 1
+    fi
+}
+
+require_concurrency_list() {
+    local name=$1
+    local value=$2
+
+    if ! [[ "$value" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+        log_error "$name 必须是逗号分隔的正整数列表，当前值: $value"
         exit 1
     fi
 }
@@ -786,7 +797,7 @@ run_single_task() {
     log_info "[Task $task_id] 开始测试..."
 
     # 创建CSV文件并写入头部
-    echo "timestamp,request_num,tokens,generation_ms,total_ms,toks_per_sec" > "$output_file.csv"
+    echo "timestamp,request_num,tokens,generation_ms,ttft_ms,total_ms,toks_per_sec" > "$output_file.csv"
 
     # 记录开始时间
     local test_end_time=$(($(date +%s) + TEST_DURATION))
@@ -795,7 +806,7 @@ run_single_task() {
         local req_start=$(date +%s.%N)
 
         # 发送请求并记录响应
-        local response=$(curl -s "http://$REMOTE_IP:$REMOTE_PORT/completion" \
+        local response=$(curl -s --max-time "${REQUEST_TIMEOUT_SEC:-180}" "http://$REMOTE_IP:$REMOTE_PORT/completion" \
             -H "Content-Type: application/json" \
             -d "{
                 \"prompt\": \"$prompt\",
@@ -810,13 +821,13 @@ run_single_task() {
         if echo "$response" | jq -e '.tokens_predicted' > /dev/null 2>&1; then
             local tokens=$(echo "$response" | jq -r '.tokens_predicted // 0')
             local generation_time=$(echo "$response" | jq -r '.timings.predicted_ms // 0')
+            local ttft=$(echo "$response" | jq -r '.timings.prompt_ms // 0')
 
             total_tokens=$((total_tokens + tokens))
             request_count=$((request_count + 1))
 
             # 记录首字延迟（第一个请求）
             if [ -z "$first_token_time" ]; then
-                local ttft=$(echo "$response" | jq -r '.timings.prompt_ms // 0')
                 first_token_time=$ttft
                 log_info "[Task $task_id] 首字延迟: ${ttft}ms"
             fi
@@ -825,8 +836,8 @@ run_single_task() {
             local toks_per_sec=$(echo "scale=2; if ($generation_time > 0) $tokens * 1000 / $generation_time else 0" | bc)
 
             # 记录这次请求
-            local request_time=$(echo "$req_end - $req_start" | bc)
-            echo "$(date +%s.%N),$request_count,$tokens,$generation_time,$request_time,$toks_per_sec" >> "$output_file.csv"
+            local request_time_ms=$(echo "scale=3; ($req_end - $req_start) * 1000" | bc)
+            echo "$(date +%s.%N),$request_count,$tokens,$generation_time,$ttft,$request_time_ms,$toks_per_sec" >> "$output_file.csv"
 
         else
             log_warn "[Task $task_id] 请求失败: $response"
@@ -858,14 +869,11 @@ EOF
 # 主测试流程
 # ========================================
 
-run_benchmark() {
+run_benchmark_once() {
+    local result_dir=$1
+
     log_header "开始基准测试"
 
-    # 创建输出目录
-    local timestamp=$(date +%Y%m%d_%H%M%S)
-    local strategy_slug
-    strategy_slug=$(echo "$BENCHMARK_STRATEGY" | tr -c 'A-Za-z0-9_.-' '_')
-    local result_dir="$RESULTS_DIR/${timestamp}_${strategy_slug}"
     CURRENT_RESULT_DIR="$result_dir"
     mkdir -p "$result_dir"
     mkdir -p "$LOG_DIR"
@@ -882,8 +890,12 @@ LLM Threads: $LLM_THREADS
 Parallel Slots: $LLM_PARALLEL
 Context Length: $LLM_CONTEXT
 Test Duration: ${TEST_DURATION}s
+Benchmark Loops: $BENCHMARK_LOOPS
+Concurrency Levels: $CONCURRENCY_LEVELS
+Current Loop: ${CURRENT_LOOP_INDEX:-1}
 Concurrent Tasks: $CONCURRENT_TASKS
 Tokens per Request: $TOKENS_PER_REQUEST
+Request Timeout: ${REQUEST_TIMEOUT_SEC}s
 Restart LLM: $RESTART_LLM
 Benchmark Strategy: $BENCHMARK_STRATEGY
 SCX Enabled: ${SCX_ENABLED:-0}
@@ -982,11 +994,80 @@ EOF
 # 报告生成
 # ========================================
 
+write_result_metrics() {
+    local result_dir=$1
+    local loop_index=${CURRENT_LOOP_INDEX:-1}
+
+    python3 - "$result_dir" "$BENCHMARK_STRATEGY" "$CONCURRENT_TASKS" "$loop_index" > "$result_dir/metrics.env" <<'PY'
+import csv
+import math
+import sys
+from pathlib import Path
+
+result_dir = Path(sys.argv[1])
+strategy = sys.argv[2]
+concurrency = int(sys.argv[3])
+loop_index = int(sys.argv[4])
+
+total_tokens = 0
+total_requests = 0
+ttfts = []
+durations = []
+
+for csv_file in sorted(result_dir.glob("task*.csv")):
+    with csv_file.open(newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                total_tokens += int(float(row.get("tokens") or 0))
+                total_requests += 1
+            except ValueError:
+                pass
+            raw_ttft = row.get("ttft_ms")
+            if raw_ttft not in (None, "", "null"):
+                try:
+                    ttfts.append(float(raw_ttft))
+                except ValueError:
+                    pass
+
+for summary_file in sorted(result_dir.glob("task*.summary")):
+    for line in summary_file.read_text(errors="ignore").splitlines():
+        if line.startswith("Duration:"):
+            raw = line.split(":", 1)[1].strip().rstrip("s")
+            try:
+                durations.append(float(raw))
+            except ValueError:
+                pass
+
+duration = max(durations) if durations else 0.0
+tps = (total_tokens / duration) if duration > 0 else 0.0
+avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else 0.0
+if ttfts:
+    ordered = sorted(ttfts)
+    idx = max(0, math.ceil(0.95 * len(ordered)) - 1)
+    p95_ttft = ordered[idx]
+else:
+    p95_ttft = 0.0
+
+print(f"strategy={strategy}")
+print(f"concurrency={concurrency}")
+print(f"loop={loop_index}")
+print(f"duration_sec={duration:.3f}")
+print(f"total_requests={total_requests}")
+print(f"total_tokens={total_tokens}")
+print(f"tps={tps:.3f}")
+print(f"avg_ttft_ms={avg_ttft:.3f}")
+print(f"p95_ttft_ms={p95_ttft:.3f}")
+print(f"ttft_samples={len(ttfts)}")
+PY
+}
+
 generate_report() {
     local result_dir=$1
     local report_file="$result_dir/report.txt"
 
     log_info "生成测试报告..."
+    write_result_metrics "$result_dir"
 
     {
         echo "========================================"
@@ -1046,40 +1127,20 @@ generate_report() {
         echo "========================================"
         echo ""
 
-        # 计算总吞吐量
-        local total_toks=0
-        local total_reqs=0
-        local total_ttft=0
-        local ttft_count=0
-
-        for i in $(seq 1 "$CONCURRENT_TASKS"); do
-            if [ -f "$result_dir/task${i}.summary" ]; then
-                local toks=$(grep "Average tok/s" "$result_dir/task${i}.summary" | awk '{print $3}')
-                local reqs=$(grep "Total Requests" "$result_dir/task${i}.summary" | awk '{print $3}')
-                local ttft=$(grep "First Token Time" "$result_dir/task${i}.summary" | awk '{print $4}' | sed 's/ms//')
-
-                toks=${toks:-0}
-                reqs=${reqs:-0}
-                total_toks=$(echo "$total_toks + $toks" | bc)
-                total_reqs=$((total_reqs + reqs))
-                if [ -n "$ttft" ]; then
-                    total_ttft=$(echo "$total_ttft + $ttft" | bc)
-                    ttft_count=$((ttft_count + 1))
-                fi
-            fi
-        done
-
-        local avg_ttft="N/A"
-        if [ "$ttft_count" -gt 0 ]; then
-            avg_ttft=$(echo "scale=2; $total_ttft / $ttft_count" | bc)
-        fi
-
-        echo "总吞吐量: $total_toks tok/s"
-        echo "总请求数: $total_reqs"
-        if [ "$avg_ttft" = "N/A" ]; then
-            echo "平均首字延迟: N/A"
+        if [ -f "$result_dir/metrics.env" ]; then
+            # shellcheck disable=SC1091
+            source "$result_dir/metrics.env"
+            echo "TPS: ${tps} tok/s"
+            echo "总请求数: $total_requests"
+            echo "总Token数: $total_tokens"
+            echo "统计时长: ${duration_sec}s"
+            echo "平均TTFT: ${avg_ttft_ms}ms"
+            echo "p95TTFT: ${p95_ttft_ms}ms"
+            echo "TTFT样本数: $ttft_samples"
         else
-            echo "平均首字延迟: ${avg_ttft}ms"
+            echo "TPS: N/A"
+            echo "平均TTFT: N/A"
+            echo "p95TTFT: N/A"
         fi
         echo ""
 
@@ -1116,6 +1177,184 @@ generate_report() {
     cat "$report_file"
 }
 
+generate_suite_report() {
+    local suite_dir=$1
+
+    log_info "生成完整测试汇总..."
+    python3 - "$suite_dir" > "$suite_dir/summary.txt" <<'PY'
+import csv
+import math
+import sys
+from pathlib import Path
+
+suite_dir = Path(sys.argv[1])
+
+def read_env(path):
+    data = {}
+    for line in path.read_text(errors="ignore").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            data[key] = value
+    return data
+
+def p95(values):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = max(0, math.ceil(0.95 * len(ordered)) - 1)
+    return ordered[idx]
+
+def read_ttfts(run_dir):
+    values = []
+    for csv_file in sorted(run_dir.glob("task*.csv")):
+        with csv_file.open(newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                raw = row.get("ttft_ms")
+                if raw not in (None, "", "null"):
+                    try:
+                        values.append(float(raw))
+                    except ValueError:
+                        pass
+    return values
+
+runs = []
+for metrics_file in sorted(suite_dir.glob("*/metrics.env")):
+    run_dir = metrics_file.parent
+    data = read_env(metrics_file)
+    data["result_dir"] = run_dir.name
+    data["ttfts"] = read_ttfts(run_dir)
+    runs.append(data)
+
+summary_csv = suite_dir / "summary.csv"
+with summary_csv.open("w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "concurrency", "loop", "tps", "avg_ttft_ms", "p95_ttft_ms",
+        "total_requests", "total_tokens", "duration_sec", "result_dir"
+    ])
+    for run in runs:
+        writer.writerow([
+            run.get("concurrency", ""),
+            run.get("loop", ""),
+            run.get("tps", ""),
+            run.get("avg_ttft_ms", ""),
+            run.get("p95_ttft_ms", ""),
+            run.get("total_requests", ""),
+            run.get("total_tokens", ""),
+            run.get("duration_sec", ""),
+            run.get("result_dir", ""),
+        ])
+
+groups = {}
+for run in runs:
+    groups.setdefault(run.get("concurrency", "unknown"), []).append(run)
+
+print("========================================")
+print("RVV LLM Benchmark Suite Summary")
+print("========================================")
+print("")
+print(f"Suite: {suite_dir}")
+print(f"Runs: {len(runs)}")
+print(f"CSV: summary.csv")
+print("")
+print("Per-concurrency aggregate:")
+print("")
+print("Concurrency | Runs | TPS(avg) | TPS(total) | TTFT(avg ms) | p95TTFT(ms) | Requests")
+print("--- | ---: | ---: | ---: | ---: | ---: | ---:")
+
+for concurrency in sorted(groups, key=lambda x: int(x) if x.isdigit() else x):
+    items = groups[concurrency]
+    tps_values = [float(x.get("tps", 0) or 0) for x in items]
+    total_tokens = sum(int(float(x.get("total_tokens", 0) or 0)) for x in items)
+    total_duration = sum(float(x.get("duration_sec", 0) or 0) for x in items)
+    total_requests = sum(int(float(x.get("total_requests", 0) or 0)) for x in items)
+    all_ttfts = []
+    for item in items:
+        all_ttfts.extend(item.get("ttfts", []))
+    avg_tps = sum(tps_values) / len(tps_values) if tps_values else 0.0
+    total_tps = total_tokens / total_duration if total_duration > 0 else 0.0
+    avg_ttft = sum(all_ttfts) / len(all_ttfts) if all_ttfts else 0.0
+    print(
+        f"{concurrency} | {len(items)} | {avg_tps:.3f} | {total_tps:.3f} | "
+        f"{avg_ttft:.3f} | {p95(all_ttfts):.3f} | {total_requests}"
+    )
+
+print("")
+print("Per-run details:")
+print("")
+for run in runs:
+    print(
+        f"- c={run.get('concurrency')} loop={run.get('loop')}: "
+        f"TPS={float(run.get('tps', 0) or 0):.3f}, "
+        f"TTFT={float(run.get('avg_ttft_ms', 0) or 0):.3f}ms, "
+        f"p95TTFT={float(run.get('p95_ttft_ms', 0) or 0):.3f}ms, "
+        f"requests={run.get('total_requests')}, dir={run.get('result_dir')}"
+    )
+PY
+
+    cat "$suite_dir/summary.txt"
+}
+
+run_benchmark_suite() {
+    log_header "开始完整测试套件"
+
+    local timestamp
+    local strategy_slug
+    local suite_dir
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    strategy_slug=$(printf '%s' "$BENCHMARK_STRATEGY" | tr -c 'A-Za-z0-9_.-' '_')
+    suite_dir="$RESULTS_DIR/${timestamp}_${strategy_slug}_suite"
+    mkdir -p "$suite_dir" "$LOG_DIR"
+
+    cat > "$suite_dir/suite_config.txt" << EOF
+Benchmark Suite Configuration
+=============================
+Date: $(date)
+Strategy: $BENCHMARK_STRATEGY
+Duration per run: ${TEST_DURATION}s
+Benchmark loops: $BENCHMARK_LOOPS
+Concurrency levels: $CONCURRENCY_LEVELS
+Tokens per request: $TOKENS_PER_REQUEST
+Request timeout: ${REQUEST_TIMEOUT_SEC}s
+RVV Trace: $RVV_TRACE
+EOF
+
+    log_info "套件目录: $suite_dir"
+    log_info "并发档位: $CONCURRENCY_LEVELS; 每档轮数: $BENCHMARK_LOOPS; 单轮窗口: ${TEST_DURATION}s"
+
+    local old_ifs=$IFS
+    local levels=()
+    IFS=',' read -r -a levels <<< "$CONCURRENCY_LEVELS"
+    IFS=$old_ifs
+
+    local concurrency
+    local loop
+    for concurrency in "${levels[@]}"; do
+        CONCURRENT_TASKS="$concurrency"
+        LLM_PARALLEL="$concurrency"
+        if [ "${PRE_BENCH_WARMUP_REQUESTS_AUTO:-0}" = "1" ]; then
+            PRE_BENCH_WARMUP_REQUESTS="$CONCURRENT_TASKS"
+        fi
+
+        for loop in $(seq 1 "$BENCHMARK_LOOPS"); do
+            CURRENT_LOOP_INDEX="$loop"
+            local run_dir="$suite_dir/c${concurrency}_loop${loop}"
+
+            log_header "并发 $concurrency / 轮次 $loop/$BENCHMARK_LOOPS"
+            start_llm_server
+            run_benchmark_once "$run_dir"
+        done
+    done
+
+    generate_suite_report "$suite_dir"
+    ln -sfn "$suite_dir" "$RESULTS_DIR/latest"
+
+    log_header "测试套件完成"
+    log_info "汇总报告: cat $suite_dir/summary.txt"
+    log_info "汇总CSV: $suite_dir/summary.csv"
+}
+
 # ========================================
 # 清理函数
 # ========================================
@@ -1146,6 +1385,19 @@ main() {
                 ;;
             --tasks)
                 CONCURRENT_TASKS="$2"
+                CONCURRENCY_LEVELS="$2"
+                shift 2
+                ;;
+            --concurrency-levels)
+                CONCURRENCY_LEVELS="$2"
+                shift 2
+                ;;
+            --loops)
+                BENCHMARK_LOOPS="$2"
+                shift 2
+                ;;
+            --tokens)
+                TOKENS_PER_REQUEST="$2"
                 shift 2
                 ;;
             --warmup-requests)
@@ -1189,13 +1441,16 @@ main() {
                 echo "用法: $0 [选项]"
                 echo ""
                 echo "选项:"
-                echo "  --duration N   测试时长（秒，默认300）"
-                echo "  --tasks N      并发任务数（默认4）"
+                echo "  --duration N   单轮测试窗口（秒，默认300）"
+                echo "  --tasks N      只测试单个并发数（兼容旧参数）"
+                echo "  --concurrency-levels L  并发档位列表（默认2,4,8）"
+                echo "  --loops N      每个并发档位重复轮数（默认1）"
+                echo "  --tokens N     每个请求生成token数（默认100）"
                 echo "  --threads N    LLM计算线程数（默认8）"
                 echo "  --strategy S   测试策略（默认cfs，使用 --list-strategies 查看）"
                 echo "  --vector-slice-ms N  覆盖 RVV dirty vector 时间片（毫秒）"
                 echo "  --dirty-threshold N  覆盖 RVV dirty 命中阈值"
-                echo "  --warmup-requests N  正式测试前预热请求数（默认跟随 --tasks）"
+                echo "  --warmup-requests N  正式测试前预热请求数（默认跟随当前并发档位）"
                 echo "  --warmup-tokens N    每个预热请求生成token数（默认1）"
                 echo "  --warmup-retries N   预热失败重试次数（默认3）"
                 echo "  --no-warmup          关闭正式测试前预热"
@@ -1219,11 +1474,15 @@ main() {
 
     require_positive_int "TEST_DURATION" "$TEST_DURATION"
     require_positive_int "CONCURRENT_TASKS" "$CONCURRENT_TASKS"
+    require_positive_int "BENCHMARK_LOOPS" "$BENCHMARK_LOOPS"
+    require_positive_int "TOKENS_PER_REQUEST" "$TOKENS_PER_REQUEST"
+    require_positive_int "REQUEST_TIMEOUT_SEC" "$REQUEST_TIMEOUT_SEC"
     require_positive_int "LLM_THREADS" "$LLM_THREADS"
     require_positive_int "PRE_BENCH_WARMUP_REQUESTS" "$PRE_BENCH_WARMUP_REQUESTS"
     require_positive_int "PRE_BENCH_WARMUP_TOKENS" "$PRE_BENCH_WARMUP_TOKENS"
     require_positive_int "PRE_BENCH_WARMUP_RETRIES" "$PRE_BENCH_WARMUP_RETRIES"
     require_positive_int "PRE_BENCH_WARMUP_TIMEOUT" "$PRE_BENCH_WARMUP_TIMEOUT"
+    require_concurrency_list "CONCURRENCY_LEVELS" "$CONCURRENCY_LEVELS"
 
     apply_strategy_preset
     if [ -n "$SCX_VECTOR_SLICE_OVERRIDE_MS" ]; then
@@ -1243,8 +1502,7 @@ main() {
 
     # 执行测试流程
     check_requirements
-    start_llm_server
-    run_benchmark
+    run_benchmark_suite
 
     log_header "全部完成！"
 }

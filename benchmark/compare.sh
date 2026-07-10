@@ -24,8 +24,8 @@ echo "测试2: $DIR2"
 echo ""
 
 # 提取整体吞吐量
-THROUGHPUT1=$(awk -F': ' '/总吞吐量/ {print $2; exit} /Overall Throughput/ {print $2; exit}' "$DIR1/report.txt" | awk '{print $1}')
-THROUGHPUT2=$(awk -F': ' '/总吞吐量/ {print $2; exit} /Overall Throughput/ {print $2; exit}' "$DIR2/report.txt" | awk '{print $1}')
+THROUGHPUT1=$(awk -F': ' '/^TPS/ {print $2; exit} /总吞吐量/ {print $2; exit} /Overall Throughput/ {print $2; exit}' "$DIR1/report.txt" | awk '{print $1}')
+THROUGHPUT2=$(awk -F': ' '/^TPS/ {print $2; exit} /总吞吐量/ {print $2; exit} /Overall Throughput/ {print $2; exit}' "$DIR2/report.txt" | awk '{print $1}')
 
 echo "整体吞吐量:"
 echo "  测试1: $THROUGHPUT1 tok/s"

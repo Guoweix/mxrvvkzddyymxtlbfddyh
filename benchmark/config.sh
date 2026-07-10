@@ -63,9 +63,12 @@ export RVV_REMOTE_DIR="${RVV_REMOTE_DIR:-/tmp/rvv_sched_cost}"
 # ========================================
 # 测试配置
 # ========================================
-export TEST_DURATION=300      # 测试时长（秒，5分钟）
-export CONCURRENT_TASKS=4     # 并发任务数
-export TOKENS_PER_REQUEST=100 # 每个请求生成的token数
+export TEST_DURATION="${TEST_DURATION:-300}"       # 单轮测试窗口（秒，默认5分钟）
+export BENCHMARK_LOOPS="${BENCHMARK_LOOPS:-1}"     # 每个并发档位重复轮数
+export CONCURRENCY_LEVELS="${CONCURRENCY_LEVELS:-2,4,8}" # 逗号分隔，例如 2,4,8
+export CONCURRENT_TASKS="${CONCURRENT_TASKS:-4}"   # 兼容旧参数；suite 会按 CONCURRENCY_LEVELS 覆盖
+export TOKENS_PER_REQUEST="${TOKENS_PER_REQUEST:-100}" # 每个请求生成的token数
+export REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-180}" # 单请求curl超时
 
 # ========================================
 # 正式测试前预热配置

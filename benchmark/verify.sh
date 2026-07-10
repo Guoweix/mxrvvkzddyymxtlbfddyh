@@ -57,9 +57,10 @@ echo "[3/6] 检查配置..."
 source "$SCRIPT_DIR/config.sh"
 echo "  IP地址: $REMOTE_IP"
 echo "  计算线程: $LLM_THREADS"
-echo "  并行槽位: $LLM_PARALLEL"
-echo "  测试时长: ${TEST_DURATION}秒"
-echo "  并发任务: $CONCURRENT_TASKS"
+echo "  默认并发档位: $CONCURRENCY_LEVELS"
+echo "  每档轮数: $BENCHMARK_LOOPS"
+echo "  单轮测试窗口: ${TEST_DURATION}秒"
+echo "  每请求tokens: $TOKENS_PER_REQUEST"
 
 # 4. 检查脚本可执行
 echo ""

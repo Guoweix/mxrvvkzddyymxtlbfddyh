@@ -13,8 +13,12 @@ from collections import defaultdict
 
 def load_task_data(result_dir, task_id):
     """加载单个任务的数据"""
-    csv_file = result_dir / f"task_{task_id}.csv"
-    summary_file = result_dir / f"task_{task_id}.summary"
+    csv_file = result_dir / f"task{task_id}.csv"
+    summary_file = result_dir / f"task{task_id}.summary"
+    if not csv_file.exists():
+        csv_file = result_dir / f"task_{task_id}.csv"
+    if not summary_file.exists():
+        summary_file = result_dir / f"task_{task_id}.summary"
 
     data = {
         'task_id': task_id,

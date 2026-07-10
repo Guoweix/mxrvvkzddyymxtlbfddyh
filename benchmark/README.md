@@ -2,7 +2,7 @@
 
 `experiments/benchmark` 是当前项目的 LLM 推理基准测试入口，用于比较 CFS、sched_ext 调度策略和 RVV dirty 识别策略对 llama.cpp 推理性能的影响。
 
-测试脚本会自动重启板端 `llama-server`，完成正式测试前预热，启动可选 sched_ext 调度器和 RVV 上下文切换观测工具，并生成每轮测试结果。
+测试脚本会自动重启板端 `llama-server`，完成正式测试前预热，启动可选 sched_ext 调度器和 RVV 上下文切换观测工具。当前默认套件：每个并发档位单轮 300 秒，按 `2,4,8` 并发请求分别运行，最终汇总 TPS、平均 TTFT 和 p95 TTFT。
 
 ## 目录结构
 
@@ -13,7 +13,7 @@ experiments/benchmark/
 ├── generate_report.py    # 报告生成器
 ├── compare.sh            # 两个结果目录的简单对比
 ├── verify.sh             # 本地依赖、配置和连通性检查
-├── run_test.sh           # 默认 300s 测试包装脚本
+├── run_test.sh           # 默认测试套件包装脚本
 ├── quick_test.sh         # 30s 快速测试
 ├── smoke_test.sh         # 已启动 server 的短请求 smoke test
 ├── test_single.sh        # 单并发诊断请求
@@ -64,17 +64,17 @@ cd /home/gwx/Workdir/riscv-rvv/experiments/benchmark
 
 ## 快速开始
 
-运行 CFS baseline：
+运行默认 CFS baseline 套件：
 
 ```bash
 cd /home/gwx/Workdir/riscv-rvv/experiments/benchmark
 ./benchmark.sh --strategy cfs
 ```
 
-运行 30 秒快速测试：
+运行单个并发档位的 30 秒快速测试：
 
 ```bash
-./benchmark.sh --strategy cfs --duration 30
+./benchmark.sh --strategy cfs --duration 30 --tasks 2 --tokens 16
 ```
 
 查看可用策略：
@@ -96,6 +96,8 @@ cd /home/gwx/Workdir/riscv-rvv/experiments/benchmark
 ```bash
 RVV_TRACE=1 ./benchmark.sh \
   --strategy rvv_dirty_all \
+  --concurrency-levels 2,4,8 \
+  --loops 3 \
   --vector-slice-ms 50 \
   --dirty-threshold 2
 ```
@@ -106,10 +108,10 @@ RVV_TRACE=1 ./benchmark.sh \
 ./benchmark.sh --strategy local_dsq_50ms
 ```
 
-指定测试时长、并发数和 llama 线程数：
+指定测试时长、并发档位、重复次数和 llama 线程数：
 
 ```bash
-./benchmark.sh --strategy cfs --duration 300 --tasks 4 --threads 8
+./benchmark.sh --strategy cfs --duration 300 --concurrency-levels 2,4,8 --loops 3 --threads 8
 ```
 
 关闭正式测试前预热：
@@ -128,8 +130,11 @@ RVV_TRACE=1 ./benchmark.sh \
 
 | 参数 | 说明 |
 | --- | --- |
-| `--duration N` | 测试窗口秒数，默认 `300` |
-| `--tasks N` | 并发任务数，默认 `4` |
+| `--duration N` | 单轮测试窗口秒数，默认 `300` |
+| `--tasks N` | 只测试一个并发档位，兼容旧参数 |
+| `--concurrency-levels L` | 并发档位列表，默认 `2,4,8` |
+| `--loops N` | 每个并发档位重复轮数，默认 `1` |
+| `--tokens N` | 每个请求生成 token 数，默认 `100` |
 | `--threads N` | llama.cpp 计算线程数，默认 `8` |
 | `--strategy S` | benchmark 策略，默认 `cfs` |
 | `--vector-slice-ms N` | 覆盖 RVV dirty vector 时间片 |
@@ -172,9 +177,11 @@ RVV_TRACE=1 ./benchmark.sh \
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `BENCHMARK_STRATEGY` | `cfs` | 默认策略 |
-| `TEST_DURATION` | `300` | 测试窗口秒数 |
-| `CONCURRENT_TASKS` | `4` | 并发任务数 |
+| `TEST_DURATION` | `300` | 单轮测试窗口秒数 |
+| `BENCHMARK_LOOPS` | `1` | 每个并发档位重复轮数 |
+| `CONCURRENCY_LEVELS` | `2,4,8` | 并发档位列表 |
 | `TOKENS_PER_REQUEST` | `100` | 每个请求生成 token 数 |
+| `REQUEST_TIMEOUT_SEC` | `180` | 单请求 curl 超时 |
 | `RESTART_LLM` | `1` | 每轮测试前重启 llama-server |
 | `SCX_AUTO_DEPLOY` | `1` | 自动部署 sched_ext loader 到板端 |
 | `SCX_VECTOR_SLICE_MS` | `0` | RVV dirty vector 时间片，策略 preset 可覆盖 |
@@ -193,7 +200,7 @@ RVV_LOCAL_LIBELF=../../jupiter-buildroot/output/k1_v2/target/usr/lib/libelf-0.18
 
 ## 测试流程
 
-每轮 `benchmark.sh` 大致执行：
+每个 suite 会按 `CONCURRENCY_LEVELS x BENCHMARK_LOOPS` 执行多轮。每个单轮大致执行：
 
 1. 检查本机依赖和 SSH 连通性。
 2. 按配置停止旧 `llama-server` 并重新启动。
@@ -201,7 +208,7 @@ RVV_LOCAL_LIBELF=../../jupiter-buildroot/output/k1_v2/target/usr/lib/libelf-0.18
 4. 启动 sched_ext 策略，`cfs` 策略会跳过这一步。
 5. 执行正式测试前并发 warm-up。
 6. 可选启动 `rvv_sched_cost`。
-7. 运行 4 个默认任务直到测试窗口结束。
+7. 按当前并发数运行默认任务直到测试窗口结束。
 8. 拉取 scheduler / RVV trace 日志并生成报告。
 9. 清理 sched_ext loader 和 trace 进程。
 
@@ -218,11 +225,24 @@ RVV_LOCAL_LIBELF=../../jupiter-buildroot/output/k1_v2/target/usr/lib/libelf-0.18
 
 ## 输出结果
 
-每轮结果目录形如：
+完整套件目录形如：
 
 ```text
-results/YYYYMMDD_HHMMSS_<strategy>_/
+results/YYYYMMDD_HHMMSS_<strategy>_suite/
+├── suite_config.txt
+├── summary.csv
+├── summary.txt
+├── c2_loop1/
+├── c4_loop1/
+└── c8_loop1/
+```
+
+每个单轮结果目录形如：
+
+```text
+results/YYYYMMDD_HHMMSS_<strategy>_suite/c4_loop1/
 ├── config.txt
+├── metrics.env
 ├── system_info.txt
 ├── sched_ext_state_start.txt
 ├── sched_ext_state_end.txt
@@ -246,15 +266,16 @@ results/YYYYMMDD_HHMMSS_<strategy>_/
 CSV 字段：
 
 ```csv
-timestamp,request_num,tokens,generation_ms,total_ms,toks_per_sec
+timestamp,request_num,tokens,generation_ms,ttft_ms,total_ms,toks_per_sec
 ```
 
 主要关注：
 
 | 指标 | 含义 |
 | --- | --- |
-| `总吞吐量` | 全部任务总 tok/s |
-| `平均首字延迟` | 4 个任务首个请求 TTFT 的平均值 |
+| `TPS` | 单轮总 tokens / 单轮实际统计时长 |
+| `平均TTFT` | 单轮所有请求 TTFT 平均值 |
+| `p95TTFT` | 单轮所有请求 TTFT 的 p95 |
 | `generation_ms` | llama.cpp 预测阶段耗时 |
 | `RVV dirty samples` | 调度器采样到 dirty VS 的次数 |
 | `RVV vector threads` | 被识别为 vector 的线程数 |
@@ -272,7 +293,7 @@ RVV_TRACE=1 ./benchmark.sh --strategy rvv_dirty_all
 trace 工具会部署并运行 `experiments/rvv_sched_cost/rvv_sched_cost`，输出 JSON 到结果目录。常用提取命令：
 
 ```bash
-jq '.vector, .lost_ts_updates' results/latest/rvv_sched_cost.json
+find results/latest -name rvv_sched_cost.json -print -quit | xargs -r jq '.vector, .lost_ts_updates'
 ```
 
 注意：当前 RISC-V Linux 路径没有 lazy vector context handling；在本项目分析口径里，RVV save/restore candidate 基本可按实际 RVV 上下文切换次数理解。
