@@ -1,0 +1,139 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║            RVV LLM BENCHMARK FRAMEWORK - 创建完成                    ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+📁 位置: /home/gwx/Workdir/riscv-rvv/benchmark/
+
+📋 文件清单:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ config.sh              - 配置文件（IP、线程数、测试时长等）
+✓ benchmark.sh           - 主测试脚本（完整实现）
+✓ generate_report.py     - 报告生成器（Python）
+✓ quick_test.sh          - 快速测试（30秒验证）
+✓ README.md              - 详细文档
+✓ QUICKSTART.md          - 快速开始指南
+✓ results/               - 结果目录（自动创建）
+✓ logs/                  - 日志目录（自动创建）
+
+🎯 核心功能:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ 自动SSH管理远程llama-server
+✅ 4个并发对话（不同prompt）
+✅ 5分钟长时间稳定性测试
+✅ 记录首字延迟（TTFT）
+✅ 记录每个任务的tok/s
+✅ 监控CPU/内存/线程
+✅ 生成详细报告（TXT + JSON）
+✅ 支持对比测试
+
+📊 测试任务:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Task 1: 技术解释（RISC-V Vector Extension）
+Task 2: 代码生成（Binary Search Tree实现）
+Task 3: 数学推理（平均速度计算）
+Task 4: 创意写作（AI自我意识故事）
+
+🚀 快速开始:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. 验证环境:
+   cd /home/gwx/Workdir/riscv-rvv/benchmark
+   ./benchmark.sh check
+
+2. 快速测试（30秒）:
+   ./quick_test.sh
+
+3. 完整测试（5分钟）:
+   ./benchmark.sh
+
+4. 查看结果:
+   cat results/latest/report.txt
+
+📈 输出指标:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+整体:
+  - Overall Throughput (总吞吐量)
+  - Total Requests (总请求数)
+  - Total Tokens (总token数)
+
+每任务:
+  - First Token Time (首字延迟, ms)
+  - Average tok/s (平均速率)
+  - Min/Max tok/s (最小/最大速率)
+  - Total Requests (请求数)
+  - Total Tokens (token数)
+
+系统:
+  - CPU Usage (CPU使用率)
+  - Memory Usage (内存)
+  - Thread Count (线程数)
+
+🔬 典型使用场景:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+场景1: 基线测试
+  ./benchmark.sh
+  mv results/latest results/baseline_cfs
+
+场景2: 测试调度器优化
+  # 加载你的sched_ext调度器
+  ./benchmark.sh
+  mv results/latest results/optimized
+
+场景3: 对比结果
+  grep "Overall Throughput" results/*/report.txt
+
+场景4: CPU绑定测试
+  # 先绑定线程，再运行benchmark
+  ./benchmark.sh
+
+场景5: 参数扫描
+  for threads in 4 8 12 16; do
+      sed -i "s/LLM_THREADS=.*/LLM_THREADS=$threads/" config.sh
+      ./benchmark.sh
+      mv results/latest "results/threads_$threads"
+  done
+
+💡 预期性能（参考）:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+基线（CFS, 8核, 4并发）:
+  - Overall Throughput: ~10-13 tok/s
+  - Per-task tok/s:     ~2.5-3.3 tok/s
+  - First Token Time:   ~200-300ms
+
+优化目标:
+  - 吞吐量提升:   5-10%
+  - 首字延迟改善: 10-20%
+  - 稳定性提升:   降低方差
+
+📝 注意事项:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  确保远程机器空闲（无其他负载）
+⚠️  首次运行需要加载模型（~30秒）
+⚠️  5分钟测试会消耗大量token
+⚠️  网络连接必须稳定
+⚠️  确保SSH权限正确
+
+🔧 定制化:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+修改配置:        编辑 config.sh
+修改测试时长:    config.sh中的TEST_DURATION
+修改并发数:      config.sh中的CONCURRENT_TASKS
+添加测试任务:    config.sh中添加PROMPT_N
+修改报告格式:    generate_report.py
+
+📚 文档:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+详细文档:  cat README.md
+快速入门:  cat QUICKSTART.md
+配置说明:  cat config.sh
+脚本帮助:  ./benchmark.sh --help
+
+✨ 下一步:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. 运行 ./quick_test.sh 验证框架
+2. 运行 ./benchmark.sh 获取基线数据
+3. 实现你的调度器优化
+4. 再次运行benchmark对比结果
+5. 基于数据调整优化策略
+
+祝实验顺利！🚀
+
