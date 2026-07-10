@@ -334,7 +334,7 @@ check_requirements() {
     local missing=0
 
     # 检查必需的命令
-    for cmd in sshpass curl jq bc; do
+    for cmd in sshpass curl jq bc python3; do
         if ! command -v $cmd &> /dev/null; then
             log_error "缺少命令: $cmd"
             missing=1
@@ -789,80 +789,183 @@ run_single_task() {
     local prompt=$2
     local output_file=$3
 
-    local start_time=$(date +%s.%N)
-    local first_token_time=""
-    local total_tokens=0
-    local request_count=0
-
     log_info "[Task $task_id] 开始测试..."
 
-    # 创建CSV文件并写入头部
-    echo "timestamp,request_num,tokens,generation_ms,ttft_ms,total_ms,toks_per_sec" > "$output_file.csv"
+    python3 - "$task_id" "$prompt" "$output_file" "$REMOTE_IP" "$REMOTE_PORT" \
+        "$TEST_DURATION" "$TOKENS_PER_REQUEST" "${REQUEST_TIMEOUT_SEC:-180}" <<'PY'
+import csv
+import json
+import subprocess
+import sys
+import time
 
-    # 记录开始时间
-    local test_end_time=$(($(date +%s) + TEST_DURATION))
+task_id = int(sys.argv[1])
+prompt = sys.argv[2]
+output_file = sys.argv[3]
+remote_ip = sys.argv[4]
+remote_port = sys.argv[5]
+test_duration = float(sys.argv[6])
+tokens_per_request = int(sys.argv[7])
+request_timeout = float(sys.argv[8])
 
-    while [ $(date +%s) -lt $test_end_time ]; do
-        local req_start=$(date +%s.%N)
+url = f"http://{remote_ip}:{remote_port}/completion"
+csv_path = f"{output_file}.csv"
+summary_path = f"{output_file}.summary"
 
-        # 发送请求并记录响应
-        local response=$(curl -s --max-time "${REQUEST_TIMEOUT_SEC:-180}" "http://$REMOTE_IP:$REMOTE_PORT/completion" \
-            -H "Content-Type: application/json" \
-            -d "{
-                \"prompt\": \"$prompt\",
-                \"n_predict\": $TOKENS_PER_REQUEST,
-                \"temperature\": 0.7,
-                \"stream\": false
-            }")
+start_time = time.time()
+deadline = start_time + test_duration
+first_token_time = None
+last_token_time = None
+total_tokens = 0
+request_count = 0
 
-        local req_end=$(date +%s.%N)
+with open(csv_path, "w", newline="") as csv_file:
+    writer = csv.writer(csv_file)
+    writer.writerow([
+        "timestamp",
+        "request_num",
+        "tokens",
+        "generation_ms",
+        "ttft_ms",
+        "last_token_ms",
+        "total_ms",
+        "toks_per_sec",
+        "completed",
+        "stream_cutoff",
+    ])
 
-        # 解析响应
-        if echo "$response" | jq -e '.tokens_predicted' > /dev/null 2>&1; then
-            local tokens=$(echo "$response" | jq -r '.tokens_predicted // 0')
-            local generation_time=$(echo "$response" | jq -r '.timings.predicted_ms // 0')
-            local ttft=$(echo "$response" | jq -r '.timings.prompt_ms // 0')
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
 
-            total_tokens=$((total_tokens + tokens))
-            request_count=$((request_count + 1))
+        req_start = time.time()
+        max_time = max(0.001, min(remaining, request_timeout))
+        payload = {
+            "prompt": prompt,
+            "n_predict": tokens_per_request,
+            "temperature": 0.7,
+            "stream": True,
+        }
+        cmd = [
+            "curl",
+            "-sN",
+            "--no-buffer",
+            "--max-time",
+            f"{max_time:.3f}",
+            url,
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            json.dumps(payload, ensure_ascii=False),
+        ]
 
-            # 记录首字延迟（第一个请求）
-            if [ -z "$first_token_time" ]; then
-                first_token_time=$ttft
-                log_info "[Task $task_id] 首字延迟: ${ttft}ms"
-            fi
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
 
-            # 计算此请求的 tok/s
-            local toks_per_sec=$(echo "scale=2; if ($generation_time > 0) $tokens * 1000 / $generation_time else 0" | bc)
+        req_tokens = 0
+        req_first_token_ms = None
+        req_last_token_ms = None
+        generation_ms = 0.0
+        completed = 0
+        stream_cutoff = 0
 
-            # 记录这次请求
-            local request_time_ms=$(echo "scale=3; ($req_end - $req_start) * 1000" | bc)
-            echo "$(date +%s.%N),$request_count,$tokens,$generation_time,$ttft,$request_time_ms,$toks_per_sec" >> "$output_file.csv"
+        try:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                now = time.time()
+                if now > deadline:
+                    stream_cutoff = 1
+                    proc.kill()
+                    break
 
-        else
-            log_warn "[Task $task_id] 请求失败: $response"
-        fi
+                line = raw_line.strip()
+                if not line.startswith("data:"):
+                    continue
 
-        # 短暂休息避免过载
-        sleep 0.5
-    done
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
 
-    local end_time=$(date +%s.%N)
-    local total_time=$(echo "$end_time - $start_time" | bc)
-    local avg_toks=$(echo "scale=2; $total_tokens / $total_time" | bc)
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
 
-    # 生成任务总结
-    cat > "$output_file.summary" << EOF
-Task ID: $task_id
-Prompt: ${prompt:0:50}...
-Duration: ${total_time}s
-Total Requests: $request_count
-Total Tokens: $total_tokens
-Average tok/s: $avg_toks
-First Token Time: ${first_token_time}ms
-EOF
+                chunk_tokens = chunk.get("tokens") or []
+                if isinstance(chunk_tokens, list) and chunk_tokens:
+                    token_count = len(chunk_tokens)
+                    req_tokens += token_count
+                    total_tokens += token_count
+                    req_last_token_ms = (now - req_start) * 1000.0
+                    last_token_time = now
+                    if req_first_token_ms is None:
+                        req_first_token_ms = req_last_token_ms
+                    if first_token_time is None:
+                        first_token_time = req_first_token_ms
+                        print(f"[INFO] [Task {task_id}] 首字延迟: {first_token_time:.3f}ms", flush=True)
 
-    log_info "[Task $task_id] 完成 - $avg_toks tok/s, $request_count 请求"
+                if chunk.get("stop"):
+                    completed = 1
+                    timings = chunk.get("timings") or {}
+                    generation_ms = float(timings.get("predicted_ms") or 0.0)
+        finally:
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+        req_end = time.time()
+        if req_end >= deadline and not completed:
+            stream_cutoff = 1
+
+        if req_tokens > 0 or completed:
+            request_count += 1
+            total_ms = (req_end - req_start) * 1000.0
+            token_ms = req_last_token_ms if req_last_token_ms is not None else total_ms
+            toks_per_sec = req_tokens / (token_ms / 1000.0) if token_ms > 0 else 0.0
+            writer.writerow([
+                f"{time.time():.9f}",
+                request_count,
+                req_tokens,
+                f"{generation_ms:.3f}",
+                "" if req_first_token_ms is None else f"{req_first_token_ms:.3f}",
+                "" if req_last_token_ms is None else f"{req_last_token_ms:.3f}",
+                f"{total_ms:.3f}",
+                f"{toks_per_sec:.2f}",
+                completed,
+                stream_cutoff,
+            ])
+            csv_file.flush()
+
+        if time.time() < deadline:
+            time.sleep(0.5)
+
+duration = (last_token_time - start_time) if last_token_time is not None else 0.0
+avg_toks = total_tokens / duration if duration > 0 else 0.0
+first = "" if first_token_time is None else f"{first_token_time:.3f}"
+last_ts = "" if last_token_time is None else f"{last_token_time:.9f}"
+
+with open(summary_path, "w") as f:
+    f.write(f"Task ID: {task_id}\n")
+    f.write(f"Prompt: {prompt[:50]}...\n")
+    f.write(f"Configured Duration: {test_duration:.3f}s\n")
+    f.write(f"Start Timestamp: {start_time:.9f}\n")
+    f.write(f"Last Token Timestamp: {last_ts}\n")
+    f.write(f"Duration: {duration:.3f}s\n")
+    f.write(f"Total Requests: {request_count}\n")
+    f.write(f"Total Tokens: {total_tokens}\n")
+    f.write(f"Average tok/s: {avg_toks:.2f}\n")
+    f.write(f"First Token Time: {first}ms\n")
+
+print(f"[INFO] [Task {task_id}] 完成 - {avg_toks:.2f} tok/s, {request_count} 请求", flush=True)
+PY
 }
 
 # ========================================
@@ -1013,6 +1116,8 @@ total_tokens = 0
 total_requests = 0
 ttfts = []
 durations = []
+start_timestamps = []
+last_token_timestamps = []
 
 for csv_file in sorted(result_dir.glob("task*.csv")):
     with csv_file.open(newline="") as f:
@@ -1038,8 +1143,24 @@ for summary_file in sorted(result_dir.glob("task*.summary")):
                 durations.append(float(raw))
             except ValueError:
                 pass
+        elif line.startswith("Start Timestamp:"):
+            raw = line.split(":", 1)[1].strip()
+            try:
+                start_timestamps.append(float(raw))
+            except ValueError:
+                pass
+        elif line.startswith("Last Token Timestamp:"):
+            raw = line.split(":", 1)[1].strip()
+            if raw:
+                try:
+                    last_token_timestamps.append(float(raw))
+                except ValueError:
+                    pass
 
-duration = max(durations) if durations else 0.0
+if start_timestamps and last_token_timestamps:
+    duration = max(last_token_timestamps) - min(start_timestamps)
+else:
+    duration = max(durations) if durations else 0.0
 tps = (total_tokens / duration) if duration > 0 else 0.0
 avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else 0.0
 if ttfts:
@@ -1075,7 +1196,7 @@ generate_report() {
         echo "========================================"
         echo ""
         echo "测试时间: $(date)"
-        echo "测试时长: ${TEST_DURATION}s"
+        echo "配置窗口: ${TEST_DURATION}s"
         echo "并发任务: $CONCURRENT_TASKS"
         echo "策略: $BENCHMARK_STRATEGY"
         echo "SCX加载策略: $SCX_LOADER_STRATEGY"
@@ -1312,7 +1433,7 @@ Benchmark Suite Configuration
 =============================
 Date: $(date)
 Strategy: $BENCHMARK_STRATEGY
-Duration per run: ${TEST_DURATION}s
+Configured duration per run: ${TEST_DURATION}s
 Benchmark loops: $BENCHMARK_LOOPS
 Concurrency levels: $CONCURRENCY_LEVELS
 Tokens per request: $TOKENS_PER_REQUEST

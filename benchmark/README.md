@@ -263,20 +263,25 @@ results/YYYYMMDD_HHMMSS_<strategy>_suite/c4_loop1/
 
 `rvv_sched_cost.*` 只在 `RVV_TRACE=1` 时生成。
 
+正式测试请求使用 `stream=true`，脚本按 SSE chunk 中的 `tokens` 数组统计实际收到的 token。窗口结束时正在进行的请求会被截断，已经收到的 token 计入 TPS，未收到的 token 不计入。TPS 的时间分母使用本轮最早 task 开始到最后一个实际收到 token 的 wall time，而不是硬编码的配置窗口秒数。
+
 CSV 字段：
 
 ```csv
-timestamp,request_num,tokens,generation_ms,ttft_ms,total_ms,toks_per_sec
+timestamp,request_num,tokens,generation_ms,ttft_ms,last_token_ms,total_ms,toks_per_sec,completed,stream_cutoff
 ```
 
 主要关注：
 
 | 指标 | 含义 |
 | --- | --- |
-| `TPS` | 单轮总 tokens / 单轮实际统计时长 |
-| `平均TTFT` | 单轮所有请求 TTFT 平均值 |
-| `p95TTFT` | 单轮所有请求 TTFT 的 p95 |
-| `generation_ms` | llama.cpp 预测阶段耗时 |
+| `TPS` | 实际收到的 token / 从本轮开始到最后一个 token 到达的真实 wall time |
+| `平均TTFT` | 流式请求首个 token 到达的 wall time 平均值 |
+| `p95TTFT` | 流式请求首个 token 到达 wall time 的 p95 |
+| `last_token_ms` | 该请求最后一个 token 到达相对请求开始的 wall time |
+| `generation_ms` | llama.cpp 预测阶段耗时；被窗口截断的请求记为 `0` |
+| `completed` | 该流式请求是否收到 stop chunk |
+| `stream_cutoff` | 该流式请求是否因测试窗口结束被截断 |
 | `RVV dirty samples` | 调度器采样到 dirty VS 的次数 |
 | `RVV vector threads` | 被识别为 vector 的线程数 |
 | `v_save_candidates` / `v_restore_candidates` | RVV 上下文保存/恢复候选次数 |
