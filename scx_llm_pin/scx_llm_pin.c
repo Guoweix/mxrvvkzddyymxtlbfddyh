@@ -15,11 +15,15 @@
 #include <stdarg.h>
 #include <dirent.h>
 #include <sched.h>
+#include <linux/bpf.h>
 #include <bpf/libbpf.h>
 #include "scx_llm_pin.h"
 #include "scx_llm_pin.skel.h"
 
 #define NSEC_PER_MSEC 1000000ULL
+#ifndef BPF_F_SLEEPABLE
+#define BPF_F_SLEEPABLE (1U << 4)
+#endif
 #ifndef SCHED_EXT
 #define SCHED_EXT 7
 #endif
@@ -239,6 +243,11 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	printf("RVV nonvector dispatches:  %llu\n", stats.rvv_nonvector_llm_dispatches);
 	printf("Protected kernel dispatches: %llu\n", stats.protected_kernel_dispatches);
 	printf("Protected kernel preempts:   %llu\n", stats.protected_kernel_preempts);
+	printf("RVV vector DSQ dispatches:   %llu\n", stats.rvv_vector_dsq_dispatches);
+	printf("RVV vector DSQ consumes:     %llu\n", stats.rvv_vector_dsq_consumes);
+	printf("RVV vector local dispatches: %llu\n", stats.rvv_vector_local_dispatches);
+	printf("RVV vector window starts:    %llu\n", stats.rvv_vector_window_starts);
+	printf("RVV vector slice clamps:     %llu\n", stats.rvv_vector_slice_clamps);
 	fflush(stdout);
 }
 
@@ -258,6 +267,7 @@ static void usage(const char *prog)
 		"  --system-slice-ms <ms> System task time slice in milliseconds (0 = kernel default)\n"
 		"  --vector-slice-ms <ms> RVV vector slice on aggressive CPUs (0 = LLM/default)\n"
 		"  --ordinary-vector-slice-ms <ms> RVV vector slice on ordinary CPUs (0 = LLM/default)\n"
+		"  --vector-local-window-ms <ms> RVV local fast-path window after vector DSQ consume (default: 500)\n"
 		"  --dirty-threshold <n>  Dirty samples before marking vector thread (default: 2)\n"
 		"  --fallback-every <n>   Every Nth vector CPU pick uses ordinary CPUs (0 = disabled)\n"
 		"  --llm-only            Do not switch all tasks; move target threads to SCHED_EXT only\n"
@@ -288,6 +298,7 @@ int main(int argc, char **argv)
 	config.vector_cpu_mask = 0xFF;
 	config.ordinary_cpu_mask = 0xFF;
 	config.dirty_threshold = 2;
+	config.vector_local_window_ns = 500 * NSEC_PER_MSEC;
 	config.switch_all = 1;
 
 	static struct option long_options[] = {
@@ -301,6 +312,7 @@ int main(int argc, char **argv)
 		{"system-slice-ms", required_argument, 0, 'S'},
 		{"vector-slice-ms", required_argument, 0, 'M'},
 		{"ordinary-vector-slice-ms", required_argument, 0, 'N'},
+		{"vector-local-window-ms", required_argument, 0, 'W'},
 		{"dirty-threshold", required_argument, 0, 'D'},
 		{"fallback-every", required_argument, 0, 'F'},
 		{"llm-only",    no_argument,       0, 'o'},
@@ -350,6 +362,9 @@ int main(int argc, char **argv)
 			break;
 		case 'N':
 			config.ordinary_vector_slice_ns = strtoull(optarg, NULL, 10) * NSEC_PER_MSEC;
+			break;
+		case 'W':
+			config.vector_local_window_ns = strtoull(optarg, NULL, 10) * NSEC_PER_MSEC;
 			break;
 		case 'D':
 			config.dirty_threshold = strtoul(optarg, NULL, 10);
@@ -422,6 +437,8 @@ int main(int argc, char **argv)
 	       (unsigned long long)(config.vector_slice_ns / NSEC_PER_MSEC));
 	printf("  Ordinary vector slice: %llums\n",
 	       (unsigned long long)(config.ordinary_vector_slice_ns / NSEC_PER_MSEC));
+	printf("  Vector local window: %llums\n",
+	       (unsigned long long)(config.vector_local_window_ns / NSEC_PER_MSEC));
 	printf("  Dirty threshold: %u\n", config.dirty_threshold);
 	printf("  Fallback every:  %u\n", config.fallback_every);
 	printf("  Switch all:      %s\n", config.switch_all ? "yes" : "no");
@@ -435,11 +452,21 @@ int main(int argc, char **argv)
 	signal(SIGTERM, on_signal);
 	libbpf_set_print(libbpf_log);
 
-	// 加载 BPF 程序
-	skel = scx_llm_pin_bpf__open_and_load();
+	// 加载 BPF 程序。init 里创建自定义 DSQ，需要 sleepable flag。
+	skel = scx_llm_pin_bpf__open();
 	if (!skel) {
-		fprintf(stderr, "failed to open/load scx_llm_pin BPF object\n");
+		fprintf(stderr, "failed to open scx_llm_pin BPF object\n");
 		return 1;
+	}
+	err = bpf_program__set_flags(skel->progs.scx_llm_pin_init, BPF_F_SLEEPABLE);
+	if (err) {
+		fprintf(stderr, "failed to mark init program sleepable: %d\n", err);
+		goto cleanup;
+	}
+	err = scx_llm_pin_bpf__load(skel);
+	if (err) {
+		fprintf(stderr, "failed to load scx_llm_pin BPF object: %d\n", err);
+		goto cleanup;
 	}
 
 	// 写入配置

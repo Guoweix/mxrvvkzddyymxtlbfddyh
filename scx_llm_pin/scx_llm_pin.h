@@ -33,6 +33,7 @@ struct llm_pin_config {
 	__u32 fallback_every;     // 每 N 次 vector 选择走普通核心，0=禁用
 	__u64 vector_slice_ns;    // vector 线程在激进核心上的时间片
 	__u64 ordinary_vector_slice_ns; // vector 线程在普通核心上的时间片
+	__u64 vector_local_window_ns; // vector DSQ 放行后的 local 快速窗口
 };
 
 // 统计信息
@@ -53,6 +54,11 @@ struct llm_pin_stats {
 	__u64 rvv_nonvector_llm_dispatches;
 	__u64 protected_kernel_dispatches;
 	__u64 protected_kernel_preempts;
+	__u64 rvv_vector_dsq_dispatches;
+	__u64 rvv_vector_dsq_consumes;
+	__u64 rvv_vector_local_dispatches;
+	__u64 rvv_vector_window_starts;
+	__u64 rvv_vector_slice_clamps;
 };
 
 struct rvv_task_class {

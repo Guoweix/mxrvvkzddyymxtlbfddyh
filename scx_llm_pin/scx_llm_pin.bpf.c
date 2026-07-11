@@ -25,11 +25,9 @@ void scx_bpf_dispatch(struct task_struct *p, u64 dsq_id, u64 slice,
 bool scx_bpf_consume(u64 dsq_id) __ksym;
 void scx_bpf_switch_all(void) __ksym;
 s32 scx_bpf_pick_idle_cpu(const cpumask_t *cpus_allowed, u64 flags) __ksym;
-void scx_bpf_kick_cpu(s32 cpu, u64 flags) __ksym;
+s32 scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
 
-#ifndef PF_KTHREAD
-#define PF_KTHREAD 0x00200000
-#endif
+#define VECTOR_DSQ_BASE 0x100000ULL
 
 // 配置 map（单元素，用户态写入）
 struct {
@@ -71,6 +69,14 @@ struct {
 	__type(value, __s32);
 } selected_cpu_map SEC(".maps");
 
+// 每个 CPU 当前 vector-local 窗口的结束时间戳（ns）
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 8);
+	__type(key, __u32);
+	__type(value, __u64);
+} vector_local_until_ns SEC(".maps");
+
 // Per-CPU 调度计数器（用于轮询选择）
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -109,43 +115,6 @@ static __always_inline __u32 task_pid(struct task_struct *p)
 
 	bpf_probe_read_kernel(&pid, sizeof(pid), &p->pid);
 	return (__u32)pid;
-}
-
-static __always_inline bool is_protected_kernel_task(struct task_struct *p)
-{
-	unsigned int flags;
-	int nr_cpus_allowed;
-
-	flags = BPF_CORE_READ(p, flags);
-	nr_cpus_allowed = BPF_CORE_READ(p, nr_cpus_allowed);
-
-	return (flags & PF_KTHREAD) && nr_cpus_allowed == 1;
-}
-
-static __always_inline bool is_latency_kernel_task(struct task_struct *p)
-{
-	char comm[16];
-
-	if (bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm) <= 0)
-		return false;
-
-	if (comm[0] == 'k' && comm[1] == 'w' && comm[2] == 'o' &&
-	    comm[3] == 'r' && comm[4] == 'k' && comm[5] == 'e' &&
-	    comm[6] == 'r' && comm[7] == '/')
-		return true;
-
-	if (comm[0] == 'k' && comm[1] == 's' && comm[2] == 'o' &&
-	    comm[3] == 'f' && comm[4] == 't' && comm[5] == 'i' &&
-	    comm[6] == 'r' && comm[7] == 'q' && comm[8] == 'd' &&
-	    comm[9] == '/')
-		return true;
-
-	return false;
-}
-
-static __always_inline bool is_protected_fastlane_task(struct task_struct *p)
-{
-	return is_protected_kernel_task(p) && is_latency_kernel_task(p);
 }
 
 static __always_inline unsigned long read_vs_state(struct task_struct *task,
@@ -235,17 +204,20 @@ static __always_inline s32 remembered_selected_cpu(struct task_struct *p)
 	return *cpu;
 }
 
-static __always_inline s32 protected_kernel_cpu(struct task_struct *p, s32 fallback_cpu)
+static __always_inline u64 vector_dsq_id(s32 cpu)
 {
-	s32 cpu = remembered_selected_cpu(p);
+	return VECTOR_DSQ_BASE + (u64)(u32)cpu;
+}
 
-	if (cpu >= 0 && cpu < 32)
-		return cpu;
-
-	if (fallback_cpu >= 0 && fallback_cpu < 32)
-		return fallback_cpu;
-
-	return (s32)bpf_get_smp_processor_id();
+static __always_inline __u64 clamp_slice(__u64 slice, __u64 limit,
+					 struct llm_pin_stats *stats)
+{
+	if (limit && slice > limit) {
+		if (stats)
+			__sync_fetch_and_add(&stats->rvv_vector_slice_clamps, 1);
+		return limit;
+	}
+	return slice;
 }
 
 // 辅助函数：从 CPU mask 中选择 CPU（简单轮询，BPF验证器友好）
@@ -327,17 +299,6 @@ s32 BPF_PROG(scx_llm_pin_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	stats = bpf_map_lookup_elem(&stats_map, &key);
 
-	// 根据任务类型选择CPU
-	if (!is_llm_task(p, cfg->target_tgid) && is_protected_fastlane_task(p)) {
-		s32 cpu = prev_cpu;
-
-		remember_selected_cpu(p, cpu);
-		if (stats) {
-			__sync_fetch_and_add(&stats->system_scheduled, 1);
-		}
-		return cpu;
-	}
-
 	if (is_llm_task(p, cfg->target_tgid)) {
 		s32 cpu;
 
@@ -391,27 +352,19 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 
-	if (!is_llm_task(p, cfg->target_tgid) &&
-	    is_protected_fastlane_task(p) &&
-	    (enq_flags & SCX_ENQ_WAKEUP)) {
-		s32 cpu = protected_kernel_cpu(p, bpf_get_smp_processor_id());
-		u64 protected_flags = enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
-
-		if (stats) {
-			__sync_fetch_and_add(&stats->system_dispatches, 1);
-			__sync_fetch_and_add(&stats->protected_kernel_dispatches, 1);
-			__sync_fetch_and_add(&stats->protected_kernel_preempts, 1);
-		}
-
-		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, protected_flags);
-		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-		return;
-	}
-
 	if (is_llm_task(p, cfg->target_tgid)) {
 		if (is_rvv_dirty_strategy(cfg->strategy) &&
 		    classify_rvv_vector_task(p, cfg, stats)) {
 			s32 selected_cpu = remembered_selected_cpu(p);
+			u64 dsq_id;
+			__u32 cpu_key;
+			__u64 *local_until;
+			__u64 now;
+
+			if (selected_cpu < 0 || selected_cpu >= 8)
+				selected_cpu = (s32)bpf_get_smp_processor_id();
+			if (selected_cpu < 0 || selected_cpu >= 8)
+				selected_cpu = 0;
 
 			if (!cpu_in_mask(selected_cpu, cfg->vector_cpu_mask) &&
 			    cpu_in_mask(selected_cpu, cfg->ordinary_cpu_mask)) {
@@ -432,10 +385,30 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 
 			if (stats) {
 				__sync_fetch_and_add(&stats->rvv_vector_dispatches, 1);
-				__sync_fetch_and_add(&stats->llm_local_dispatches, 1);
 			}
 
-			scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice, enq_flags);
+			if (cfg->vector_local_window_ns) {
+				cpu_key = (__u32)selected_cpu;
+				local_until = bpf_map_lookup_elem(&vector_local_until_ns,
+								  &cpu_key);
+				now = bpf_ktime_get_ns();
+				if (local_until && *local_until > now) {
+					slice = clamp_slice(slice, *local_until - now,
+							    stats);
+					if (stats)
+						__sync_fetch_and_add(&stats->rvv_vector_local_dispatches, 1);
+					scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice, enq_flags);
+					return;
+				}
+
+				slice = clamp_slice(slice, cfg->vector_local_window_ns,
+						    stats);
+			}
+
+			if (stats)
+				__sync_fetch_and_add(&stats->rvv_vector_dsq_dispatches, 1);
+			dsq_id = vector_dsq_id(selected_cpu);
+			scx_bpf_dispatch(p, dsq_id, slice, enq_flags);
 			return;
 		}
 
@@ -470,10 +443,33 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 SEC("struct_ops/scx_llm_pin_dispatch")
 void BPF_PROG(scx_llm_pin_dispatch, s32 cpu, struct task_struct *prev)
 {
-	// 循环消费全局队列中的所有任务，直到队列为空
-	// 这可以减少调度延迟
-	if (!scx_bpf_consume(SCX_DSQ_GLOBAL))
+	struct llm_pin_config *cfg;
+	struct llm_pin_stats *stats;
+	u32 key = 0;
+
+	if (scx_bpf_consume(SCX_DSQ_GLOBAL))
 		return;
+
+	if (cpu >= 0 && cpu < 8 && scx_bpf_consume(vector_dsq_id(cpu))) {
+		__u32 cpu_key = (__u32)cpu;
+		__u64 *local_until;
+
+		cfg = bpf_map_lookup_elem(&config_map, &key);
+		stats = bpf_map_lookup_elem(&stats_map, &key);
+		if (cfg && cfg->vector_local_window_ns) {
+			local_until = bpf_map_lookup_elem(&vector_local_until_ns,
+							  &cpu_key);
+			if (local_until) {
+				*local_until = bpf_ktime_get_ns() +
+					       cfg->vector_local_window_ns;
+				if (stats)
+					__sync_fetch_and_add(&stats->rvv_vector_window_starts, 1);
+			}
+		}
+		if (stats)
+			__sync_fetch_and_add(&stats->rvv_vector_dsq_consumes, 1);
+		return;
+	}
 }
 
 SEC("struct_ops/scx_llm_pin_init")
@@ -481,10 +477,18 @@ s32 BPF_PROG(scx_llm_pin_init)
 {
 	struct llm_pin_config *cfg;
 	u32 key = 0;
+	s32 ret;
 
 	cfg = bpf_map_lookup_elem(&config_map, &key);
 	if (!cfg || cfg->switch_all)
 		scx_bpf_switch_all();
+
+	#pragma unroll
+	for (u32 cpu = 0; cpu < 8; cpu++) {
+		ret = scx_bpf_create_dsq(vector_dsq_id((s32)cpu), -1);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
