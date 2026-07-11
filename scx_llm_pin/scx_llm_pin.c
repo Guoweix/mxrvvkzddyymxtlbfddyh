@@ -237,6 +237,8 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	printf("RVV aggressive dispatches: %llu\n", stats.rvv_aggressive_dispatches);
 	printf("RVV fallback dispatches:   %llu\n", stats.rvv_fallback_dispatches);
 	printf("RVV nonvector dispatches:  %llu\n", stats.rvv_nonvector_llm_dispatches);
+	printf("Protected kernel dispatches: %llu\n", stats.protected_kernel_dispatches);
+	printf("Protected kernel preempts:   %llu\n", stats.protected_kernel_preempts);
 	fflush(stdout);
 }
 

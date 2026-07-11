@@ -51,6 +51,8 @@ struct llm_pin_stats {
 	__u64 rvv_aggressive_dispatches;
 	__u64 rvv_fallback_dispatches;
 	__u64 rvv_nonvector_llm_dispatches;
+	__u64 protected_kernel_dispatches;
+	__u64 protected_kernel_preempts;
 };
 
 struct rvv_task_class {
