@@ -69,6 +69,14 @@ struct {
 	__type(value, __s32);
 } selected_cpu_map SEC(".maps");
 
+// 每个 CPU 的 vector 线程所有者 TID，0 表示未分配
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 8);
+	__type(key, __u32);
+	__type(value, __u32);
+} vector_cpu_owners SEC(".maps");
+
 // 每个 CPU 当前 vector-local 窗口的结束时间戳（ns）
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -246,6 +254,83 @@ static inline s32 select_cpu_from_mask(__u32 cpu_mask, s32 prev_cpu)
 	return prev_cpu;
 }
 
+static __always_inline bool claim_vector_cpu(__u32 tid, s32 cpu,
+					      __u32 allowed_mask)
+{
+	__u32 cpu_key;
+	__u32 *owner;
+
+	if (!cpu_in_mask(cpu, allowed_mask))
+		return false;
+
+	cpu_key = (__u32)cpu;
+	owner = bpf_map_lookup_elem(&vector_cpu_owners, &cpu_key);
+	if (!owner)
+		return false;
+	if (*owner == tid)
+		return true;
+	if (*owner == 0 && __sync_val_compare_and_swap(owner, 0, tid) == 0)
+		return true;
+	return false;
+}
+
+static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
+						      const struct llm_pin_config *cfg,
+						      s32 prev_cpu)
+{
+	struct rvv_task_class *state;
+	__u32 tid = task_pid(p);
+	__u32 allowed_mask = cfg->vector_cpu_mask | cfg->ordinary_cpu_mask;
+	s32 assigned_cpu;
+
+	if (!allowed_mask)
+		allowed_mask = cfg->llm_cpu_mask;
+
+	state = get_rvv_task_class(tid);
+	if (!state)
+		return select_cpu_from_mask(allowed_mask, prev_cpu);
+
+	if (state->assigned_cpu_plus1) {
+		assigned_cpu = (s32)state->assigned_cpu_plus1 - 1;
+		if (claim_vector_cpu(tid, assigned_cpu, allowed_mask))
+			return assigned_cpu;
+		state->assigned_cpu_plus1 = 0;
+	}
+
+	if (claim_vector_cpu(tid, prev_cpu, allowed_mask)) {
+		state->assigned_cpu_plus1 = (__u32)prev_cpu + 1;
+		return prev_cpu;
+	}
+
+	#pragma unroll
+	for (__u32 offset = 0; offset < 8; offset++) {
+		s32 cpu = (s32)((tid + offset) & 7);
+
+		if (claim_vector_cpu(tid, cpu, allowed_mask)) {
+			state->assigned_cpu_plus1 = (__u32)cpu + 1;
+			return cpu;
+		}
+	}
+
+	return select_cpu_from_mask(allowed_mask, prev_cpu);
+}
+
+static __always_inline __u32 vector_unique_target(const struct llm_pin_config *cfg)
+{
+	__u32 allowed_mask = (cfg->vector_cpu_mask | cfg->ordinary_cpu_mask) & 0xff;
+	__u32 count = 0;
+
+	if (!allowed_mask)
+		allowed_mask = cfg->llm_cpu_mask & 0xff;
+
+	#pragma unroll
+	for (__u32 cpu = 0; cpu < 8; cpu++) {
+		if (allowed_mask & (1U << cpu))
+			count++;
+	}
+	return count;
+}
+
 static __always_inline s32 select_rvv_vector_cpu(struct task_struct *p,
 						  const struct llm_pin_config *cfg,
 						  struct llm_pin_stats *stats,
@@ -257,6 +342,14 @@ static __always_inline s32 select_rvv_vector_cpu(struct task_struct *p,
 	__u32 key = 0;
 	__u64 *counter;
 	s32 cpu;
+
+	if (cfg->vector_local_window_ns) {
+		cpu = select_unique_vector_cpu(p, cfg, prev_cpu);
+		remember_selected_cpu(p, cpu);
+		if (stats && cpu != prev_cpu)
+			__sync_fetch_and_add(&stats->cpu_migrations, 1);
+		return cpu;
+	}
 
 	if (cpu_in_mask(prev_cpu, aggressive_mask) || cpu_in_mask(prev_cpu, ordinary_mask)) {
 		remember_selected_cpu(p, prev_cpu);
@@ -361,10 +454,30 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 			__u64 *local_until;
 			__u64 now;
 
+			if (cfg->vector_local_window_ns)
+				selected_cpu = select_unique_vector_cpu(p, cfg,
+								 selected_cpu);
+			remember_selected_cpu(p, selected_cpu);
+
 			if (selected_cpu < 0 || selected_cpu >= 8)
 				selected_cpu = (s32)bpf_get_smp_processor_id();
 			if (selected_cpu < 0 || selected_cpu >= 8)
 				selected_cpu = 0;
+
+			if (cfg->vector_local_window_ns && stats &&
+			    stats->rvv_vector_threads < vector_unique_target(cfg)) {
+				cpu_key = (__u32)selected_cpu;
+				local_until = bpf_map_lookup_elem(
+					&vector_local_until_ns, &cpu_key);
+				if (local_until)
+					*local_until = bpf_ktime_get_ns() +
+						       cfg->vector_local_window_ns;
+				__sync_fetch_and_add(&stats->rvv_vector_identify_barrier_dispatches,
+						     1);
+				scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
+						 enq_flags);
+				return;
+			}
 
 			if (!cpu_in_mask(selected_cpu, cfg->vector_cpu_mask) &&
 			    cpu_in_mask(selected_cpu, cfg->ordinary_cpu_mask)) {
@@ -457,11 +570,12 @@ void BPF_PROG(scx_llm_pin_dispatch, s32 cpu, struct task_struct *prev)
 		cfg = bpf_map_lookup_elem(&config_map, &key);
 		stats = bpf_map_lookup_elem(&stats_map, &key);
 		if (cfg && cfg->vector_local_window_ns) {
+			__u64 now = bpf_ktime_get_ns();
+
 			local_until = bpf_map_lookup_elem(&vector_local_until_ns,
 							  &cpu_key);
 			if (local_until) {
-				*local_until = bpf_ktime_get_ns() +
-					       cfg->vector_local_window_ns;
+				*local_until = now + cfg->vector_local_window_ns;
 				if (stats)
 					__sync_fetch_and_add(&stats->rvv_vector_window_starts, 1);
 			}
@@ -499,6 +613,30 @@ void BPF_PROG(scx_llm_pin_exit, struct scx_exit_info *ei)
 	// 清理工作（如果需要）
 }
 
+SEC("struct_ops/scx_llm_pin_disable")
+void BPF_PROG(scx_llm_pin_disable, struct task_struct *p)
+{
+	struct rvv_task_class *state;
+	__u32 tid = task_pid(p);
+	__u32 cpu_key;
+	__u32 *owner;
+
+	state = bpf_map_lookup_elem(&rvv_task_classes, &tid);
+	if (!state)
+		return;
+
+	if (state->assigned_cpu_plus1) {
+		cpu_key = state->assigned_cpu_plus1 - 1;
+		if (cpu_key < 8) {
+			owner = bpf_map_lookup_elem(&vector_cpu_owners, &cpu_key);
+			if (owner)
+				__sync_val_compare_and_swap(owner, tid, 0);
+		}
+	}
+	bpf_map_delete_elem(&selected_cpu_map, &tid);
+	bpf_map_delete_elem(&rvv_task_classes, &tid);
+}
+
 SEC(".struct_ops")
 struct sched_ext_ops scx_llm_pin_ops = {
 	.select_cpu		= (void *)scx_llm_pin_select_cpu,
@@ -506,6 +644,7 @@ struct sched_ext_ops scx_llm_pin_ops = {
 	.dispatch		= (void *)scx_llm_pin_dispatch,
 	.init			= (void *)scx_llm_pin_init,
 	.exit			= (void *)scx_llm_pin_exit,
+	.disable		= (void *)scx_llm_pin_disable,
 	.dispatch_max_batch	= 1,
 	.timeout_ms		= 5000,
 	.name			= "scx_llm_pin",

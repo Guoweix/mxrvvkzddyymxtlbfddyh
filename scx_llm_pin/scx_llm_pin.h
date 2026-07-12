@@ -59,11 +59,13 @@ struct llm_pin_stats {
 	__u64 rvv_vector_local_dispatches;
 	__u64 rvv_vector_window_starts;
 	__u64 rvv_vector_slice_clamps;
+	__u64 rvv_vector_identify_barrier_dispatches;
 };
 
 struct rvv_task_class {
 	__u32 dirty_score;
 	__u32 is_vector;
+	__u32 assigned_cpu_plus1;
 };
 
 #endif /* __SCX_LLM_PIN_H */

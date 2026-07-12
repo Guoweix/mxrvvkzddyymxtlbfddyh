@@ -17,6 +17,7 @@
 #include <sched.h>
 #include <linux/bpf.h>
 #include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 #include "scx_llm_pin.h"
 #include "scx_llm_pin.skel.h"
 
@@ -248,6 +249,34 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	printf("RVV vector local dispatches: %llu\n", stats.rvv_vector_local_dispatches);
 	printf("RVV vector window starts:    %llu\n", stats.rvv_vector_window_starts);
 	printf("RVV vector slice clamps:     %llu\n", stats.rvv_vector_slice_clamps);
+	printf("RVV vector identify barrier dispatches: %llu\n",
+	       stats.rvv_vector_identify_barrier_dispatches);
+	fflush(stdout);
+}
+
+static void print_vector_cpu_assignments(struct scx_llm_pin_bpf *skel)
+{
+	struct rvv_task_class task_class;
+	__s32 selected_cpu;
+	__u32 key;
+	__u32 next_key;
+	int class_fd = bpf_map__fd(skel->maps.rvv_task_classes);
+	int cpu_fd = bpf_map__fd(skel->maps.selected_cpu_map);
+	int err;
+
+	printf("\n=== RVV vector CPU assignments ===\n");
+	err = bpf_map_get_next_key(class_fd, NULL, &next_key);
+	while (!err) {
+		key = next_key;
+		if (!bpf_map_lookup_elem(class_fd, &key, &task_class) &&
+		    task_class.is_vector) {
+			selected_cpu = -1;
+			bpf_map_lookup_elem(cpu_fd, &key, &selected_cpu);
+			printf("tid=%u dirty_score=%u selected_cpu=%d\n",
+			       key, task_class.dirty_score, selected_cpu);
+		}
+		err = bpf_map_get_next_key(class_fd, &key, &next_key);
+	}
 	fflush(stdout);
 }
 
@@ -518,6 +547,7 @@ int main(int argc, char **argv)
 
 	// 打印最终统计
 	print_stats(skel);
+	print_vector_cpu_assignments(skel);
 
 cleanup:
 	if (!config.switch_all && moved_threads > 0) {
