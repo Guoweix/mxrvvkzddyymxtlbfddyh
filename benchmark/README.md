@@ -14,6 +14,7 @@ experiments/benchmark/
 ├── compare.sh            # 两个结果目录的简单对比
 ├── verify.sh             # 本地依赖、配置和连通性检查
 ├── run_test.sh           # 默认测试套件包装脚本
+├── linux_affinity_benchmark.sh # Linux task affinity worker pin 对照
 ├── quick_test.sh         # 30s 快速测试
 ├── smoke_test.sh         # 已启动 server 的短请求 smoke test
 ├── test_single.sh        # 单并发诊断请求
@@ -26,6 +27,7 @@ experiments/benchmark/
 experiments/scx_llm_pin/
 experiments/scx_rvv_exclusive/
 experiments/rvv_sched_cost/
+experiments/ggml_barrier_count/
 ```
 
 ## 环境要求
@@ -108,6 +110,12 @@ RVV_TRACE=1 ./benchmark.sh \
 ./benchmark.sh --strategy local_dsq_50ms
 ```
 
+运行不加载 sched_ext 的 Linux worker affinity 对照：
+
+```bash
+./linux_affinity_benchmark.sh
+```
+
 指定测试时长、并发档位、重复次数和 llama 线程数：
 
 ```bash
@@ -138,6 +146,7 @@ RVV_TRACE=1 ./benchmark.sh \
 | `--threads N` | llama.cpp 计算线程数，默认 `8` |
 | `--strategy S` | benchmark 策略，默认 `cfs` |
 | `--vector-slice-ms N` | 覆盖 RVV dirty vector 时间片 |
+| `--vector-local-window-ms N` | 覆盖 RVV dirty vector-local 快速窗口 |
 | `--dirty-threshold N` | 覆盖 RVV dirty 命中阈值 |
 | `--warmup-requests N` | 正式测试前预热请求数，默认跟随并发数 |
 | `--warmup-tokens N` | 每个预热请求生成 token 数，默认 `1` |
@@ -151,6 +160,7 @@ RVV_TRACE=1 ./benchmark.sh \
 | 策略 | 说明 |
 | --- | --- |
 | `cfs` | 默认 CFS baseline，不加载 sched_ext |
+| `linux_affinity` | CFS + Linux task affinity worker pin，不加载 sched_ext |
 | `scx_global` | 最小 sched_ext 全局队列 |
 | `pin_all` | LLM 全 CPU 亲和，保持原 CPU |
 | `pin_0_3_iso_4_7` | LLM CPU0-3，系统任务 CPU4-7 |
@@ -165,10 +175,18 @@ RVV_TRACE=1 ./benchmark.sh \
 | `llm_only_local_dsq_50ms` | 仅 llama-server 线程进入 SCHED_EXT + local DSQ + 50ms |
 | `llm_workers_pin` | 仅运行时间最高的计算 worker 进入 SCHED_EXT + pin |
 | `llm_workers_local_dsq` | 仅运行时间最高的计算 worker 进入 SCHED_EXT + local DSQ |
-| `rvv_dirty_all` | 全核心 RVV Dirty 识别，vector 线程长时间片 |
+| `rvv_dirty_all` | 旧版全核心 RVV Dirty，vector 每次 wakeup 进入 vector DSQ |
+| `rvv_dirty_bind_all` | 仅保留 RVV Dirty 识别和 8 个 vector worker 一核一个；vector 使用默认 slice 并直接进入所选 CPU local DSQ |
+| `rvv_dirty_lease_all` | 500ms lease，并为 8 个 vector worker 分配互不重复的 CPU |
+| `rvv_dirty_lease_unique_all` | `rvv_dirty_lease_all` 的兼容别名 |
 | `rvv_dirty_local_all` | RVV Dirty vector 长时间片 + LLM 辅助线程本地 DSQ |
 | `rvv_dirty_6_2` | CPU0-5 激进计算核心，CPU6-7 普通/回退核心 |
 | `rvv_exclusive_6_2` | CPU2-7 RVV 专用核心，CPU0-1 普通核心 |
+| `rvv_lpedf_all` | 全核心 RVV Dirty + Limited-Preemption EDF vtime DSQ |
+
+`rvv_dirty_lease_all` 的唯一 CPU 分配不是普通 affinity 对照。线程达到 RVV dirty 阈值后，会原子占用一个尚未分配的 CPU，并在后续 wakeup 中继续选择该 CPU。旧 lease 只保留 `prev_cpu`，偶尔会把两个 OpenMP worker 留在同一核；此时 barrier 的 7 个等待者会频繁耗尽自旋并进入 futex，形成百万级 wakeup/dispatch storm。当前所有启用 vector-local window 的 lease 都强制使用唯一 CPU 分配，不再提供旧行为入口。
+
+`rvv_dirty_bind_all` 是唯一 CPU 分配的消融对照。它不启用 vector DSQ、500ms local window 或自定义 vector slice；识别后的 vector worker 只按固定 CPU 进入 local DSQ，其他 LLM 和系统任务仍走 global DSQ。
 
 ## 关键配置
 
@@ -185,15 +203,26 @@ RVV_TRACE=1 ./benchmark.sh \
 | `RESTART_LLM` | `1` | 每轮测试前重启 llama-server |
 | `SCX_AUTO_DEPLOY` | `1` | 自动部署 sched_ext loader 到板端 |
 | `SCX_VECTOR_SLICE_MS` | `0` | RVV dirty vector 时间片，策略 preset 可覆盖 |
+| `SCX_VECTOR_LOCAL_WINDOW_MS` | `500` | vector DSQ 放行后 V 线程继续走 local DSQ 的窗口；旧版 `rvv_dirty_all` preset 设为 `0` |
 | `SCX_DIRTY_THRESHOLD` | `2` | RVV dirty 命中阈值，策略 preset 可覆盖 |
+| `SCX_LPEDF_SEGMENT_MS` | `50` | LP-EDF vector limited-preemption segment |
+| `SCX_LPEDF_PERIOD_MS` | `50` | LP-EDF vector virtual release period |
+| `SCX_LPEDF_DEADLINE_MS` | `50` | LP-EDF vector relative deadline |
 | `RVV_TRACE` | `0` | 是否启动 RVV 上下文切换观测 |
 | `RVV_TRACE_EXTRA_SEC` | `180` | trace 额外采集时间 |
+| `RVV_TRACE_SWITCH_OUT` | `1` | 是否统计 switch-out / RVV save 候选；设为 `0` 时传递 `--no-switch-out` |
+| `RVV_TRACE_SWITCH_REASON` | `1` | 是否统计 V 线程切出理由；设为 `0` 时保留 save/restore 计数但跳过 out-state |
+| `RVV_TRACE_RVV_ONLY` | `0` | 为 `1` 时只累计全局 RVV save/restore 候选，不采样 wakeup、时延、线程或 CPU 细节 |
+| `RVV_TRACE_FUTEX` | `0` | 是否额外统计目标进程 futex wait/wake 系统调用；设为 `1` 时传递 `--futex` |
+| `RVV_TRACE_FUTEX_DETAIL` | `0` | 是否额外统计 futex 地址 + TID 维度；设为 `1` 时传递 `--futex-detail` |
+| `RVV_TRACE_FUTEX_STACK` | `0` | 是否额外记录 futex 地址对应的用户态调用栈 IP；设为 `1` 时传递 `--futex-stack`，并保存 `llama_server_maps.txt` |
 
 移动到 `experiments/benchmark` 后，默认本地工具路径为：
 
 ```bash
 SCX_LOCAL_BIN=../scx_llm_pin/scx_llm_pin
 SCX_EXCLUSIVE_LOCAL_BIN=../scx_rvv_exclusive/scx_rvv_exclusive
+SCX_LPEDF_LOCAL_BIN=../scx_rvv_lpedf/scx_rvv_lpedf
 RVV_LOCAL_BIN=../rvv_sched_cost/rvv_sched_cost
 RVV_LOCAL_LIBELF=../../jupiter-buildroot/output/k1_v2/target/usr/lib/libelf-0.186.so
 ```
@@ -299,6 +328,12 @@ trace 工具会部署并运行 `experiments/rvv_sched_cost/rvv_sched_cost`，输
 
 ```bash
 find results/latest -name rvv_sched_cost.json -print -quit | xargs -r jq '.vector, .lost_ts_updates'
+```
+
+长测中如需降低 trace 开销且仍保留 RVV save/restore 候选计数，可关闭切出理由统计：
+
+```bash
+RVV_TRACE=1 RVV_TRACE_SWITCH_REASON=0 ./benchmark.sh --strategy rvv_dirty_all
 ```
 
 注意：当前 RISC-V Linux 路径没有 lazy vector context handling；在本项目分析口径里，RVV save/restore candidate 基本可按实际 RVV 上下文切换次数理解。

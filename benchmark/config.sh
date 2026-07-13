@@ -15,7 +15,7 @@ export REMOTE_PORT="9090"
 export LLM_THREADS=8          # 计算线程数 (-t)
 export LLM_PARALLEL=4         # 并行槽位数 (-np)
 export LLM_CONTEXT=4096       # 上下文长度 (-c)
-export LLM_PATH="/mnt/llm/llama"
+export LLM_PATH="${LLM_PATH:-/mnt/llm/llama}"
 export RESTART_LLM="${RESTART_LLM:-1}"
 
 # ========================================
@@ -26,7 +26,10 @@ export RESTART_LLM="${RESTART_LLM:-1}"
 #   long_slice, local_dsq, local_dsq_50ms, local_dsq_100ms,
 #   long_slice_isolated, llm_only_pin, llm_only_local_dsq,
 #   llm_only_local_dsq_50ms, llm_workers_pin, llm_workers_local_dsq,
-#   rvv_dirty_all, rvv_dirty_local_all, rvv_dirty_6_2, rvv_exclusive_6_2
+#   rvv_dirty_all, rvv_dirty_bind_all, rvv_dirty_lease_all, rvv_dirty_lease_unique_all,
+#   rvv_dirty_local_all, rvv_dirty_6_2, rvv_exclusive_6_2,
+#   rvv_lpedf_all,
+#   linux_affinity
 export BENCHMARK_STRATEGY="${BENCHMARK_STRATEGY:-cfs}"
 export SCX_AUTO_DEPLOY="${SCX_AUTO_DEPLOY:-1}"
 export SCX_LOCAL_BIN="${SCX_LOCAL_BIN:-../scx_llm_pin/scx_llm_pin}"
@@ -34,6 +37,8 @@ export SCX_REMOTE_DIR="${SCX_REMOTE_DIR:-/tmp/scx_llm_pin}"
 export SCX_REMOTE_LOG="${SCX_REMOTE_LOG:-/tmp/scx_llm_pin.log}"
 export SCX_EXCLUSIVE_LOCAL_BIN="${SCX_EXCLUSIVE_LOCAL_BIN:-../scx_rvv_exclusive/scx_rvv_exclusive}"
 export SCX_EXCLUSIVE_REMOTE_DIR="${SCX_EXCLUSIVE_REMOTE_DIR:-/tmp/scx_rvv_exclusive}"
+export SCX_LPEDF_LOCAL_BIN="${SCX_LPEDF_LOCAL_BIN:-../scx_rvv_lpedf/scx_rvv_lpedf}"
+export SCX_LPEDF_REMOTE_DIR="${SCX_LPEDF_REMOTE_DIR:-/tmp/scx_rvv_lpedf}"
 export SCX_LOADER_STRATEGY="${SCX_LOADER_STRATEGY:-pin}"
 export SCX_LLM_CPUS="${SCX_LLM_CPUS:-0-7}"
 export SCX_SYSTEM_CPUS="${SCX_SYSTEM_CPUS:-0-7}"
@@ -47,8 +52,12 @@ export SCX_VECTOR_CPUS="${SCX_VECTOR_CPUS:-0-7}"
 export SCX_ORDINARY_CPUS="${SCX_ORDINARY_CPUS:-0-7}"
 export SCX_VECTOR_SLICE_MS="${SCX_VECTOR_SLICE_MS:-0}"
 export SCX_ORDINARY_VECTOR_SLICE_MS="${SCX_ORDINARY_VECTOR_SLICE_MS:-0}"
+export SCX_VECTOR_LOCAL_WINDOW_MS="${SCX_VECTOR_LOCAL_WINDOW_MS:-500}"
 export SCX_DIRTY_THRESHOLD="${SCX_DIRTY_THRESHOLD:-2}"
 export SCX_FALLBACK_EVERY="${SCX_FALLBACK_EVERY:-0}"
+export SCX_LPEDF_SEGMENT_MS="${SCX_LPEDF_SEGMENT_MS:-50}"
+export SCX_LPEDF_PERIOD_MS="${SCX_LPEDF_PERIOD_MS:-50}"
+export SCX_LPEDF_DEADLINE_MS="${SCX_LPEDF_DEADLINE_MS:-50}"
 
 # ========================================
 # rvv_sched_cost 调度观测配置
@@ -56,6 +65,12 @@ export SCX_FALLBACK_EVERY="${SCX_FALLBACK_EVERY:-0}"
 export RVV_TRACE="${RVV_TRACE:-0}"
 export RVV_TRACE_AUTO_DEPLOY="${RVV_TRACE_AUTO_DEPLOY:-1}"
 export RVV_TRACE_EXTRA_SEC="${RVV_TRACE_EXTRA_SEC:-180}"
+export RVV_TRACE_SWITCH_OUT="${RVV_TRACE_SWITCH_OUT:-1}"
+export RVV_TRACE_SWITCH_REASON="${RVV_TRACE_SWITCH_REASON:-1}"
+export RVV_TRACE_RVV_ONLY="${RVV_TRACE_RVV_ONLY:-0}"
+export RVV_TRACE_FUTEX="${RVV_TRACE_FUTEX:-0}"
+export RVV_TRACE_FUTEX_DETAIL="${RVV_TRACE_FUTEX_DETAIL:-0}"
+export RVV_TRACE_FUTEX_STACK="${RVV_TRACE_FUTEX_STACK:-0}"
 export RVV_LOCAL_BIN="${RVV_LOCAL_BIN:-../rvv_sched_cost/rvv_sched_cost}"
 export RVV_LOCAL_LIBELF="${RVV_LOCAL_LIBELF:-../../jupiter-buildroot/output/k1_v2/target/usr/lib/libelf-0.186.so}"
 export RVV_REMOTE_DIR="${RVV_REMOTE_DIR:-/tmp/rvv_sched_cost}"
@@ -69,6 +84,14 @@ export CONCURRENCY_LEVELS="${CONCURRENCY_LEVELS:-2,4,8}" # 逗号分隔，例如
 export CONCURRENT_TASKS="${CONCURRENT_TASKS:-4}"   # 兼容旧参数；suite 会按 CONCURRENCY_LEVELS 覆盖
 export TOKENS_PER_REQUEST="${TOKENS_PER_REQUEST:-100}" # 每个请求生成的token数
 export REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-180}" # 单请求curl超时
+
+# ========================================
+# Linux affinity worker pin 配置
+# ========================================
+# 不使用 sched_ext，仅通过 taskset 固定 llama.cpp 计算 worker 的 CPU 亲和性。
+export AFFINITY_PIN_WORKERS="${AFFINITY_PIN_WORKERS:-0}"
+export AFFINITY_WORKER_CPUS="${AFFINITY_WORKER_CPUS:-0-7}"
+export AFFINITY_WORKER_COUNT="${AFFINITY_WORKER_COUNT:-$LLM_THREADS}"
 
 # ========================================
 # 正式测试前预热配置

@@ -17,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
 SCX_VECTOR_SLICE_OVERRIDE_MS=""
+SCX_VECTOR_LOCAL_WINDOW_OVERRIDE_MS=""
 SCX_DIRTY_THRESHOLD_OVERRIDE=""
 
 # ========================================
@@ -93,15 +94,46 @@ require_concurrency_list() {
     fi
 }
 
+expand_cpu_list() {
+    local spec=$1
+    local old_ifs=$IFS
+    local parts=()
+    local cpus=()
+    local part
+
+    IFS=',' read -r -a parts <<< "$spec"
+    IFS=$old_ifs
+
+    for part in "${parts[@]}"; do
+        if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            local start=${BASH_REMATCH[1]}
+            local end=${BASH_REMATCH[2]}
+            local cpu
+            for cpu in $(seq "$start" "$end"); do
+                cpus+=("$cpu")
+            done
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            cpus+=("$part")
+        fi
+    done
+
+    printf '%s\n' "${cpus[@]}"
+}
+
 RESULTS_DIR=$(resolve_local_path "$RESULTS_DIR")
 LOG_DIR=$(resolve_local_path "$LOG_DIR")
 SCX_LOCAL_BIN=$(resolve_local_path "$SCX_LOCAL_BIN")
 SCX_EXCLUSIVE_LOCAL_BIN=$(resolve_local_path "$SCX_EXCLUSIVE_LOCAL_BIN")
+SCX_LPEDF_LOCAL_BIN=$(resolve_local_path "$SCX_LPEDF_LOCAL_BIN")
 RVV_LOCAL_BIN=$(resolve_local_path "$RVV_LOCAL_BIN")
 RVV_LOCAL_LIBELF=$(resolve_local_path "$RVV_LOCAL_LIBELF")
 
 is_rvv_exclusive_scheduler() {
     [ "${SCX_LOADER_STRATEGY:-}" = "rvv_exclusive" ]
+}
+
+is_rvv_lpedf_scheduler() {
+    [ "${SCX_LOADER_STRATEGY:-}" = "rvv_lpedf" ]
 }
 
 apply_strategy_preset() {
@@ -111,6 +143,11 @@ apply_strategy_preset() {
     case "$BENCHMARK_STRATEGY" in
         cfs|baseline)
             BENCHMARK_STRATEGY="cfs"
+            SCX_ENABLED=0
+            SCX_SWITCH_ALL="1"
+            ;;
+        linux_affinity|affinity)
+            BENCHMARK_STRATEGY="linux_affinity"
             SCX_ENABLED=0
             SCX_SWITCH_ALL="1"
             ;;
@@ -241,6 +278,39 @@ apply_strategy_preset() {
             SCX_SYSTEM_SLICE_MS="0"
             SCX_VECTOR_SLICE_MS="100"
             SCX_ORDINARY_VECTOR_SLICE_MS="50"
+            SCX_VECTOR_LOCAL_WINDOW_MS="0"
+            SCX_DIRTY_THRESHOLD="2"
+            SCX_FALLBACK_EVERY="0"
+            SCX_SWITCH_ALL="1"
+            SCX_WORKER_ONLY="0"
+            ;;
+        rvv_dirty_bind|rvv_dirty_bind_all)
+            SCX_LOADER_STRATEGY="rvv_dirty_bind"
+            SCX_LLM_CPUS="0-7"
+            SCX_SYSTEM_CPUS="0-7"
+            SCX_VECTOR_CPUS="0-7"
+            SCX_ORDINARY_CPUS="0-7"
+            SCX_SLICE_MS="0"
+            SCX_SYSTEM_SLICE_MS="0"
+            SCX_VECTOR_SLICE_MS="0"
+            SCX_ORDINARY_VECTOR_SLICE_MS="0"
+            SCX_VECTOR_LOCAL_WINDOW_MS="0"
+            SCX_DIRTY_THRESHOLD="2"
+            SCX_FALLBACK_EVERY="0"
+            SCX_SWITCH_ALL="1"
+            SCX_WORKER_ONLY="0"
+            ;;
+        rvv_dirty_lease|rvv_dirty_lease_all|rvv_dirty_lease_unique|rvv_dirty_lease_unique_all)
+            SCX_LOADER_STRATEGY="rvv_dirty"
+            SCX_LLM_CPUS="0-7"
+            SCX_SYSTEM_CPUS="0-7"
+            SCX_VECTOR_CPUS="0-7"
+            SCX_ORDINARY_CPUS="0-7"
+            SCX_SLICE_MS="0"
+            SCX_SYSTEM_SLICE_MS="0"
+            SCX_VECTOR_SLICE_MS="100"
+            SCX_ORDINARY_VECTOR_SLICE_MS="50"
+            SCX_VECTOR_LOCAL_WINDOW_MS="500"
             SCX_DIRTY_THRESHOLD="2"
             SCX_FALLBACK_EVERY="0"
             SCX_SWITCH_ALL="1"
@@ -256,6 +326,7 @@ apply_strategy_preset() {
             SCX_SYSTEM_SLICE_MS="0"
             SCX_VECTOR_SLICE_MS="100"
             SCX_ORDINARY_VECTOR_SLICE_MS="50"
+            SCX_VECTOR_LOCAL_WINDOW_MS="500"
             SCX_DIRTY_THRESHOLD="2"
             SCX_FALLBACK_EVERY="0"
             SCX_SWITCH_ALL="1"
@@ -271,6 +342,7 @@ apply_strategy_preset() {
             SCX_SYSTEM_SLICE_MS="0"
             SCX_VECTOR_SLICE_MS="200"
             SCX_ORDINARY_VECTOR_SLICE_MS="50"
+            SCX_VECTOR_LOCAL_WINDOW_MS="500"
             SCX_DIRTY_THRESHOLD="2"
             SCX_FALLBACK_EVERY="4"
             SCX_SWITCH_ALL="1"
@@ -291,9 +363,23 @@ apply_strategy_preset() {
             SCX_SWITCH_ALL="1"
             SCX_WORKER_ONLY="0"
             ;;
+        rvv_lpedf_all)
+            SCX_LOADER_STRATEGY="rvv_lpedf"
+            SCX_LLM_CPUS="0-7"
+            SCX_SYSTEM_CPUS="0-7"
+            SCX_VECTOR_CPUS="0-7"
+            SCX_SLICE_MS="0"
+            SCX_SYSTEM_SLICE_MS="0"
+            SCX_DIRTY_THRESHOLD="2"
+            SCX_LPEDF_SEGMENT_MS="50"
+            SCX_LPEDF_PERIOD_MS="50"
+            SCX_LPEDF_DEADLINE_MS="50"
+            SCX_SWITCH_ALL="1"
+            SCX_WORKER_ONLY="0"
+            ;;
         *)
             log_error "未知策略: $BENCHMARK_STRATEGY"
-            echo "可选策略: cfs, scx_global, pin_all, pin_0_3_iso_4_7, pin_4_7_iso_0_3, long_slice, local_dsq, local_dsq_50ms, local_dsq_100ms, long_slice_isolated, llm_only_pin, llm_only_local_dsq, llm_only_local_dsq_50ms, llm_workers_pin, llm_workers_local_dsq, rvv_dirty_all, rvv_dirty_local_all, rvv_dirty_6_2, rvv_exclusive_6_2"
+			echo "可选策略: cfs, linux_affinity, scx_global, pin_all, pin_0_3_iso_4_7, pin_4_7_iso_0_3, long_slice, local_dsq, local_dsq_50ms, local_dsq_100ms, long_slice_isolated, llm_only_pin, llm_only_local_dsq, llm_only_local_dsq_50ms, llm_workers_pin, llm_workers_local_dsq, rvv_dirty_all, rvv_dirty_bind_all, rvv_dirty_lease_all, rvv_dirty_lease_unique_all, rvv_dirty_local_all, rvv_dirty_6_2, rvv_exclusive_6_2, rvv_lpedf_all"
             exit 1
             ;;
     esac
@@ -303,6 +389,7 @@ list_strategies() {
     cat << EOF
 可选策略:
   cfs                    默认 CFS baseline，不加载 sched_ext
+  linux_affinity         CFS + Linux task affinity worker pin，不加载 sched_ext
   scx_global             最小 sched_ext 全局队列
   pin_all                LLM 全 CPU 亲和，保持原 CPU
   pin_0_3_iso_4_7        LLM CPU0-3，系统任务 CPU4-7
@@ -317,10 +404,14 @@ list_strategies() {
   llm_only_local_dsq_50ms 仅 llama-server 线程进入 SCHED_EXT + local DSQ + 50ms
   llm_workers_pin        仅运行时间最高的计算worker进入 SCHED_EXT + pin
   llm_workers_local_dsq  仅运行时间最高的计算worker进入 SCHED_EXT + local DSQ
-  rvv_dirty_all          全核心 RVV Dirty 识别，vector 线程长时间片
+  rvv_dirty_all          旧版全核心 RVV Dirty，vector 每次 wakeup 进入 vector DSQ
+  rvv_dirty_bind_all     仅 RVV Dirty 识别 + 8个vector worker一核一个，默认 slice、本地 DSQ
+  rvv_dirty_lease_all    500ms lease + 8个vector worker一核一个
+  rvv_dirty_lease_unique_all  rvv_dirty_lease_all 的兼容别名
   rvv_dirty_local_all    RVV Dirty vector 长时间片 + LLM 辅助线程本地 DSQ
   rvv_dirty_6_2          CPU0-5 激进计算核心，CPU6-7 普通/回退核心
   rvv_exclusive_6_2      CPU2-7 RVV专用核心，vector 使用长时间片、本地DSQ；CPU0-1 普通核心
+  rvv_lpedf_all          全核心 RVV Dirty + Limited-Preemption EDF vtime DSQ
 EOF
 }
 
@@ -421,6 +512,42 @@ warmup_llm_server() {
     exit 1
 }
 
+validate_warmup_stream() {
+    python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+expected_tokens = int(sys.argv[2])
+token_count = 0
+stopped = False
+
+with open(path, "r", encoding="utf-8") as stream:
+    for raw_line in stream:
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+        tokens = chunk.get("tokens") or []
+        if isinstance(tokens, list):
+            token_count += len(tokens)
+        if chunk.get("stop"):
+            stopped = True
+
+if token_count < expected_tokens or not stopped:
+    sys.exit(1)
+PY
+}
+
 warmup_before_benchmark() {
     local result_dir=$1
     local warmup_dir="$result_dir/pre_bench_warmup"
@@ -459,10 +586,10 @@ warmup_before_benchmark() {
         local i
         for i in $(seq 1 "$warmup_requests"); do
             (
-                curl -s --max-time "$warmup_timeout" "http://$REMOTE_IP:$REMOTE_PORT/completion" \
+                curl -sN --no-buffer --max-time "$warmup_timeout" "http://$REMOTE_IP:$REMOTE_PORT/completion" \
                     -H "Content-Type: application/json" \
-                    -d "{\"prompt\":\"pre benchmark warmup slot $i\",\"n_predict\":$warmup_tokens,\"temperature\":0,\"stream\":false}" \
-                    > "$attempt_dir/slot${i}.json"
+                    -d "{\"prompt\":\"pre benchmark warmup slot $i\",\"n_predict\":$warmup_tokens,\"temperature\":0,\"stream\":true}" \
+                    > "$attempt_dir/slot${i}.sse"
             ) &
             pids+=($!)
         done
@@ -475,8 +602,8 @@ warmup_before_benchmark() {
         done
 
         for i in $(seq 1 "$warmup_requests"); do
-            if ! jq -e 'has("tokens_predicted")' "$attempt_dir/slot${i}.json" >/dev/null 2>&1; then
-                log_warn "warm-up slot $i 未返回 tokens_predicted"
+            if ! validate_warmup_stream "$attempt_dir/slot${i}.sse" "$warmup_tokens"; then
+                log_warn "warm-up slot $i 未收到完整流式响应"
                 failed=1
             fi
         done
@@ -538,6 +665,11 @@ deploy_scheduler() {
         remote_dir="$SCX_EXCLUSIVE_REMOTE_DIR"
         remote_bin="scx_rvv_exclusive"
         build_target="experiments/scx_rvv_exclusive"
+    elif is_rvv_lpedf_scheduler; then
+        local_bin="$SCX_LPEDF_LOCAL_BIN"
+        remote_dir="$SCX_LPEDF_REMOTE_DIR"
+        remote_bin="scx_rvv_lpedf"
+        build_target="experiments/scx_rvv_lpedf"
     else
         local_bin="$SCX_LOCAL_BIN"
         remote_dir="$SCX_REMOTE_DIR"
@@ -559,7 +691,82 @@ deploy_scheduler() {
 
 select_worker_tids() {
     local llm_pid=$1
-    ssh_exec "for t in /proc/$llm_pid/task/*; do tid=\${t##*/}; runtime=\$(awk '{print \$1}' \$t/schedstat 2>/dev/null || echo 0); echo \$runtime \$tid; done | sort -nr | head -n $LLM_THREADS | awk '{if (out) out=out \",\" \$2; else out=\$2} END {print out}'"
+    local limit=${2:-$LLM_THREADS}
+    ssh_exec "for t in /proc/$llm_pid/task/*; do tid=\${t##*/}; runtime=\$(awk '{print \$1}' \$t/schedstat 2>/dev/null || echo 0); echo \$runtime \$tid; done | sort -nr | head -n $limit | awk '{if (out) out=out \",\" \$2; else out=\$2} END {print out}'"
+}
+
+pin_llm_workers_affinity() {
+    local stage=$1
+    local result_dir=$2
+    local llm_pid
+    local tid_list
+    local cpus=()
+    local tids=()
+    local pin_log
+    local affinity_setter="taskset"
+
+    if [ "${AFFINITY_PIN_WORKERS:-0}" != "1" ]; then
+        return 0
+    fi
+
+    llm_pid=$(remote_pid_by_pattern "llama-server")
+    if [ -z "$llm_pid" ]; then
+        log_error "AFFINITY_PIN_WORKERS=1 但找不到 llama-server PID"
+        exit 1
+    fi
+
+    if ! ssh_exec "command -v taskset >/dev/null 2>&1"; then
+        if ssh_exec "python3 -c 'import os; assert hasattr(os, \"sched_setaffinity\")'" >/dev/null 2>&1; then
+            affinity_setter="python3"
+        else
+            log_error "板端缺少 taskset，且 python3 不支持 os.sched_setaffinity"
+            exit 1
+        fi
+    fi
+
+    mapfile -t cpus < <(expand_cpu_list "$AFFINITY_WORKER_CPUS")
+    if [ "${#cpus[@]}" -eq 0 ]; then
+        log_error "AFFINITY_WORKER_CPUS 无法解析: $AFFINITY_WORKER_CPUS"
+        exit 1
+    fi
+
+    tid_list=$(select_worker_tids "$llm_pid" "${AFFINITY_WORKER_COUNT:-$LLM_THREADS}")
+    if [ -z "$tid_list" ]; then
+        log_error "无法选择 llama-server worker TID"
+        exit 1
+    fi
+
+    IFS=',' read -r -a tids <<< "$tid_list"
+    pin_log="$result_dir/affinity_${stage}.txt"
+
+    log_header "Linux affinity worker pin: $stage"
+    log_info "llama_pid=$llm_pid, worker_count=${#tids[@]}, cpus=$AFFINITY_WORKER_CPUS"
+
+    {
+        echo "stage=$stage"
+        echo "llama_pid=$llm_pid"
+        echo "worker_count=${#tids[@]}"
+        echo "worker_cpus=$AFFINITY_WORKER_CPUS"
+        echo "affinity_setter=$affinity_setter"
+        echo "selected_tids=$tid_list"
+        echo ""
+    } > "$pin_log"
+
+    local i
+    for i in "${!tids[@]}"; do
+        local tid=${tids[$i]}
+        local cpu=${cpus[$((i % ${#cpus[@]}))]}
+        log_info "pin TID $tid -> CPU $cpu"
+        {
+            echo "pin tid=$tid cpu=$cpu"
+            if [ "$affinity_setter" = "taskset" ]; then
+                ssh_exec "taskset -pc '$cpu' '$tid' 2>&1; awk '/Cpus_allowed_list/ {print}' /proc/'$tid'/status 2>/dev/null; awk '/se.nr_migrations/ {print}' /proc/'$tid'/sched 2>/dev/null; awk '{print \"schedstat_runtime_ns=\" \$1, \"wait_ns=\" \$2, \"timeslices=\" \$3}' /proc/'$tid'/schedstat 2>/dev/null"
+            else
+                ssh_exec "python3 -c \"import os; os.sched_setaffinity($tid, {$cpu})\" 2>&1 && echo 'pid $tid affinity set to CPU $cpu'; awk '/Cpus_allowed_list/ {print}' /proc/'$tid'/status 2>/dev/null; awk '/se.nr_migrations/ {print}' /proc/'$tid'/sched 2>/dev/null; awk '{print \"schedstat_runtime_ns=\" \$1, \"wait_ns=\" \$2, \"timeslices=\" \$3}' /proc/'$tid'/schedstat 2>/dev/null"
+            fi
+            echo ""
+        } >> "$pin_log"
+    done
 }
 
 start_scheduler() {
@@ -570,7 +777,7 @@ start_scheduler() {
     local scheduler_pattern="scx_llm_pin"
 
     if [ "${SCX_ENABLED:-0}" -ne 1 ]; then
-        log_info "策略: cfs（不加载 sched_ext 调度器）"
+        log_info "策略: $BENCHMARK_STRATEGY（不加载 sched_ext 调度器）"
         return 0
     fi
 
@@ -590,6 +797,10 @@ start_scheduler() {
         scheduler_dir="$SCX_EXCLUSIVE_REMOTE_DIR"
         scheduler_bin="scx_rvv_exclusive"
         scheduler_pattern="scx_rvv_exclusive"
+    elif is_rvv_lpedf_scheduler; then
+        scheduler_dir="$SCX_LPEDF_REMOTE_DIR"
+        scheduler_bin="scx_rvv_lpedf"
+        scheduler_pattern="scx_rvv_lpedf"
     fi
 
     SCX_ACTIVE_PATTERN="$scheduler_pattern"
@@ -598,6 +809,7 @@ start_scheduler() {
     log_info "清理已有 sched_ext 调度器..."
     remote_kill_by_pattern "scx_llm_pin" "-TERM"
     remote_kill_by_pattern "scx_rvv_exclusive" "-TERM"
+    remote_kill_by_pattern "scx_rvv_lpedf" "-TERM"
     sleep 1
 
     if is_rvv_exclusive_scheduler; then
@@ -608,6 +820,28 @@ start_scheduler() {
 
         log_info "启动策略: loader=$SCX_LOADER_STRATEGY, tgid=$llm_pid, compute_cpus=$SCX_VECTOR_CPUS, ordinary_cpus=$SCX_ORDINARY_CPUS, compute_slice=${SCX_VECTOR_SLICE_MS}ms, ordinary_vector_slice=${SCX_ORDINARY_VECTOR_SLICE_MS}ms, dirty_threshold=${SCX_DIRTY_THRESHOLD}, ordinary_every=${SCX_FALLBACK_EVERY}, switch_all=${SCX_SWITCH_ALL}"
         ssh_exec "cd '$scheduler_dir' && nohup ./$scheduler_bin --tgid '$llm_pid' --compute-cpus '$SCX_VECTOR_CPUS' --ordinary-cpus '$SCX_ORDINARY_CPUS' --compute-slice-ms '$SCX_VECTOR_SLICE_MS' --ordinary-vector-slice-ms '$SCX_ORDINARY_VECTOR_SLICE_MS' --system-slice-ms '$SCX_SYSTEM_SLICE_MS' --dirty-threshold '$SCX_DIRTY_THRESHOLD' --ordinary-every '$SCX_FALLBACK_EVERY' $switch_all_arg > '$SCX_ACTIVE_LOG' 2>&1 &"
+        sleep 3
+
+        if [ -n "$(remote_pid_by_pattern "$scheduler_pattern")" ]; then
+            SCX_ACTIVE=1
+            log_info "✓ sched_ext策略已启动"
+            ssh_exec "cat /sys/kernel/sched_ext/state 2>/dev/null || true" > "$result_dir/sched_ext_state_start.txt"
+        else
+            log_error "sched_ext策略启动失败，远端日志如下："
+            ssh_exec "cat '$SCX_ACTIVE_LOG' 2>/dev/null || true"
+            exit 1
+        fi
+        return 0
+    fi
+
+    if is_rvv_lpedf_scheduler; then
+        local switch_all_arg=""
+        if [ "${SCX_SWITCH_ALL:-1}" = "0" ]; then
+            switch_all_arg="--llm-only"
+        fi
+
+        log_info "启动策略: loader=$SCX_LOADER_STRATEGY, tgid=$llm_pid, llm_cpus=$SCX_LLM_CPUS, system_cpus=$SCX_SYSTEM_CPUS, vector_cpus=$SCX_VECTOR_CPUS, segment=${SCX_LPEDF_SEGMENT_MS}ms, period=${SCX_LPEDF_PERIOD_MS}ms, deadline=${SCX_LPEDF_DEADLINE_MS}ms, dirty_threshold=${SCX_DIRTY_THRESHOLD}, switch_all=${SCX_SWITCH_ALL}"
+        ssh_exec "cd '$scheduler_dir' && nohup ./$scheduler_bin --tgid '$llm_pid' --llm-cpus '$SCX_LLM_CPUS' --system-cpus '$SCX_SYSTEM_CPUS' --vector-cpus '$SCX_VECTOR_CPUS' --slice-ms '$SCX_SLICE_MS' --system-slice-ms '$SCX_SYSTEM_SLICE_MS' --segment-ms '$SCX_LPEDF_SEGMENT_MS' --period-ms '$SCX_LPEDF_PERIOD_MS' --deadline-ms '$SCX_LPEDF_DEADLINE_MS' --dirty-threshold '$SCX_DIRTY_THRESHOLD' $switch_all_arg > '$SCX_ACTIVE_LOG' 2>&1 &"
         sleep 3
 
         if [ -n "$(remote_pid_by_pattern "$scheduler_pattern")" ]; then
@@ -639,8 +873,8 @@ start_scheduler() {
         fi
     fi
 
-    log_info "启动策略: loader=$SCX_LOADER_STRATEGY, tgid=$llm_pid, llm_cpus=$SCX_LLM_CPUS, system_cpus=$SCX_SYSTEM_CPUS, vector_cpus=$SCX_VECTOR_CPUS, ordinary_cpus=$SCX_ORDINARY_CPUS, slice=${SCX_SLICE_MS}ms, vector_slice=${SCX_VECTOR_SLICE_MS}ms, ordinary_vector_slice=${SCX_ORDINARY_VECTOR_SLICE_MS}ms, switch_all=${SCX_SWITCH_ALL}, worker_only=${SCX_WORKER_ONLY}"
-    ssh_exec "cd '$scheduler_dir' && nohup ./$scheduler_bin --tgid '$llm_pid' --strategy '$SCX_LOADER_STRATEGY' --llm-cpus '$SCX_LLM_CPUS' --system-cpus '$SCX_SYSTEM_CPUS' --vector-cpus '$SCX_VECTOR_CPUS' --ordinary-cpus '$SCX_ORDINARY_CPUS' --slice-ms '$SCX_SLICE_MS' --system-slice-ms '$SCX_SYSTEM_SLICE_MS' --vector-slice-ms '$SCX_VECTOR_SLICE_MS' --ordinary-vector-slice-ms '$SCX_ORDINARY_VECTOR_SLICE_MS' --dirty-threshold '$SCX_DIRTY_THRESHOLD' --fallback-every '$SCX_FALLBACK_EVERY' $llm_only_arg $tid_list_arg > '$SCX_ACTIVE_LOG' 2>&1 &"
+    log_info "启动策略: loader=$SCX_LOADER_STRATEGY, tgid=$llm_pid, llm_cpus=$SCX_LLM_CPUS, system_cpus=$SCX_SYSTEM_CPUS, vector_cpus=$SCX_VECTOR_CPUS, ordinary_cpus=$SCX_ORDINARY_CPUS, slice=${SCX_SLICE_MS}ms, vector_slice=${SCX_VECTOR_SLICE_MS}ms, ordinary_vector_slice=${SCX_ORDINARY_VECTOR_SLICE_MS}ms, vector_local_window=${SCX_VECTOR_LOCAL_WINDOW_MS}ms, switch_all=${SCX_SWITCH_ALL}, worker_only=${SCX_WORKER_ONLY}"
+    ssh_exec "cd '$scheduler_dir' && nohup ./$scheduler_bin --tgid '$llm_pid' --strategy '$SCX_LOADER_STRATEGY' --llm-cpus '$SCX_LLM_CPUS' --system-cpus '$SCX_SYSTEM_CPUS' --vector-cpus '$SCX_VECTOR_CPUS' --ordinary-cpus '$SCX_ORDINARY_CPUS' --slice-ms '$SCX_SLICE_MS' --system-slice-ms '$SCX_SYSTEM_SLICE_MS' --vector-slice-ms '$SCX_VECTOR_SLICE_MS' --ordinary-vector-slice-ms '$SCX_ORDINARY_VECTOR_SLICE_MS' --vector-local-window-ms '$SCX_VECTOR_LOCAL_WINDOW_MS' --dirty-threshold '$SCX_DIRTY_THRESHOLD' --fallback-every '$SCX_FALLBACK_EVERY' $llm_only_arg $tid_list_arg > '$SCX_ACTIVE_LOG' 2>&1 &"
     sleep 3
 
     if [ -n "$(remote_pid_by_pattern "$scheduler_pattern")" ]; then
@@ -705,6 +939,12 @@ start_rvv_trace() {
     local result_dir=$1
     local llm_pid
     local duration
+    local switch_out_arg=""
+    local switch_reason_arg=""
+    local rvv_only_arg=""
+    local futex_arg=""
+    local futex_detail_arg=""
+    local futex_stack_arg=""
 
     if [ "${RVV_TRACE:-0}" -ne 1 ]; then
         return 0
@@ -725,18 +965,44 @@ start_rvv_trace() {
     duration=$((TEST_DURATION + RVV_TRACE_EXTRA_SEC))
     RVV_TRACE_LOG="/tmp/rvv_sched_cost_${BENCHMARK_STRATEGY}_$(date +%s).log"
     RVV_TRACE_JSON="/tmp/rvv_sched_cost_${BENCHMARK_STRATEGY}_$(date +%s).json"
+    if [ "${RVV_TRACE_SWITCH_OUT:-1}" = "0" ]; then
+        switch_out_arg="--no-switch-out"
+    fi
+    if [ "${RVV_TRACE_SWITCH_REASON:-1}" = "0" ]; then
+        switch_reason_arg="--no-switch-out-state"
+    fi
+    if [ "${RVV_TRACE_RVV_ONLY:-0}" = "1" ]; then
+        rvv_only_arg="--rvv-only"
+    fi
+    if [ "${RVV_TRACE_FUTEX:-0}" = "1" ]; then
+        futex_arg="--futex"
+    fi
+    if [ "${RVV_TRACE_FUTEX_DETAIL:-0}" = "1" ]; then
+        futex_detail_arg="--futex-detail"
+    fi
+    if [ "${RVV_TRACE_FUTEX_STACK:-0}" = "1" ]; then
+        futex_stack_arg="--futex-stack"
+    fi
 
     remote_kill_by_pattern "rvv_sched_cost" "-TERM"
     sleep 1
 
-    log_info "启动rvv_sched_cost: tgid=$llm_pid duration=${duration}s"
-    ssh_exec "cd '$RVV_REMOTE_DIR' && LD_LIBRARY_PATH='$RVV_REMOTE_DIR/lib' nohup ./rvv_sched_cost --tgid '$llm_pid' --duration '$duration' --json '$RVV_TRACE_JSON' > '$RVV_TRACE_LOG' 2>&1 &"
+    ssh_exec "cat /proc/$llm_pid/maps" > "$result_dir/llama_server_maps.txt" 2>/dev/null || true
+
+    log_info "启动rvv_sched_cost: tgid=$llm_pid duration=${duration}s rvv_only=${RVV_TRACE_RVV_ONLY:-0} switch_out=${RVV_TRACE_SWITCH_OUT:-1} switch_reason=${RVV_TRACE_SWITCH_REASON:-1} futex=${RVV_TRACE_FUTEX:-0} futex_detail=${RVV_TRACE_FUTEX_DETAIL:-0} futex_stack=${RVV_TRACE_FUTEX_STACK:-0}"
+    ssh_exec "cd '$RVV_REMOTE_DIR' && LD_LIBRARY_PATH='$RVV_REMOTE_DIR/lib' nohup ./rvv_sched_cost --tgid '$llm_pid' --duration '$duration' --json '$RVV_TRACE_JSON' $rvv_only_arg $switch_out_arg $switch_reason_arg $futex_arg $futex_detail_arg $futex_stack_arg > '$RVV_TRACE_LOG' 2>&1 &"
     sleep 2
 
     if [ -n "$(remote_pid_by_pattern "rvv_sched_cost")" ]; then
         RVV_TRACE_ACTIVE=1
         echo "rvv_sched_cost log: $RVV_TRACE_LOG" > "$result_dir/rvv_trace_info.txt"
         echo "rvv_sched_cost json: $RVV_TRACE_JSON" >> "$result_dir/rvv_trace_info.txt"
+        echo "rvv_sched_cost switch_out: ${RVV_TRACE_SWITCH_OUT:-1}" >> "$result_dir/rvv_trace_info.txt"
+        echo "rvv_sched_cost switch_reason: ${RVV_TRACE_SWITCH_REASON:-1}" >> "$result_dir/rvv_trace_info.txt"
+        echo "rvv_sched_cost rvv_only: ${RVV_TRACE_RVV_ONLY:-0}" >> "$result_dir/rvv_trace_info.txt"
+        echo "rvv_sched_cost futex: ${RVV_TRACE_FUTEX:-0}" >> "$result_dir/rvv_trace_info.txt"
+        echo "rvv_sched_cost futex_detail: ${RVV_TRACE_FUTEX_DETAIL:-0}" >> "$result_dir/rvv_trace_info.txt"
+        echo "rvv_sched_cost futex_stack: ${RVV_TRACE_FUTEX_STACK:-0}" >> "$result_dir/rvv_trace_info.txt"
         log_info "✓ rvv_sched_cost已启动"
     else
         log_error "rvv_sched_cost启动失败，远端日志如下："
@@ -1015,8 +1281,12 @@ SCX Vector CPUs: $SCX_VECTOR_CPUS
 SCX Ordinary CPUs: $SCX_ORDINARY_CPUS
 SCX Vector Slice ms: $SCX_VECTOR_SLICE_MS
 SCX Ordinary Vector Slice ms: $SCX_ORDINARY_VECTOR_SLICE_MS
+SCX Vector Local Window ms: $SCX_VECTOR_LOCAL_WINDOW_MS
 SCX Dirty Threshold: $SCX_DIRTY_THRESHOLD
 SCX Fallback Every: $SCX_FALLBACK_EVERY
+SCX LPEDF Segment ms: $SCX_LPEDF_SEGMENT_MS
+SCX LPEDF Period ms: $SCX_LPEDF_PERIOD_MS
+SCX LPEDF Deadline ms: $SCX_LPEDF_DEADLINE_MS
 Pre Benchmark Warmup: $PRE_BENCH_WARMUP
 Pre Benchmark Warmup Requests: $PRE_BENCH_WARMUP_REQUESTS
 Pre Benchmark Warmup Tokens: $PRE_BENCH_WARMUP_TOKENS
@@ -1025,6 +1295,15 @@ Pre Benchmark Warmup Timeout: $PRE_BENCH_WARMUP_TIMEOUT
 Pre Benchmark Warmup Strict: $PRE_BENCH_WARMUP_STRICT
 RVV Trace: $RVV_TRACE
 RVV Trace Extra sec: $RVV_TRACE_EXTRA_SEC
+RVV Trace Switch Out: $RVV_TRACE_SWITCH_OUT
+RVV Trace Switch Reason: $RVV_TRACE_SWITCH_REASON
+RVV Trace RVV Only: $RVV_TRACE_RVV_ONLY
+RVV Trace Futex: $RVV_TRACE_FUTEX
+RVV Trace Futex Detail: $RVV_TRACE_FUTEX_DETAIL
+RVV Trace Futex Stack: $RVV_TRACE_FUTEX_STACK
+Affinity Pin Workers: $AFFINITY_PIN_WORKERS
+Affinity Worker CPUs: $AFFINITY_WORKER_CPUS
+Affinity Worker Count: $AFFINITY_WORKER_COUNT
 EOF
 
     # 记录系统信息
@@ -1032,12 +1311,16 @@ EOF
     ssh_exec "uname -a" > "$result_dir/system_info.txt"
     ssh_exec "cat /proc/cpuinfo | grep -E 'processor|model name|cpu MHz' | head -20" >> "$result_dir/system_info.txt"
     ssh_exec "free -h" >> "$result_dir/system_info.txt"
+    ssh_exec "dmesg" > "$result_dir/dmesg_before.log"
 
     # 启动调度策略（CFS baseline 时为空操作）
     start_scheduler "$result_dir"
 
     # 正式计时前预热 llama-server 并发 slot，避免首个正式请求承担冷启动成本
     warmup_before_benchmark "$result_dir"
+
+    # Linux 原生 affinity 对照：在正式测试前固定高 runtime worker TID 到指定 CPU
+    pin_llm_workers_affinity "pre_benchmark" "$result_dir"
 
     # 启动调度观测，覆盖正式benchmark窗口和请求收尾阶段
     start_rvv_trace "$result_dir"
@@ -1084,6 +1367,27 @@ EOF
 
     # 停止调度器并抓取统计日志
     stop_scheduler "$result_dir"
+
+    ssh_exec "dmesg" > "$result_dir/dmesg_after.log"
+    python3 - "$result_dir/dmesg_before.log" "$result_dir/dmesg_after.log" \
+        > "$result_dir/dmesg_delta.log" <<'PY'
+import sys
+from pathlib import Path
+
+before = Path(sys.argv[1]).read_text(errors="replace").splitlines(keepends=True)
+after = Path(sys.argv[2]).read_text(errors="replace").splitlines(keepends=True)
+
+if after[:len(before)] == before:
+    sys.stdout.writelines(after[len(before):])
+else:
+    last_before = before[-1] if before else None
+    if last_before in after:
+        index = len(after) - 1 - after[::-1].index(last_before)
+        sys.stdout.writelines(after[index + 1:])
+    else:
+        sys.stdout.write("# Unable to align dmesg snapshots; full after snapshot follows.\n")
+        sys.stdout.writelines(after)
+PY
 
     # 生成汇总报告
     generate_report "$result_dir"
@@ -1211,8 +1515,12 @@ generate_report() {
         echo "SCX Ordinary CPUs: $SCX_ORDINARY_CPUS"
         echo "SCX Vector Slice: ${SCX_VECTOR_SLICE_MS}ms"
         echo "SCX Ordinary Vector Slice: ${SCX_ORDINARY_VECTOR_SLICE_MS}ms"
+        echo "SCX Vector Local Window: ${SCX_VECTOR_LOCAL_WINDOW_MS}ms"
         echo "SCX Dirty Threshold: $SCX_DIRTY_THRESHOLD"
         echo "SCX Fallback Every: $SCX_FALLBACK_EVERY"
+        echo "SCX LPEDF Segment: ${SCX_LPEDF_SEGMENT_MS}ms"
+        echo "SCX LPEDF Period: ${SCX_LPEDF_PERIOD_MS}ms"
+        echo "SCX LPEDF Deadline: ${SCX_LPEDF_DEADLINE_MS}ms"
         echo "Pre Benchmark Warmup: $PRE_BENCH_WARMUP"
         echo "Pre Benchmark Warmup Requests: $PRE_BENCH_WARMUP_REQUESTS"
         echo "Pre Benchmark Warmup Tokens: $PRE_BENCH_WARMUP_TOKENS"
@@ -1220,6 +1528,12 @@ generate_report() {
         echo "Pre Benchmark Warmup Timeout: $PRE_BENCH_WARMUP_TIMEOUT"
         echo "Pre Benchmark Warmup Strict: $PRE_BENCH_WARMUP_STRICT"
         echo "RVV Trace: $RVV_TRACE"
+        echo "RVV Trace Switch Out: $RVV_TRACE_SWITCH_OUT"
+        echo "RVV Trace Switch Reason: $RVV_TRACE_SWITCH_REASON"
+        echo "RVV Trace RVV Only: $RVV_TRACE_RVV_ONLY"
+        echo "RVV Trace Futex: $RVV_TRACE_FUTEX"
+        echo "RVV Trace Futex Detail: $RVV_TRACE_FUTEX_DETAIL"
+        echo "RVV Trace Futex Stack: $RVV_TRACE_FUTEX_STACK"
         echo ""
 
         if [ -f "$result_dir/pre_bench_warmup/status.txt" ]; then
@@ -1439,6 +1753,15 @@ Concurrency levels: $CONCURRENCY_LEVELS
 Tokens per request: $TOKENS_PER_REQUEST
 Request timeout: ${REQUEST_TIMEOUT_SEC}s
 RVV Trace: $RVV_TRACE
+RVV Trace Switch Out: $RVV_TRACE_SWITCH_OUT
+RVV Trace Switch Reason: $RVV_TRACE_SWITCH_REASON
+RVV Trace RVV Only: $RVV_TRACE_RVV_ONLY
+RVV Trace Futex: $RVV_TRACE_FUTEX
+RVV Trace Futex Detail: $RVV_TRACE_FUTEX_DETAIL
+RVV Trace Futex Stack: $RVV_TRACE_FUTEX_STACK
+Affinity Pin Workers: $AFFINITY_PIN_WORKERS
+Affinity Worker CPUs: $AFFINITY_WORKER_CPUS
+Affinity Worker Count: $AFFINITY_WORKER_COUNT
 EOF
 
     log_info "套件目录: $suite_dir"
@@ -1550,6 +1873,10 @@ main() {
                 SCX_VECTOR_SLICE_OVERRIDE_MS="$2"
                 shift 2
                 ;;
+            --vector-local-window-ms)
+                SCX_VECTOR_LOCAL_WINDOW_OVERRIDE_MS="$2"
+                shift 2
+                ;;
             --dirty-threshold)
                 SCX_DIRTY_THRESHOLD_OVERRIDE="$2"
                 shift 2
@@ -1570,6 +1897,7 @@ main() {
                 echo "  --threads N    LLM计算线程数（默认8）"
                 echo "  --strategy S   测试策略（默认cfs，使用 --list-strategies 查看）"
                 echo "  --vector-slice-ms N  覆盖 RVV dirty vector 时间片（毫秒）"
+                echo "  --vector-local-window-ms N  覆盖 RVV local fast-path 窗口（毫秒）"
                 echo "  --dirty-threshold N  覆盖 RVV dirty 命中阈值"
                 echo "  --warmup-requests N  正式测试前预热请求数（默认跟随当前并发档位）"
                 echo "  --warmup-tokens N    每个预热请求生成token数（默认1）"
@@ -1612,6 +1940,13 @@ main() {
             exit 1
         fi
         SCX_VECTOR_SLICE_MS="$SCX_VECTOR_SLICE_OVERRIDE_MS"
+    fi
+    if [ -n "$SCX_VECTOR_LOCAL_WINDOW_OVERRIDE_MS" ]; then
+        if ! [[ "$SCX_VECTOR_LOCAL_WINDOW_OVERRIDE_MS" =~ ^[0-9]+$ ]]; then
+            log_error "SCX_VECTOR_LOCAL_WINDOW_OVERRIDE_MS 必须是非负整数，当前值: $SCX_VECTOR_LOCAL_WINDOW_OVERRIDE_MS"
+            exit 1
+        fi
+        SCX_VECTOR_LOCAL_WINDOW_MS="$SCX_VECTOR_LOCAL_WINDOW_OVERRIDE_MS"
     fi
     if [ -n "$SCX_DIRTY_THRESHOLD_OVERRIDE" ]; then
         if ! [[ "$SCX_DIRTY_THRESHOLD_OVERRIDE" =~ ^[0-9]+$ ]] || [ "$SCX_DIRTY_THRESHOLD_OVERRIDE" -eq 0 ]; then
