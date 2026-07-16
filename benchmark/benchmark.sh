@@ -456,7 +456,7 @@ check_requirements() {
 start_llm_server() {
     log_header "启动LLM服务器"
 
-    log_info "配置: -t $LLM_THREADS -np $LLM_PARALLEL -c $LLM_CONTEXT"
+    log_info "配置: -t $LLM_THREADS -tb $LLM_THREADS_BATCH -np $LLM_PARALLEL -c $LLM_CONTEXT, GOMP_SPINCOUNT=${GOMP_SPINCOUNT:-default}"
 
     if [ "${RESTART_LLM:-1}" = "1" ]; then
         # 停止现有服务器
@@ -466,7 +466,11 @@ start_llm_server() {
 
         # 启动服务器
         log_info "启动llama-server..."
-        ssh_exec "cd $LLM_PATH && THREADS=$LLM_THREADS PARALLEL=$LLM_PARALLEL CTX=$LLM_CONTEXT nohup ./run-server.sh > /tmp/llama-server.log 2>&1 &"
+        local gomp_env=""
+        if [ -n "${GOMP_SPINCOUNT:-}" ]; then
+            gomp_env="GOMP_SPINCOUNT=$GOMP_SPINCOUNT"
+        fi
+        ssh_exec "cd '$LLM_PATH' && $gomp_env THREADS=$LLM_THREADS THREADS_BATCH=$LLM_THREADS_BATCH PARALLEL=$LLM_PARALLEL CTX=$LLM_CONTEXT nohup ./run-server.sh > /tmp/llama-server.log 2>&1 &"
     else
         log_info "复用现有llama-server（RESTART_LLM=0）..."
     fi
@@ -643,6 +647,67 @@ warmup_before_benchmark() {
 stop_llm_server() {
     log_info "停止LLM服务器..."
     remote_kill_by_pattern "llama-server" "-9"
+}
+
+run_phase_gate() {
+    local result_dir=$1
+    local gate_script="$SCRIPT_DIR/phase_gate.py"
+    local attempt=1
+    local max_retries=${PHASE_GATE_MAX_RETRIES:-5}
+
+    if [ "${PHASE_GATE_ENABLED:-1}" != "1" ]; then
+        log_warn "正式测试前相位门禁已关闭（PHASE_GATE_ENABLED=0）"
+        return 0
+    fi
+
+    while [ "$attempt" -le "$max_retries" ]; do
+        local gate_output="$result_dir/phase_gate_attempt${attempt}.json"
+        log_header "相位门禁 $attempt/$max_retries"
+        log_info "统一释放首请求并检查首 token spread <= ${PHASE_GATE_THRESHOLD_MS}ms"
+
+        set +e
+        python3 "$gate_script" \
+            --url "http://$REMOTE_IP:$REMOTE_PORT/completion" \
+            --prompt "$PROMPT_1" \
+            --concurrency "$CONCURRENT_TASKS" \
+            --tokens "${PHASE_GATE_TOKENS:-1}" \
+            --threshold-ms "${PHASE_GATE_THRESHOLD_MS:-100}" \
+            --lead-sec "${SYNC_START_LEAD_SEC:-3}" \
+            --timeout-sec "${PHASE_GATE_TIMEOUT_SEC:-60}" \
+            --output "$gate_output" > "$result_dir/phase_gate_attempt${attempt}.log"
+        local rc=$?
+        set -e
+
+        if [ "$rc" -eq 0 ]; then
+            cp "$gate_output" "$result_dir/phase_gate.json"
+            log_info "✓ 相位门禁通过: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["spread_ms"])' "$gate_output")ms"
+            return 0
+        fi
+        if [ "$rc" -ne 2 ]; then
+            log_error "相位门禁执行失败，详见 $result_dir/phase_gate_attempt${attempt}.log"
+            stop_scheduler "$result_dir"
+            stop_llm_server
+            return 1
+        fi
+
+        log_warn "相位门禁未通过，将重启 server/scheduler 后重试"
+        if [ "$attempt" -eq "$max_retries" ]; then
+            log_error "相位门禁连续 $max_retries 次未通过"
+            stop_scheduler "$result_dir"
+            stop_llm_server
+            return 1
+        fi
+        stop_scheduler "$result_dir"
+        stop_llm_server
+        sleep 2
+        start_llm_server
+        start_scheduler "$result_dir"
+        warmup_before_benchmark "$result_dir"
+        pin_llm_workers_affinity "phase_gate_retry${attempt}" "$result_dir"
+        attempt=$((attempt + 1))
+    done
+
+    return 1
 }
 
 # ========================================
@@ -962,7 +1027,11 @@ start_rvv_trace() {
         exit 1
     fi
 
-    duration=$((TEST_DURATION + RVV_TRACE_EXTRA_SEC))
+    if [ "${FIXED_TOTAL_TOKENS:-1000}" -gt 0 ]; then
+        duration=$((${FIXED_REQUEST_TIMEOUT_SEC:-600} + RVV_TRACE_EXTRA_SEC))
+    else
+        duration=$((TEST_DURATION + RVV_TRACE_EXTRA_SEC))
+    fi
     RVV_TRACE_LOG="/tmp/rvv_sched_cost_${BENCHMARK_STRATEGY}_$(date +%s).log"
     RVV_TRACE_JSON="/tmp/rvv_sched_cost_${BENCHMARK_STRATEGY}_$(date +%s).json"
     if [ "${RVV_TRACE_SWITCH_OUT:-1}" = "0" ]; then
@@ -1054,11 +1123,19 @@ run_single_task() {
     local task_id=$1
     local prompt=$2
     local output_file=$3
+    local sync_mono_start=${4:-}
+    local sync_wall_start=${5:-}
+    local requested_tokens=${6:-$TOKENS_PER_REQUEST}
+    local fixed_mode=${7:-0}
+    local task_timeout=${8:-${REQUEST_TIMEOUT_SEC:-180}}
 
     log_info "[Task $task_id] 开始测试..."
 
     python3 - "$task_id" "$prompt" "$output_file" "$REMOTE_IP" "$REMOTE_PORT" \
-        "$TEST_DURATION" "$TOKENS_PER_REQUEST" "${REQUEST_TIMEOUT_SEC:-180}" <<'PY'
+        "$TEST_DURATION" "$requested_tokens" "$task_timeout" \
+        "$sync_mono_start" "$sync_wall_start" "${SYNC_START_SPIN_MS:-2}" \
+        "${REQUEST_TEMPERATURE:-0}" "${REQUEST_SEED:-1234}" "${REQUEST_IGNORE_EOS:-1}" \
+        "$fixed_mode" <<'PY'
 import csv
 import json
 import subprocess
@@ -1073,14 +1150,33 @@ remote_port = sys.argv[5]
 test_duration = float(sys.argv[6])
 tokens_per_request = int(sys.argv[7])
 request_timeout = float(sys.argv[8])
+sync_mono_start = float(sys.argv[9]) if sys.argv[9] else None
+sync_wall_start = float(sys.argv[10]) if sys.argv[10] else None
+sync_spin_sec = max(0.0, float(sys.argv[11]) / 1000.0)
+request_temperature = float(sys.argv[12])
+request_seed = int(sys.argv[13])
+request_ignore_eos = sys.argv[14] == "1"
+fixed_mode = sys.argv[15] == "1"
+
+if sync_mono_start is not None:
+    # Sleep until the shared release point, then use a short bounded spin to
+    # reduce wakeup jitter without spinning for the whole lead interval.
+    while True:
+        remaining = sync_mono_start - time.monotonic()
+        if remaining <= sync_spin_sec:
+            break
+        time.sleep(remaining - sync_spin_sec)
+    while time.monotonic() < sync_mono_start:
+        pass
 
 url = f"http://{remote_ip}:{remote_port}/completion"
 csv_path = f"{output_file}.csv"
 summary_path = f"{output_file}.summary"
 
-start_time = time.time()
-deadline = start_time + test_duration
+start_time = sync_wall_start if sync_wall_start is not None else time.time()
+deadline = start_time + (request_timeout if fixed_mode else test_duration)
 first_token_time = None
+first_token_timestamp = None
 last_token_time = None
 total_tokens = 0
 request_count = 0
@@ -1110,7 +1206,9 @@ with open(csv_path, "w", newline="") as csv_file:
         payload = {
             "prompt": prompt,
             "n_predict": tokens_per_request,
-            "temperature": 0.7,
+            "temperature": request_temperature,
+            "seed": request_seed,
+            "ignore_eos": request_ignore_eos,
             "stream": True,
         }
         cmd = [
@@ -1174,6 +1272,7 @@ with open(csv_path, "w", newline="") as csv_file:
                         req_first_token_ms = req_last_token_ms
                     if first_token_time is None:
                         first_token_time = req_first_token_ms
+                        first_token_timestamp = now
                         print(f"[INFO] [Task {task_id}] 首字延迟: {first_token_time:.3f}ms", flush=True)
 
                 if chunk.get("stop"):
@@ -1210,19 +1309,31 @@ with open(csv_path, "w", newline="") as csv_file:
             ])
             csv_file.flush()
 
+        if fixed_mode:
+            if not completed or req_tokens != tokens_per_request:
+                raise SystemExit(
+                    f"fixed-token request incomplete: expected={tokens_per_request} "
+                    f"received={req_tokens} completed={completed}"
+                )
+            break
+
         if time.time() < deadline:
             time.sleep(0.5)
 
 duration = (last_token_time - start_time) if last_token_time is not None else 0.0
 avg_toks = total_tokens / duration if duration > 0 else 0.0
 first = "" if first_token_time is None else f"{first_token_time:.3f}"
+first_ts = "" if first_token_timestamp is None else f"{first_token_timestamp:.9f}"
 last_ts = "" if last_token_time is None else f"{last_token_time:.9f}"
 
 with open(summary_path, "w") as f:
     f.write(f"Task ID: {task_id}\n")
     f.write(f"Prompt: {prompt[:50]}...\n")
     f.write(f"Configured Duration: {test_duration:.3f}s\n")
+    f.write(f"Fixed Token Mode: {int(fixed_mode)}\n")
+    f.write(f"Requested Tokens: {tokens_per_request}\n")
     f.write(f"Start Timestamp: {start_time:.9f}\n")
+    f.write(f"First Token Timestamp: {first_ts}\n")
     f.write(f"Last Token Timestamp: {last_ts}\n")
     f.write(f"Duration: {duration:.3f}s\n")
     f.write(f"Total Requests: {request_count}\n")
@@ -1256,6 +1367,8 @@ Benchmark Configuration
 Date: $(date)
 Remote IP: $REMOTE_IP
 LLM Threads: $LLM_THREADS
+LLM Batch Threads: $LLM_THREADS_BATCH
+GOMP_SPINCOUNT: ${GOMP_SPINCOUNT:-default}
 Parallel Slots: $LLM_PARALLEL
 Context Length: $LLM_CONTEXT
 Test Duration: ${TEST_DURATION}s
@@ -1265,6 +1378,18 @@ Current Loop: ${CURRENT_LOOP_INDEX:-1}
 Concurrent Tasks: $CONCURRENT_TASKS
 Tokens per Request: $TOKENS_PER_REQUEST
 Request Timeout: ${REQUEST_TIMEOUT_SEC}s
+Fixed Total Tokens: ${FIXED_TOTAL_TOKENS:-1000}
+Fixed Request Timeout: ${FIXED_REQUEST_TIMEOUT_SEC:-600}s
+Request Temperature: ${REQUEST_TEMPERATURE:-0}
+Request Seed: ${REQUEST_SEED:-1234}
+Request Ignore EOS: ${REQUEST_IGNORE_EOS:-1}
+Synchronized Concurrent Start: ${SYNC_CONCURRENT_START:-1}
+Synchronized Start Lead: ${SYNC_START_LEAD_SEC:-3}s
+Synchronized Start Spin: ${SYNC_START_SPIN_MS:-2}ms
+Phase Gate Enabled: ${PHASE_GATE_ENABLED:-1}
+Phase Gate Threshold: ${PHASE_GATE_THRESHOLD_MS:-100}ms
+Phase Gate Max Retries: ${PHASE_GATE_MAX_RETRIES:-5}
+Phase Gate Tokens: ${PHASE_GATE_TOKENS:-1}
 Restart LLM: $RESTART_LLM
 Benchmark Strategy: $BENCHMARK_STRATEGY
 SCX Enabled: ${SCX_ENABLED:-0}
@@ -1322,6 +1447,9 @@ EOF
     # Linux 原生 affinity 对照：在正式测试前固定高 runtime worker TID 到指定 CPU
     pin_llm_workers_affinity "pre_benchmark" "$result_dir"
 
+    # 只有首 token 相位通过门禁后，才开始正式计时和 RVV tracing。
+    run_phase_gate "$result_dir"
+
     # 启动调度观测，覆盖正式benchmark窗口和请求收尾阶段
     start_rvv_trace "$result_dir"
 
@@ -1330,29 +1458,68 @@ EOF
 
     local pids=()
     local task_id
+    local fixed_mode=0
+    local fixed_total=${FIXED_TOTAL_TOKENS:-1000}
+    local fixed_base=0
+    local fixed_remainder=0
+    if [ "$fixed_total" -gt 0 ]; then
+        fixed_mode=1
+        fixed_base=$((fixed_total / CONCURRENT_TASKS))
+        fixed_remainder=$((fixed_total % CONCURRENT_TASKS))
+        log_info "固定总token模式: total=$fixed_total, base_per_task=$fixed_base, remainder=$fixed_remainder"
+    fi
+    local sync_mono_start=""
+    local sync_wall_start=""
+    if [ "${SYNC_CONCURRENT_START:-1}" = "1" ]; then
+        read -r sync_mono_start sync_wall_start < <(python3 - "${SYNC_START_LEAD_SEC:-3}" <<'PY'
+import sys
+import time
+
+lead = float(sys.argv[1])
+now_mono = time.monotonic()
+now_wall = time.time()
+print(f"{now_mono + lead:.9f} {now_wall + lead:.9f}")
+PY
+)
+        log_info "并发首请求统一释放: monotonic=$sync_mono_start, wall=$sync_wall_start"
+    else
+        log_info "并发首请求对齐已关闭（SYNC_CONCURRENT_START=0）"
+    fi
 
     for task_id in $(seq 1 "$CONCURRENT_TASKS"); do
         local prompt
+        local task_tokens=$TOKENS_PER_REQUEST
+        local task_timeout=${REQUEST_TIMEOUT_SEC:-180}
         prompt=$(get_task_prompt "$task_id")
-        (run_single_task "$task_id" "$prompt" "$result_dir/task${task_id}") &
+        if [ "$fixed_mode" -eq 1 ]; then
+            task_tokens=$fixed_base
+            if [ "$task_id" -le "$fixed_remainder" ]; then
+                task_tokens=$((task_tokens + 1))
+            fi
+            task_timeout=${FIXED_REQUEST_TIMEOUT_SEC:-600}
+        fi
+        (run_single_task "$task_id" "$prompt" "$result_dir/task${task_id}" \
+            "$sync_mono_start" "$sync_wall_start" "$task_tokens" "$fixed_mode" "$task_timeout") &
         pids+=($!)
     done
 
     log_info "所有任务已启动，等待完成..."
 
-    # 显示进度
-    local elapsed=0
-    while [ $elapsed -lt $TEST_DURATION ]; do
-        local step=10
-        if [ $((TEST_DURATION - elapsed)) -lt $step ]; then
-            step=$((TEST_DURATION - elapsed))
-        fi
-        sleep $step
-        elapsed=$((elapsed + step))
-        local percent=$((elapsed * 100 / TEST_DURATION))
-        echo -ne "\r进度: [$elapsed/${TEST_DURATION}s] ${percent}% "
-    done
-    echo ""
+    if [ "$fixed_mode" -eq 0 ]; then
+        # 固定时长模式保留原有进度显示。
+        local elapsed=0
+        while [ $elapsed -lt $TEST_DURATION ]; do
+            local step=10
+            if [ $((TEST_DURATION - elapsed)) -lt $step ]; then
+                step=$((TEST_DURATION - elapsed))
+            fi
+            sleep $step
+            elapsed=$((elapsed + step))
+            local percent=$((elapsed * 100 / TEST_DURATION))
+            echo -ne "\r进度: [$elapsed/${TEST_DURATION}s] ${percent}% "
+        done
+        echo ""
+    fi
 
     # 等待所有任务完成
     log_info "等待所有任务结束..."
@@ -1421,6 +1588,7 @@ total_requests = 0
 ttfts = []
 durations = []
 start_timestamps = []
+first_token_timestamps = []
 last_token_timestamps = []
 
 for csv_file in sorted(result_dir.glob("task*.csv")):
@@ -1460,12 +1628,25 @@ for summary_file in sorted(result_dir.glob("task*.summary")):
                     last_token_timestamps.append(float(raw))
                 except ValueError:
                     pass
+        elif line.startswith("First Token Timestamp:"):
+            raw = line.split(":", 1)[1].strip()
+            if raw:
+                try:
+                    first_token_timestamps.append(float(raw))
+                except ValueError:
+                    pass
 
 if start_timestamps and last_token_timestamps:
     duration = max(last_token_timestamps) - min(start_timestamps)
 else:
     duration = max(durations) if durations else 0.0
 tps = (total_tokens / duration) if duration > 0 else 0.0
+if first_token_timestamps and last_token_timestamps:
+    decode_duration = max(last_token_timestamps) - min(first_token_timestamps)
+else:
+    decode_duration = 0.0
+decode_tokens = max(0, total_tokens - len(first_token_timestamps))
+decode_tps = decode_tokens / decode_duration if decode_duration > 0 else 0.0
 avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else 0.0
 if ttfts:
     ordered = sorted(ttfts)
@@ -1481,6 +1662,9 @@ print(f"duration_sec={duration:.3f}")
 print(f"total_requests={total_requests}")
 print(f"total_tokens={total_tokens}")
 print(f"tps={tps:.3f}")
+print(f"decode_duration_sec={decode_duration:.3f}")
+print(f"decode_tokens={decode_tokens}")
+print(f"decode_tps={decode_tps:.3f}")
 print(f"avg_ttft_ms={avg_ttft:.3f}")
 print(f"p95_ttft_ms={p95_ttft:.3f}")
 print(f"ttft_samples={len(ttfts)}")
@@ -1503,6 +1687,11 @@ generate_report() {
         echo "配置窗口: ${TEST_DURATION}s"
         echo "并发任务: $CONCURRENT_TASKS"
         echo "策略: $BENCHMARK_STRATEGY"
+        echo "Fixed Total Tokens: ${FIXED_TOTAL_TOKENS:-1000}"
+        echo "Fixed Request Timeout: ${FIXED_REQUEST_TIMEOUT_SEC:-600}s"
+        echo "Request Temperature: ${REQUEST_TEMPERATURE:-0}"
+        echo "Request Seed: ${REQUEST_SEED:-1234}"
+        echo "Request Ignore EOS: ${REQUEST_IGNORE_EOS:-1}"
         echo "SCX加载策略: $SCX_LOADER_STRATEGY"
         echo "SCX LLM CPUs: $SCX_LLM_CPUS"
         echo "SCX System CPUs: $SCX_SYSTEM_CPUS"
@@ -1527,6 +1716,13 @@ generate_report() {
         echo "Pre Benchmark Warmup Retries: $PRE_BENCH_WARMUP_RETRIES"
         echo "Pre Benchmark Warmup Timeout: $PRE_BENCH_WARMUP_TIMEOUT"
         echo "Pre Benchmark Warmup Strict: $PRE_BENCH_WARMUP_STRICT"
+        echo "Synchronized Concurrent Start: ${SYNC_CONCURRENT_START:-1}"
+        echo "Synchronized Start Lead: ${SYNC_START_LEAD_SEC:-3}s"
+        echo "Synchronized Start Spin: ${SYNC_START_SPIN_MS:-2}ms"
+        echo "Phase Gate Enabled: ${PHASE_GATE_ENABLED:-1}"
+        echo "Phase Gate Threshold: ${PHASE_GATE_THRESHOLD_MS:-100}ms"
+        echo "Phase Gate Max Retries: ${PHASE_GATE_MAX_RETRIES:-5}"
+        echo "Phase Gate Tokens: ${PHASE_GATE_TOKENS:-1}"
         echo "RVV Trace: $RVV_TRACE"
         echo "RVV Trace Switch Out: $RVV_TRACE_SWITCH_OUT"
         echo "RVV Trace Switch Reason: $RVV_TRACE_SWITCH_REASON"
@@ -1566,9 +1762,12 @@ generate_report() {
             # shellcheck disable=SC1091
             source "$result_dir/metrics.env"
             echo "TPS: ${tps} tok/s"
+            echo "Decode TPS: ${decode_tps} tok/s"
             echo "总请求数: $total_requests"
             echo "总Token数: $total_tokens"
             echo "统计时长: ${duration_sec}s"
+            echo "Decode Token数: $decode_tokens"
+            echo "Decode统计时长: ${decode_duration_sec}s"
             echo "平均TTFT: ${avg_ttft_ms}ms"
             echo "p95TTFT: ${p95_ttft_ms}ms"
             echo "TTFT样本数: $ttft_samples"
@@ -1639,6 +1838,18 @@ def p95(values):
     idx = max(0, math.ceil(0.95 * len(ordered)) - 1)
     return ordered[idx]
 
+def mean(values):
+    return sum(values) / len(values) if values else 0.0
+
+def variance(values):
+    if len(values) < 2:
+        return 0.0
+    average = mean(values)
+    return sum((value - average) ** 2 for value in values) / (len(values) - 1)
+
+def sd(values):
+    return math.sqrt(variance(values))
+
 def read_ttfts(run_dir):
     values = []
     for csv_file in sorted(run_dir.glob("task*.csv")):
@@ -1665,7 +1876,7 @@ summary_csv = suite_dir / "summary.csv"
 with summary_csv.open("w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow([
-        "concurrency", "loop", "tps", "avg_ttft_ms", "p95_ttft_ms",
+        "concurrency", "loop", "tps", "decode_tps", "avg_ttft_ms", "p95_ttft_ms",
         "total_requests", "total_tokens", "duration_sec", "result_dir"
     ])
     for run in runs:
@@ -1673,6 +1884,7 @@ with summary_csv.open("w", newline="") as f:
             run.get("concurrency", ""),
             run.get("loop", ""),
             run.get("tps", ""),
+            run.get("decode_tps", ""),
             run.get("avg_ttft_ms", ""),
             run.get("p95_ttft_ms", ""),
             run.get("total_requests", ""),
@@ -1695,24 +1907,35 @@ print(f"CSV: summary.csv")
 print("")
 print("Per-concurrency aggregate:")
 print("")
-print("Concurrency | Runs | TPS(avg) | TPS(total) | TTFT(avg ms) | p95TTFT(ms) | Requests")
+print("Concurrency | Runs | E2E TPS(mean+/-sd) | Decode TPS(mean+/-sd) | TTFT(mean+/-sd ms) | p95TTFT(mean+/-sd ms) | Requests")
 print("--- | ---: | ---: | ---: | ---: | ---: | ---:")
 
 for concurrency in sorted(groups, key=lambda x: int(x) if x.isdigit() else x):
     items = groups[concurrency]
     tps_values = [float(x.get("tps", 0) or 0) for x in items]
+    decode_tps_values = [float(x.get("decode_tps", 0) or 0) for x in items]
     total_tokens = sum(int(float(x.get("total_tokens", 0) or 0)) for x in items)
     total_duration = sum(float(x.get("duration_sec", 0) or 0) for x in items)
     total_requests = sum(int(float(x.get("total_requests", 0) or 0)) for x in items)
     all_ttfts = []
     for item in items:
         all_ttfts.extend(item.get("ttfts", []))
-    avg_tps = sum(tps_values) / len(tps_values) if tps_values else 0.0
-    total_tps = total_tokens / total_duration if total_duration > 0 else 0.0
-    avg_ttft = sum(all_ttfts) / len(all_ttfts) if all_ttfts else 0.0
+    avg_tps = mean(tps_values)
+    run_avg_ttfts = [float(x.get("avg_ttft_ms", 0) or 0) for x in items]
+    run_p95_ttfts = [float(x.get("p95_ttft_ms", 0) or 0) for x in items]
+    avg_ttft = mean(all_ttfts)
+    pooled_p95 = p95(all_ttfts)
     print(
-        f"{concurrency} | {len(items)} | {avg_tps:.3f} | {total_tps:.3f} | "
-        f"{avg_ttft:.3f} | {p95(all_ttfts):.3f} | {total_requests}"
+        f"{concurrency} | {len(items)} | {avg_tps:.3f}+/-{sd(tps_values):.3f} | "
+        f"{mean(decode_tps_values):.3f}+/-{sd(decode_tps_values):.3f} | "
+        f"{mean(run_avg_ttfts):.3f}+/-{sd(run_avg_ttfts):.3f} | "
+        f"{mean(run_p95_ttfts):.3f}+/-{sd(run_p95_ttfts):.3f} | {total_requests}"
+    )
+    print(
+        f"  variance: TPS={variance(tps_values):.6f}, "
+        f"decode_TPS={variance(decode_tps_values):.6f}, "
+        f"avg_ttft_ms={variance(run_avg_ttfts):.3f}, "
+        f"p95_ttft_ms={variance(run_p95_ttfts):.3f}; pooled_p95TTFT={pooled_p95:.3f}ms"
     )
 
 print("")
@@ -1722,6 +1945,7 @@ for run in runs:
     print(
         f"- c={run.get('concurrency')} loop={run.get('loop')}: "
         f"TPS={float(run.get('tps', 0) or 0):.3f}, "
+        f"decode_TPS={float(run.get('decode_tps', 0) or 0):.3f}, "
         f"TTFT={float(run.get('avg_ttft_ms', 0) or 0):.3f}ms, "
         f"p95TTFT={float(run.get('p95_ttft_ms', 0) or 0):.3f}ms, "
         f"requests={run.get('total_requests')}, dir={run.get('result_dir')}"
@@ -1739,6 +1963,12 @@ run_benchmark_suite() {
     local suite_dir
     timestamp=$(date +%Y%m%d_%H%M%S)
     strategy_slug=$(printf '%s' "$BENCHMARK_STRATEGY" | tr -c 'A-Za-z0-9_.-' '_')
+    if [ -n "${GOMP_SPINCOUNT:-}" ]; then
+        strategy_slug="${strategy_slug}_gomp${GOMP_SPINCOUNT}"
+    fi
+    if [ "${FIXED_TOTAL_TOKENS:-1000}" -gt 0 ]; then
+        strategy_slug="${strategy_slug}_fixed${FIXED_TOTAL_TOKENS}"
+    fi
     suite_dir="$RESULTS_DIR/${timestamp}_${strategy_slug}_suite"
     mkdir -p "$suite_dir" "$LOG_DIR"
 
@@ -1752,6 +1982,14 @@ Benchmark loops: $BENCHMARK_LOOPS
 Concurrency levels: $CONCURRENCY_LEVELS
 Tokens per request: $TOKENS_PER_REQUEST
 Request timeout: ${REQUEST_TIMEOUT_SEC}s
+Fixed total tokens: ${FIXED_TOTAL_TOKENS:-1000}
+Fixed request timeout: ${FIXED_REQUEST_TIMEOUT_SEC:-600}s
+Request temperature: ${REQUEST_TEMPERATURE:-0}
+Request seed: ${REQUEST_SEED:-1234}
+Request ignore EOS: ${REQUEST_IGNORE_EOS:-1}
+LLM threads (-t): $LLM_THREADS
+LLM batch threads (-tb): $LLM_THREADS_BATCH
+GOMP_SPINCOUNT: ${GOMP_SPINCOUNT:-default}
 RVV Trace: $RVV_TRACE
 RVV Trace Switch Out: $RVV_TRACE_SWITCH_OUT
 RVV Trace Switch Reason: $RVV_TRACE_SWITCH_REASON
@@ -1765,7 +2003,11 @@ Affinity Worker Count: $AFFINITY_WORKER_COUNT
 EOF
 
     log_info "套件目录: $suite_dir"
-    log_info "并发档位: $CONCURRENCY_LEVELS; 每档轮数: $BENCHMARK_LOOPS; 单轮窗口: ${TEST_DURATION}s"
+    if [ "${FIXED_TOTAL_TOKENS:-1000}" -gt 0 ]; then
+        log_info "并发档位: $CONCURRENCY_LEVELS; 每档轮数: $BENCHMARK_LOOPS; 固定总token: ${FIXED_TOTAL_TOKENS}"
+    else
+        log_info "并发档位: $CONCURRENCY_LEVELS; 每档轮数: $BENCHMARK_LOOPS; 单轮窗口: ${TEST_DURATION}s"
+    fi
 
     local old_ifs=$IFS
     local levels=()
@@ -1844,6 +2086,10 @@ main() {
                 TOKENS_PER_REQUEST="$2"
                 shift 2
                 ;;
+            --total-tokens)
+                FIXED_TOTAL_TOKENS="$2"
+                shift 2
+                ;;
             --warmup-requests)
                 PRE_BENCH_WARMUP_REQUESTS="$2"
                 PRE_BENCH_WARMUP_REQUESTS_AUTO=0
@@ -1863,6 +2109,14 @@ main() {
                 ;;
             --threads)
                 LLM_THREADS="$2"
+                shift 2
+                ;;
+            --threads-batch)
+                LLM_THREADS_BATCH="$2"
+                shift 2
+                ;;
+            --gomp-spincount)
+                GOMP_SPINCOUNT="$2"
                 shift 2
                 ;;
             --strategy)
@@ -1889,12 +2143,15 @@ main() {
                 echo "用法: $0 [选项]"
                 echo ""
                 echo "选项:"
-                echo "  --duration N   单轮测试窗口（秒，默认300）"
+                echo "  --duration N   固定时长模式窗口（秒，--total-tokens 0 时使用）"
                 echo "  --tasks N      只测试单个并发数（兼容旧参数）"
                 echo "  --concurrency-levels L  并发档位列表（默认2,4,8）"
                 echo "  --loops N      每个并发档位重复轮数（默认1）"
                 echo "  --tokens N     每个请求生成token数（默认100）"
-                echo "  --threads N    LLM计算线程数（默认8）"
+                echo "  --total-tokens N  固定总输出token数（默认1000；0恢复固定时长模式）"
+                echo "  --threads N    单 token/generation 计算线程数 -t（默认8）"
+                echo "  --threads-batch N  多 token/prompt batch 线程数 -tb（默认跟随 --threads）"
+                echo "  --gomp-spincount N  GNU libgomp barrier 自旋次数（默认使用板端默认值）"
                 echo "  --strategy S   测试策略（默认cfs，使用 --list-strategies 查看）"
                 echo "  --vector-slice-ms N  覆盖 RVV dirty vector 时间片（毫秒）"
                 echo "  --vector-local-window-ms N  覆盖 RVV local fast-path 窗口（毫秒）"
@@ -1914,6 +2171,10 @@ main() {
         esac
     done
 
+    if [ -z "$LLM_THREADS_BATCH" ]; then
+        LLM_THREADS_BATCH="$LLM_THREADS"
+    fi
+
     # 创建输出目录
     mkdir -p "$RESULTS_DIR" "$LOG_DIR"
 
@@ -1926,12 +2187,60 @@ main() {
     require_positive_int "BENCHMARK_LOOPS" "$BENCHMARK_LOOPS"
     require_positive_int "TOKENS_PER_REQUEST" "$TOKENS_PER_REQUEST"
     require_positive_int "REQUEST_TIMEOUT_SEC" "$REQUEST_TIMEOUT_SEC"
+    if ! [[ "${FIXED_TOTAL_TOKENS:-1000}" =~ ^[0-9]+$ ]]; then
+        log_error "FIXED_TOTAL_TOKENS 必须是非负整数"
+        exit 1
+    fi
+    require_positive_int "FIXED_REQUEST_TIMEOUT_SEC" "${FIXED_REQUEST_TIMEOUT_SEC:-600}"
+    if [ "${FIXED_TOTAL_TOKENS:-1000}" -gt 0 ] && [ "${FIXED_TOTAL_TOKENS:-1000}" -lt "$CONCURRENT_TASKS" ]; then
+        log_error "FIXED_TOTAL_TOKENS 必须不小于并发任务数"
+        exit 1
+    fi
+    if ! [[ "${REQUEST_TEMPERATURE:-0}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        log_error "REQUEST_TEMPERATURE 必须是非负数字"
+        exit 1
+    fi
+    if ! [[ "${REQUEST_SEED:-1234}" =~ ^[0-9]+$ ]]; then
+        log_error "REQUEST_SEED 必须是非负整数"
+        exit 1
+    fi
+    if ! [[ "${REQUEST_IGNORE_EOS:-1}" =~ ^[01]$ ]]; then
+        log_error "REQUEST_IGNORE_EOS 必须是 0 或 1"
+        exit 1
+    fi
     require_positive_int "LLM_THREADS" "$LLM_THREADS"
+    require_positive_int "LLM_THREADS_BATCH" "$LLM_THREADS_BATCH"
+    if [ -n "${GOMP_SPINCOUNT:-}" ]; then
+        require_positive_int "GOMP_SPINCOUNT" "$GOMP_SPINCOUNT"
+    fi
     require_positive_int "PRE_BENCH_WARMUP_REQUESTS" "$PRE_BENCH_WARMUP_REQUESTS"
     require_positive_int "PRE_BENCH_WARMUP_TOKENS" "$PRE_BENCH_WARMUP_TOKENS"
     require_positive_int "PRE_BENCH_WARMUP_RETRIES" "$PRE_BENCH_WARMUP_RETRIES"
     require_positive_int "PRE_BENCH_WARMUP_TIMEOUT" "$PRE_BENCH_WARMUP_TIMEOUT"
     require_concurrency_list "CONCURRENCY_LEVELS" "$CONCURRENCY_LEVELS"
+    if ! [[ "${SYNC_CONCURRENT_START:-1}" =~ ^[01]$ ]]; then
+        log_error "SYNC_CONCURRENT_START 必须是 0 或 1"
+        exit 1
+    fi
+    if ! [[ "${SYNC_START_LEAD_SEC:-3}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        log_error "SYNC_START_LEAD_SEC 必须是非负数字"
+        exit 1
+    fi
+    if ! [[ "${SYNC_START_SPIN_MS:-2}" =~ ^[0-9]+$ ]]; then
+        log_error "SYNC_START_SPIN_MS 必须是非负整数"
+        exit 1
+    fi
+    if ! [[ "${PHASE_GATE_ENABLED:-1}" =~ ^[01]$ ]]; then
+        log_error "PHASE_GATE_ENABLED 必须是 0 或 1"
+        exit 1
+    fi
+    if ! [[ "${PHASE_GATE_THRESHOLD_MS:-100}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        log_error "PHASE_GATE_THRESHOLD_MS 必须是非负数字"
+        exit 1
+    fi
+    require_positive_int "PHASE_GATE_MAX_RETRIES" "${PHASE_GATE_MAX_RETRIES:-5}"
+    require_positive_int "PHASE_GATE_TOKENS" "${PHASE_GATE_TOKENS:-1}"
+    require_positive_int "PHASE_GATE_TIMEOUT_SEC" "${PHASE_GATE_TIMEOUT_SEC:-60}"
 
     apply_strategy_preset
     if [ -n "$SCX_VECTOR_SLICE_OVERRIDE_MS" ]; then

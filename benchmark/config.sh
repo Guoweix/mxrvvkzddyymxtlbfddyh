@@ -12,9 +12,13 @@ export REMOTE_PORT="9090"
 # ========================================
 # LLM配置
 # ========================================
-export LLM_THREADS=8          # 计算线程数 (-t)
+export LLM_THREADS=8          # 单 token / generation 计算线程数 (-t)
+# 留空时在参数解析后跟随 LLM_THREADS；也可通过环境变量或 --threads-batch 单独覆盖。
+export LLM_THREADS_BATCH="${LLM_THREADS_BATCH:-}" # 多 token / prompt batch 线程数 (-tb)
 export LLM_PARALLEL=4         # 并行槽位数 (-np)
 export LLM_CONTEXT=4096       # 上下文长度 (-c)
+# GNU libgomp barrier spin count；留空表示使用板端默认值。
+export GOMP_SPINCOUNT="${GOMP_SPINCOUNT:-}"
 export LLM_PATH="${LLM_PATH:-/mnt/llm/llama}"
 export RESTART_LLM="${RESTART_LLM:-1}"
 
@@ -84,6 +88,20 @@ export CONCURRENCY_LEVELS="${CONCURRENCY_LEVELS:-2,4,8}" # 逗号分隔，例如
 export CONCURRENT_TASKS="${CONCURRENT_TASKS:-4}"   # 兼容旧参数；suite 会按 CONCURRENCY_LEVELS 覆盖
 export TOKENS_PER_REQUEST="${TOKENS_PER_REQUEST:-100}" # 每个请求生成的token数
 export REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-180}" # 单请求curl超时
+export FIXED_TOTAL_TOKENS="${FIXED_TOTAL_TOKENS:-1000}" # 非零时启用固定总token模式
+export FIXED_REQUEST_TIMEOUT_SEC="${FIXED_REQUEST_TIMEOUT_SEC:-600}"
+export REQUEST_TEMPERATURE="${REQUEST_TEMPERATURE:-0}"
+export REQUEST_SEED="${REQUEST_SEED:-1234}"
+export REQUEST_IGNORE_EOS="${REQUEST_IGNORE_EOS:-1}"
+# 并发 worker 在统一绝对时间点发出首个正式请求；后续请求保持自然连续。
+export SYNC_CONCURRENT_START="${SYNC_CONCURRENT_START:-1}"
+export SYNC_START_LEAD_SEC="${SYNC_START_LEAD_SEC:-3}"
+export SYNC_START_SPIN_MS="${SYNC_START_SPIN_MS:-2}"
+export PHASE_GATE_ENABLED="${PHASE_GATE_ENABLED:-1}"
+export PHASE_GATE_THRESHOLD_MS="${PHASE_GATE_THRESHOLD_MS:-100}"
+export PHASE_GATE_MAX_RETRIES="${PHASE_GATE_MAX_RETRIES:-5}"
+export PHASE_GATE_TOKENS="${PHASE_GATE_TOKENS:-1}"
+export PHASE_GATE_TIMEOUT_SEC="${PHASE_GATE_TIMEOUT_SEC:-60}"
 
 # ========================================
 # Linux affinity worker pin 配置

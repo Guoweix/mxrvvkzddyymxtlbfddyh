@@ -46,6 +46,7 @@ REMOTE_USER=root
 REMOTE_PASS=bianbu
 REMOTE_PORT=9090
 LLM_THREADS=8
+LLM_THREADS_BATCH=        # 留空时跟随 LLM_THREADS
 LLM_PARALLEL=4
 LLM_CONTEXT=4096
 LLM_PATH=/mnt/llm/llama
@@ -56,6 +57,8 @@ LLM_PATH=/mnt/llm/llama
 ```text
 /mnt/llm/llama/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf
 ```
+
+默认 benchmark 使用固定总输出模式：并发请求同步发出，并将 `FIXED_TOTAL_TOKENS=1000` 均分到各并发槽位。计时从统一释放点到最后一个 token，另外报告从第一个输出 token 到最后一个 token 的 decode TPS。设置 `--total-tokens 0` 可恢复旧的固定时长连续请求模式。
 
 先检查环境：
 
@@ -122,6 +125,14 @@ RVV_TRACE=1 ./benchmark.sh \
 ./benchmark.sh --strategy cfs --duration 300 --concurrency-levels 2,4,8 --loops 3 --threads 8
 ```
 
+分别设置 generation 单 token 线程数 `-t` 和 prompt/multi-token batch 线程数 `-tb`：
+
+```bash
+./benchmark.sh --strategy cfs --tasks 1 --threads 6 --threads-batch 8
+```
+
+未指定 `--threads-batch` 时，`-tb` 自动跟随 `--threads`，保持 llama.cpp 默认配置语义。
+
 关闭正式测试前预热：
 
 ```bash
@@ -154,6 +165,23 @@ RVV_TRACE=1 ./benchmark.sh \
 | `--no-warmup` | 跳过正式测试前预热 |
 | `--list-strategies` | 列出可用策略 |
 | `--help` | 显示帮助 |
+
+旧 benchmark 默认让所有并发 worker 在同一个绝对时间点释放首个正式请求，以减少启动相位差。可通过环境变量调整：
+
+```bash
+SYNC_CONCURRENT_START=1 SYNC_START_LEAD_SEC=3 SYNC_START_SPIN_MS=2
+```
+
+只对齐首个请求；之后每个 worker 独立连续发送请求，不在每轮请求之间增加人为同步。
+
+默认还会在正式计时前执行相位门禁：用同样的并发数同步发出探测请求，比较各请求首 token 时间；若 spread 超过 `PHASE_GATE_THRESHOLD_MS`，当前 server/scheduler 会被重启并重新预热，最多重试 `PHASE_GATE_MAX_RETRIES` 次。相关配置为：
+
+```bash
+PHASE_GATE_ENABLED=1 PHASE_GATE_THRESHOLD_MS=100 \
+PHASE_GATE_MAX_RETRIES=5 PHASE_GATE_TOKENS=1
+```
+
+每轮会保存 `phase_gate_attempt*.json` 和最终的 `phase_gate.json`。只有通过门禁的 server 状态才进入正式统计。
 
 ## 策略说明
 
@@ -200,6 +228,11 @@ RVV_TRACE=1 ./benchmark.sh \
 | `CONCURRENCY_LEVELS` | `2,4,8` | 并发档位列表 |
 | `TOKENS_PER_REQUEST` | `100` | 每个请求生成 token 数 |
 | `REQUEST_TIMEOUT_SEC` | `180` | 单请求 curl 超时 |
+| `FIXED_TOTAL_TOKENS` | `1000` | 固定总输出 token；`0` 表示固定时长模式 |
+| `FIXED_REQUEST_TIMEOUT_SEC` | `600` | 固定 token 模式的单请求超时 |
+| `REQUEST_TEMPERATURE` | `0` | 正式请求采样温度；默认使用确定性贪心解码 |
+| `REQUEST_SEED` | `1234` | 正式请求固定随机种子 |
+| `REQUEST_IGNORE_EOS` | `1` | 忽略 EOS，完整请求生成指定 token 数 |
 | `RESTART_LLM` | `1` | 每轮测试前重启 llama-server |
 | `SCX_AUTO_DEPLOY` | `1` | 自动部署 sched_ext loader 到板端 |
 | `SCX_VECTOR_SLICE_MS` | `0` | RVV dirty vector 时间片，策略 preset 可覆盖 |
@@ -337,6 +370,20 @@ RVV_TRACE=1 RVV_TRACE_SWITCH_REASON=0 ./benchmark.sh --strategy rvv_dirty_all
 ```
 
 注意：当前 RISC-V Linux 路径没有 lazy vector context handling；在本项目分析口径里，RVV save/restore candidate 基本可按实际 RVV 上下文切换次数理解。
+
+## np=4 Decode Barrier Blocked-Time
+
+`benchmark/barrier_c4/run_compare.sh` 是独立的 barrier 对照测试。它固定
+`-np 4`、并发 4、`-t 8 -tb 8`，使用 32-token 短 prompt 和较长流式输出，比较
+CFS、稳定版 `rvv_dirty_lease` 或当前 `rvv_barrier_gang` 的 OpenMP 主导 futex
+blocked time。该脚本使用
+`rvv_sched_cost --futex-only` 的 syscall enter/exit 配对，不使用会在当前内核触发
+`SIGILL` 的 barrier uprobe。完整口径和命令见 `benchmark/barrier_c4/README.md`。
+
+```bash
+cd benchmark/barrier_c4
+./run_compare.sh
+```
 
 ## 故障排除
 
