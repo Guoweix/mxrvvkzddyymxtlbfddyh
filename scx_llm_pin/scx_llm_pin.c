@@ -15,6 +15,9 @@
 #include <stdarg.h>
 #include <dirent.h>
 #include <sched.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <limits.h>
 #include <linux/bpf.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -45,6 +48,180 @@ static int libbpf_log(enum libbpf_print_level level, const char *fmt, va_list ar
 	if (level == LIBBPF_DEBUG)
 		return 0;
 	return vfprintf(stderr, fmt, args);
+}
+
+static const char *control_mode_name(__u32 mode)
+{
+	switch (mode) {
+	case RVV_LEASE_CONTROL_OFF:
+		return "off";
+	case RVV_LEASE_CONTROL_OBSERVE:
+		return "observe";
+	case RVV_LEASE_CONTROL_ACTIVE:
+		return "active";
+	default:
+		return "unknown";
+	}
+}
+
+static int parse_control_mode(const char *str, __u32 *mode)
+{
+	if (!strcmp(str, "off"))
+		*mode = RVV_LEASE_CONTROL_OFF;
+	else if (!strcmp(str, "observe"))
+		*mode = RVV_LEASE_CONTROL_OBSERVE;
+	else if (!strcmp(str, "active"))
+		*mode = RVV_LEASE_CONTROL_ACTIVE;
+	else
+		return -EINVAL;
+	return 0;
+}
+
+static __u64 new_control_session_id(void)
+{
+	struct timespec ts = {};
+	__u64 value;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	value = ((__u64)ts.tv_sec << 32) ^ (__u64)ts.tv_nsec ^
+		((__u64)getpid() << 16);
+	return value ? value : 1;
+}
+
+static int parse_cpu_order(const char *str,
+			   __u32 cpus[RVV_LEASE_CONTROL_WORKERS],
+			   __u32 *enabled)
+{
+	bool seen[RVV_LEASE_CONTROL_WORKERS] = {};
+	char *saveptr = NULL;
+	char *token;
+	char *tmp;
+	__u32 count = 0;
+
+	if (!strcmp(str, "auto")) {
+		*enabled = 0;
+		return 0;
+	}
+
+	tmp = strdup(str);
+	if (!tmp)
+		return -ENOMEM;
+	for (token = strtok_r(tmp, ",", &saveptr); token;
+	     token = strtok_r(NULL, ",", &saveptr)) {
+		char *end = NULL;
+		long cpu;
+
+		if (count >= RVV_LEASE_CONTROL_WORKERS) {
+			free(tmp);
+			return -EINVAL;
+		}
+		errno = 0;
+		cpu = strtol(token, &end, 10);
+		if (errno || !end || *end != '\0' || cpu < 0 ||
+		    cpu >= RVV_LEASE_CONTROL_WORKERS || seen[cpu]) {
+			free(tmp);
+			return -EINVAL;
+		}
+		seen[cpu] = true;
+		cpus[count++] = (__u32)cpu;
+	}
+	free(tmp);
+	if (count != RVV_LEASE_CONTROL_WORKERS)
+		return -EINVAL;
+	*enabled = 1;
+	return 0;
+}
+
+static int initialize_and_pin_control_maps(
+	struct scx_llm_pin_bpf *skel, const char *dir,
+	const struct llm_pin_config *config, char *config_path,
+	size_t config_path_size, char *worker_path, size_t worker_path_size)
+{
+	struct rvv_lease_worker_page page = {};
+	__u32 key = 0;
+	int err;
+
+	if (mkdir(dir, 0700) && errno != EEXIST)
+		return -errno;
+	if (snprintf(config_path, config_path_size, "%s/%s", dir,
+		     RVV_LEASE_CONFIG_MAP_NAME) >= (int)config_path_size ||
+	    snprintf(worker_path, worker_path_size, "%s/%s", dir,
+		     RVV_LEASE_WORKER_MAP_NAME) >= (int)worker_path_size)
+		return -ENAMETOOLONG;
+	if (!access(config_path, F_OK) || !access(worker_path, F_OK)) {
+		fprintf(stderr, "control map path already exists under %s\n", dir);
+		return -EEXIST;
+	}
+
+	page.header.magic = RVV_LEASE_CONTROL_MAGIC;
+	page.header.abi_version = RVV_LEASE_CONTROL_ABI_VERSION;
+	page.header.active = 1;
+	page.header.target_tgid = config->target_tgid;
+	page.header.max_workers = RVV_LEASE_CONTROL_WORKERS;
+	page.header.loader_pid = (__u32)getpid();
+	page.header.session_id = config->user_session_id;
+	page.header.policy_epoch = config->user_policy_epoch;
+	err = bpf_map__update_elem(skel->maps.user_worker_map, &key,
+				   sizeof(key), &page, sizeof(page), BPF_ANY);
+	if (err)
+		return err;
+	err = bpf_map__pin(skel->maps.config_map, config_path);
+	if (err)
+		return err;
+	err = bpf_map__pin(skel->maps.user_worker_map, worker_path);
+	if (err) {
+		bpf_map__unpin(skel->maps.config_map, config_path);
+		return err;
+	}
+	chmod(config_path, 0600);
+	chmod(worker_path, 0600);
+	return 0;
+}
+
+static void deactivate_and_unpin_control_maps(
+	struct scx_llm_pin_bpf *skel, const char *dir, const char *config_path,
+	const char *worker_path, bool pinned)
+{
+	struct rvv_lease_worker_page page = {};
+	__u32 key = 0;
+
+	if (!pinned || !skel)
+		return;
+	if (!bpf_map__lookup_elem(skel->maps.user_worker_map, &key, sizeof(key),
+				  &page, sizeof(page), 0)) {
+		page.header.active = 0;
+		bpf_map__update_elem(skel->maps.user_worker_map, &key, sizeof(key),
+				     &page, sizeof(page), BPF_ANY);
+	}
+	bpf_map__unpin(skel->maps.user_worker_map, worker_path);
+	bpf_map__unpin(skel->maps.config_map, config_path);
+	rmdir(dir);
+}
+
+static void print_worker_page(struct scx_llm_pin_bpf *skel)
+{
+	struct rvv_lease_worker_page page = {};
+	__u32 key = 0;
+
+	if (bpf_map__lookup_elem(skel->maps.user_worker_map, &key, sizeof(key),
+				 &page, sizeof(page), 0) || !page.header.active)
+		return;
+	printf("\n=== userspace lease workers ===\n");
+	printf("active=%u tgid=%u session=%llu epoch=%llu abi=%u\n",
+	       page.header.active, page.header.target_tgid,
+	       (unsigned long long)page.header.session_id,
+	       (unsigned long long)page.header.policy_epoch,
+	       page.header.abi_version);
+	for (__u32 ith = 0; ith < RVV_LEASE_CONTROL_WORKERS; ith++) {
+		const struct rvv_lease_worker_slot *slot = &page.workers[ith];
+
+		if (!slot->sequence || !slot->tid)
+			continue;
+		printf("lease_worker ith=%u tid=%u tgid=%u n_threads=%u session=%llu seq=%u\n",
+		       slot->ith, slot->tid, slot->tgid, slot->n_threads,
+		       (unsigned long long)slot->session_id, slot->sequence);
+	}
+	fflush(stdout);
 }
 
 // 解析 CPU 范围字符串（如 "0-3" 或 "0,2,4"）
@@ -251,6 +428,18 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	printf("RVV vector slice clamps:     %llu\n", stats.rvv_vector_slice_clamps);
 	printf("RVV vector identify barrier dispatches: %llu\n",
 	       stats.rvv_vector_identify_barrier_dispatches);
+	printf("User hint classification reads: %llu\n",
+	       stats.user_hint_classification_reads);
+	printf("User hint valid workers:       %llu\n",
+	       stats.user_hint_valid_workers);
+	printf("User hint observed workers:    %llu\n",
+	       stats.user_hint_observed_workers);
+	printf("User hint active workers:      %llu\n",
+	       stats.user_hint_active_workers);
+	printf("User hint active assignments:  %llu\n",
+	       stats.user_hint_active_assignments);
+	printf("User hint invalid/fallback:    %llu/%llu\n",
+	       stats.user_hint_invalid_workers, stats.user_hint_fallbacks);
 	fflush(stdout);
 }
 
@@ -272,13 +461,22 @@ static void print_vector_cpu_assignments(struct scx_llm_pin_bpf *skel)
 		    task_class.is_vector) {
 			selected_cpu = -1;
 			bpf_map_lookup_elem(cpu_fd, &key, &selected_cpu);
-			printf("tid=%u dirty_score=%u selected_cpu=%d\n",
-			       key, task_class.dirty_score, selected_cpu);
+			printf("tid=%u dirty_score=%u selected_cpu=%d user_ith=%d user_session=%llu\n",
+			       key, task_class.dirty_score, selected_cpu,
+			       task_class.user_ith_plus1 ?
+			       (int)task_class.user_ith_plus1 - 1 : -1,
+			       (unsigned long long)task_class.user_session_id);
 		}
 		err = bpf_map_get_next_key(class_fd, &key, &next_key);
 	}
 	fflush(stdout);
 }
+
+enum {
+	OPT_USER_CONTROL = 1000,
+	OPT_CONTROL_DIR,
+	OPT_USER_CPU_MAP,
+};
 
 static void usage(const char *prog)
 {
@@ -299,6 +497,9 @@ static void usage(const char *prog)
 		"  --vector-local-window-ms <ms> RVV local fast-path window after vector DSQ consume (default: 500)\n"
 		"  --dirty-threshold <n>  Dirty samples before marking vector thread (default: 2)\n"
 		"  --fallback-every <n>   Every Nth vector CPU pick uses ordinary CPUs (0 = disabled)\n"
+		"  --user-control <mode>  off|observe|active (default: off)\n"
+		"  --control-dir <path>   Pin config/worker maps under this bpffs directory\n"
+		"  --user-cpu-map <map>   auto or OpenMP ith0..7 CPU order (default: auto)\n"
 		"  --llm-only            Do not switch all tasks; move target threads to SCHED_EXT only\n"
 		"  --tid-list <list>     With --llm-only, move only comma-separated TIDs to SCHED_EXT\n"
 		"  --duration <sec>       Run duration in seconds (0 = infinite, default: 0)\n"
@@ -316,8 +517,12 @@ int main(int argc, char **argv)
 	struct bpf_link *link = NULL;
 	struct llm_pin_config config = {0};
 	const char *tid_list = NULL;
+	const char *control_dir = RVV_LEASE_CONTROL_DEFAULT_DIR;
+	char config_map_path[PATH_MAX] = {};
+	char worker_map_path[PATH_MAX] = {};
 	int duration = 0;
 	int moved_threads = 0;
+	bool control_maps_pinned = false;
 	int err;
 	__u32 key = 0;
 
@@ -329,6 +534,8 @@ int main(int argc, char **argv)
 	config.dirty_threshold = 2;
 	config.vector_local_window_ns = 500 * NSEC_PER_MSEC;
 	config.switch_all = 1;
+	for (__u32 ith = 0; ith < RVV_LEASE_CONTROL_WORKERS; ith++)
+		config.user_cpu_map[ith] = ith;
 
 	static struct option long_options[] = {
 		{"tgid",        required_argument, 0, 't'},
@@ -344,6 +551,9 @@ int main(int argc, char **argv)
 		{"vector-local-window-ms", required_argument, 0, 'W'},
 		{"dirty-threshold", required_argument, 0, 'D'},
 		{"fallback-every", required_argument, 0, 'F'},
+		{"user-control", required_argument, 0, OPT_USER_CONTROL},
+		{"control-dir", required_argument, 0, OPT_CONTROL_DIR},
+		{"user-cpu-map", required_argument, 0, OPT_USER_CPU_MAP},
 		{"llm-only",    no_argument,       0, 'o'},
 		{"tid-list",    required_argument, 0, 'T'},
 		{"duration",    required_argument, 0, 'd'},
@@ -401,6 +611,22 @@ int main(int argc, char **argv)
 		case 'F':
 			config.fallback_every = strtoul(optarg, NULL, 10);
 			break;
+		case OPT_USER_CONTROL:
+			if (parse_control_mode(optarg, &config.user_control_mode)) {
+				fprintf(stderr, "Error: invalid --user-control '%s'\n", optarg);
+				return 1;
+			}
+			break;
+		case OPT_CONTROL_DIR:
+			control_dir = optarg;
+			break;
+		case OPT_USER_CPU_MAP:
+			if (parse_cpu_order(optarg, config.user_cpu_map,
+					    &config.user_cpu_map_enabled)) {
+				fprintf(stderr, "Error: --user-cpu-map requires auto or eight unique CPUs 0..7\n");
+				return 1;
+			}
+			break;
 		case 'o':
 			config.switch_all = 0;
 			break;
@@ -437,6 +663,17 @@ int main(int argc, char **argv)
 		config.ordinary_cpu_mask = config.system_cpu_mask;
 	if (!config.dirty_threshold)
 		config.dirty_threshold = 2;
+	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF &&
+	    config.strategy != LLM_STRATEGY_RVV_DIRTY &&
+	    config.strategy != LLM_STRATEGY_RVV_DIRTY_LOCAL) {
+		fprintf(stderr, "Error: userspace control requires an rvv_dirty strategy\n");
+		return 1;
+	}
+	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF &&
+	    (!control_dir || control_dir[0] != '/')) {
+		fprintf(stderr, "Error: --control-dir must be an absolute bpffs path\n");
+		return 1;
+	}
 
 	if (config.strategy == LLM_STRATEGY_LONG_SLICE && !config.llm_slice_ns)
 		config.llm_slice_ns = 100 * NSEC_PER_MSEC;
@@ -449,6 +686,10 @@ int main(int argc, char **argv)
 	}
 
 	config.enabled = 1;
+	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF) {
+		config.user_session_id = new_control_session_id();
+		config.user_policy_epoch = 1;
+	}
 
 	// 打印配置
 	printf("scx_llm_pin configuration:\n");
@@ -470,6 +711,20 @@ int main(int argc, char **argv)
 	       (unsigned long long)(config.vector_local_window_ns / NSEC_PER_MSEC));
 	printf("  Dirty threshold: %u\n", config.dirty_threshold);
 	printf("  Fallback every:  %u\n", config.fallback_every);
+	printf("  User control:    %s\n", control_mode_name(config.user_control_mode));
+	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF) {
+		printf("  Control dir:     %s\n", control_dir);
+		printf("  Control session: %llu\n",
+		       (unsigned long long)config.user_session_id);
+		if (config.user_cpu_map_enabled)
+			printf("  User CPU map:    %u,%u,%u,%u,%u,%u,%u,%u\n",
+			       config.user_cpu_map[0], config.user_cpu_map[1],
+			       config.user_cpu_map[2], config.user_cpu_map[3],
+			       config.user_cpu_map[4], config.user_cpu_map[5],
+			       config.user_cpu_map[6], config.user_cpu_map[7]);
+		else
+			printf("  User CPU map:    auto\n");
+	}
 	printf("  Switch all:      %s\n", config.switch_all ? "yes" : "no");
 	if (tid_list)
 		printf("  TID list:        %s\n", tid_list);
@@ -505,6 +760,20 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to write config: %d\n", err);
 		goto cleanup;
 	}
+	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF) {
+		err = initialize_and_pin_control_maps(
+			skel, control_dir, &config, config_map_path,
+			sizeof(config_map_path), worker_map_path,
+			sizeof(worker_map_path));
+		if (err) {
+			fprintf(stderr, "failed to initialize userspace control maps: %d\n", err);
+			goto cleanup;
+		}
+		control_maps_pinned = true;
+		printf("RVV lease control maps ready: config=%s workers=%s session=%llu\n",
+		       config_map_path, worker_map_path,
+		       (unsigned long long)config.user_session_id);
+	}
 
 	// 附加 struct_ops
 	link = bpf_map__attach_struct_ops(skel->maps.scx_llm_pin_ops);
@@ -535,19 +804,23 @@ int main(int argc, char **argv)
 	if (duration > 0) {
 		for (int i = 0; i < duration && !exiting; i++) {
 			sleep(1);
-			if (i > 0 && i % 10 == 0)
+			if (i > 0 && i % 10 == 0) {
 				print_stats(skel);
+				print_worker_page(skel);
+			}
 		}
 	} else {
 		while (!exiting) {
 			sleep(5);
 			print_stats(skel);
+			print_worker_page(skel);
 		}
 	}
 
 	// 打印最终统计
 	print_stats(skel);
 	print_vector_cpu_assignments(skel);
+	print_worker_page(skel);
 
 cleanup:
 	if (!config.switch_all && moved_threads > 0) {
@@ -557,6 +830,8 @@ cleanup:
 			set_tgid_threads_policy(config.target_tgid, SCHED_NORMAL);
 	}
 	bpf_link__destroy(link);
+	deactivate_and_unpin_control_maps(skel, control_dir, config_map_path,
+					  worker_map_path, control_maps_pinned);
 	scx_llm_pin_bpf__destroy(skel);
 	printf("\nscx_llm_pin detached\n");
 	return err < 0 ? -err : 0;

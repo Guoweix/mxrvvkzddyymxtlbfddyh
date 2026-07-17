@@ -29,13 +29,14 @@ USER_LDFLAGS := -static-libgcc -Wl,-Bstatic -L$(STAGING_DIR)/usr/lib
 USER_LDLIBS := $(LIBBPF_A) $(STAGING_DIR)/usr/lib/libelf.a -Wl,-Bdynamic -lz
 
 TARGET := scx_llm_pin
+CONTROL_TARGET := rvv_lease_ctl
 BPF_OBJ := $(TARGET).bpf.o
 SKEL_H := $(TARGET).skel.h
 USER_OBJ := $(TARGET).o
 
 .PHONY: all clean fetch-btf deploy strip host-bpftool
 
-all: $(TARGET)
+all: $(TARGET) $(CONTROL_TARGET)
 
 # 从板卡获取 BTF 信息
 fetch-btf:
@@ -52,7 +53,7 @@ $(VMLINUX_H): $(VMLINUX_BTF) $(BPFTOOL)
 	$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > $@
 
 # 编译 BPF 程序
-$(BPF_OBJ): $(TARGET).bpf.c $(VMLINUX_H) $(TARGET).h
+$(BPF_OBJ): $(TARGET).bpf.c $(VMLINUX_H) $(TARGET).h scx_rvv_lease_control.h
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 # 生成 skeleton
@@ -60,12 +61,15 @@ $(SKEL_H): $(BPF_OBJ) $(BPFTOOL)
 	$(BPFTOOL) gen skeleton $< > $@
 
 # 编译用户态程序
-$(USER_OBJ): $(TARGET).c $(SKEL_H) $(TARGET).h
+$(USER_OBJ): $(TARGET).c $(SKEL_H) $(TARGET).h scx_rvv_lease_control.h
 	$(CROSS_CC) $(USER_CFLAGS) -c $< -o $@
 
 # 链接最终程序
 $(TARGET): $(USER_OBJ)
 	$(CROSS_CC) $(USER_LDFLAGS) $< -o $@ $(USER_LDLIBS)
+
+$(CONTROL_TARGET): rvv_lease_ctl.c $(TARGET).h scx_rvv_lease_control.h
+	$(CROSS_CC) $(USER_CFLAGS) $< -o $@
 
 # 剥离调试符号（可选）
 strip: $(TARGET)
@@ -75,8 +79,9 @@ strip: $(TARGET)
 deploy: $(TARGET)
 	$(SSHPASS) ssh $(SSH_OPTS) $(BOARD) "mkdir -p /tmp/scx_llm_pin"
 	$(SSHPASS) scp $(SSH_OPTS) $(TARGET) $(BOARD):/tmp/scx_llm_pin/
+	$(SSHPASS) scp $(SSH_OPTS) $(CONTROL_TARGET) $(BOARD):/tmp/scx_llm_pin/
 	@echo "Deployed to $(BOARD):/tmp/scx_llm_pin/$(TARGET)"
 
 clean:
-	rm -f $(TARGET) $(BPF_OBJ) $(SKEL_H) $(USER_OBJ)
+	rm -f $(TARGET) $(CONTROL_TARGET) $(BPF_OBJ) $(SKEL_H) $(USER_OBJ)
 	rm -f $(VMLINUX_BTF) $(VMLINUX_H)

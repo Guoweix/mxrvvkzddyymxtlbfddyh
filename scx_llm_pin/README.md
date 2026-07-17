@@ -2,14 +2,15 @@
 
 ## 概述
 
-`scx_llm_pin` 是一个基于 Linux sched_ext 框架的 eBPF 调度器，专门用于优化 LLM（大语言模型）推理场景的上下文切换开销。
+`scx_llm_pin` 是一个基于 Linux sched_ext 的实验调度器，包含 CPU placement、local DSQ 和 RVV dirty lease 等策略。当前 LLM 主策略通过 RVV dirty 状态识别 8 个 OpenMP 计算 worker，为它们分配互不重复的 CPU，并用 vector DSQ、100ms slice 和 500ms local lease 协调运行顺序。
 
 ### 核心功能
 
 - **CPU 亲和性绑定**：将 `llama-server` 工作线程固定到指定的 CPU 核心组
 - **隔离系统任务**：防止其他进程干扰 LLM 推理
 - **避免跨核迁移**：减少 cache miss 和 RISC-V Vector 状态保存/恢复开销
-- **统计反馈**：实时显示调度决策和 CPU 迁移次数
+- **用户态控制**：可选的 OpenMP worker 注册、observe/active 模式、pinned config 和控制 CLI
+- **统计反馈**：实时显示调度决策、RVV worker、DSQ 和用户提示统计
 
 ### 目标
 
@@ -18,7 +19,7 @@
 - L1/L2 cache miss 率
 - 调度器开销
 
-预期提升 LLM 推理吞吐量 **10-20%**。
+性能收益取决于负载相位和参数，必须用同口径多轮 benchmark 验收；不能仅由 RVV 上下文切换次数推导。
 
 ---
 
@@ -59,7 +60,7 @@ make deploy
 
 ```bash
 # 在板卡上运行
-ssh root@192.168.3.63
+ssh root@192.168.3.67
 
 # 查找 llama-server PID
 ps aux | grep llama-server
@@ -101,6 +102,39 @@ CPU migrations:         12
 - **LLM tasks pinned**：成功固定到指定 CPU 的次数
 - **System tasks scheduled**：系统线程被调度的总次数
 - **CPU migrations**：跨核迁移次数（应该接近 0）
+
+### Dirty Lease 用户态控制
+
+控制接口只在启用 `--user-control observe|active` 时创建。loader 将配置和 worker map pin 到 bpffs；llama.cpp 通过 `GGML_SCX_LEASE_HINT_PATH` 在 OpenMP graph 开始时连接一次，每个 worker 仅在 session/TID 变化时注册。BPF 只在首次 dirty 分类时读取一次 worker map，后续 enqueue/dispatch 继续走原 dirty lease 路径。
+
+```bash
+# 默认 active 模式不改变已验证的自然唯一 CPU 分配
+./scx_llm_pin --tgid "$LLM_PID" --strategy rvv_dirty \
+  --llm-cpus 0-7 --system-cpus 0-7 \
+  --vector-cpus 0-7 --ordinary-cpus 0-7 \
+  --vector-slice-ms 100 --vector-local-window-ms 500 \
+  --dirty-threshold 2 --user-control active \
+  --user-cpu-map auto
+
+# 查看或原子更新在线策略
+./rvv_lease_ctl status
+./rvv_lease_ctl set --slice-ms 120 --window-ms 600 --dirty-threshold 3
+
+# 显式 ith0..7 -> CPU7..0；已分类 worker 在下次 wakeup 使用新映射
+./rvv_lease_ctl set --cpu-map 7,6,5,4,3,2,1,0
+
+# 回到 100ms/500ms/threshold=2 和自然唯一分配
+./rvv_lease_ctl reset
+```
+
+模式语义：
+
+- `off`：不创建控制 map，不读取用户提示，保持原调度器路径。
+- `observe`：验证并缓存 worker 的 `ith/TID/session`，不改变 CPU placement。
+- `active` + `auto`：允许在线参数控制，但 CPU placement 仍使用原 dirty lease 自然唯一分配。
+- `active` + 显式 map：按用户给出的唯一排列覆盖 `ith -> CPU`；切回 `auto` 后重新进入自然分配。
+
+提示页缺失、session 不匹配或 worker slot 无效时，调度器只增加 fallback 统计，仍靠 RVV dirty 识别和原 lease 路径运行，不会依赖用户态继续推进。
 
 ---
 
@@ -181,8 +215,8 @@ cd /tmp/rvv_sched_cost
 2. **CPU 选择**：
    - LLM 线程：从 `llm_cpu_mask` 中选择 CPU（优先保持原 CPU）
    - 系统线程：从 `system_cpu_mask` 中选择 CPU
-3. **队列分发**：所有任务分发到全局队列 (`SCX_DSQ_GLOBAL`)
-4. **时间片**：使用默认时间片 (`SCX_SLICE_DFL`)，约 6ms
+3. **队列分发**：基础策略使用 global/local DSQ；RVV lease 使用 per-CPU vector DSQ，并在放行后的固定窗口内使用 local DSQ
+4. **时间片**：基础策略使用 `SCX_SLICE_DFL`；RVV lease 的 vector slice 和 local window 可配置
 
 ### BPF 程序结构
 
@@ -194,6 +228,7 @@ cd /tmp/rvv_sched_cost
 ### BPF Maps
 
 - **`config_map`**：用户态写入配置（TGID、CPU mask）
+- **`user_worker_map`**：可选 mmap worker 注册页，仅在首次 RVV 分类读取
 - **`stats_map`**：统计信息（调度次数、迁移次数）
 - **`percpu_stats`**：Per-CPU 统计（预留）
 

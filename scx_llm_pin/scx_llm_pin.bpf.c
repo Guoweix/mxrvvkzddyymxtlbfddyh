@@ -37,6 +37,16 @@ struct {
 	__type(value, struct llm_pin_config);
 } config_map SEC(".maps");
 
+// Optional userspace worker registration. The hot path never reads this map
+// after a task has been classified as an RVV worker.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__uint(map_flags, BPF_F_MMAPABLE);
+	__type(key, u32);
+	__type(value, struct rvv_lease_worker_page);
+} user_worker_map SEC(".maps");
+
 // 统计信息 map
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -159,6 +169,116 @@ static __always_inline struct rvv_task_class *get_rvv_task_class(__u32 tid)
 	return bpf_map_lookup_elem(&rvv_task_classes, &tid);
 }
 
+struct lease_worker_snapshot {
+	__u32 tid;
+	__u32 tgid;
+	__u32 ith;
+	__u32 n_threads;
+	__u64 session_id;
+};
+
+static __always_inline bool read_lease_worker_slot(
+	const struct rvv_lease_worker_page *page, __u32 index,
+	struct lease_worker_snapshot *out)
+{
+	const struct rvv_lease_worker_slot *slot;
+	__u32 sequence;
+
+	if (!page || index >= RVV_LEASE_CONTROL_WORKERS)
+		return false;
+	slot = &page->workers[index];
+	sequence = slot->sequence;
+	if (!sequence || (sequence & 1U))
+		return false;
+	out->tid = slot->tid;
+	out->tgid = slot->tgid;
+	out->ith = slot->ith;
+	out->n_threads = slot->n_threads;
+	out->session_id = slot->session_id;
+	return sequence == slot->sequence;
+}
+
+static __always_inline void apply_user_worker_hint(
+	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
+	struct rvv_task_class *state, __u32 tid)
+{
+	struct rvv_lease_worker_page *page;
+	struct lease_worker_snapshot slot = {};
+	__u32 allowed_mask;
+	__u32 key = 0;
+	__u32 cpu;
+
+	if (!cfg || !state || cfg->user_control_mode == RVV_LEASE_CONTROL_OFF)
+		return;
+	if (stats)
+		__sync_fetch_and_add(&stats->user_hint_classification_reads, 1);
+	page = bpf_map_lookup_elem(&user_worker_map, &key);
+	if (!page || page->header.magic != RVV_LEASE_CONTROL_MAGIC ||
+	    page->header.abi_version != RVV_LEASE_CONTROL_ABI_VERSION ||
+	    !page->header.active || page->header.target_tgid != cfg->target_tgid ||
+	    page->header.max_workers != RVV_LEASE_CONTROL_WORKERS ||
+	    !cfg->user_session_id ||
+	    page->header.session_id != cfg->user_session_id) {
+		if (stats)
+			__sync_fetch_and_add(&stats->user_hint_fallbacks, 1);
+		return;
+	}
+
+#define TRY_WORKER_SLOT(index) do {                                           \
+		if (!read_lease_worker_slot(page, (index), &slot))               \
+			break;                                                    \
+		if (slot.tid != tid)                                             \
+			break;                                                    \
+		if (slot.tgid != cfg->target_tgid || slot.ith != (index) ||       \
+		    slot.n_threads != RVV_LEASE_CONTROL_WORKERS ||                \
+		    slot.session_id != cfg->user_session_id) {                    \
+			if (stats)                                                  \
+				__sync_fetch_and_add(&stats->user_hint_invalid_workers, 1); \
+			return;                                                       \
+		}                                                                  \
+		state->user_ith_plus1 = (index) + 1;                               \
+		state->user_session_id = slot.session_id;                          \
+		if (stats)                                                         \
+			__sync_fetch_and_add(&stats->user_hint_valid_workers, 1);     \
+		if (cfg->user_control_mode == RVV_LEASE_CONTROL_OBSERVE) {         \
+			if (stats)                                                     \
+				__sync_fetch_and_add(&stats->user_hint_observed_workers, 1); \
+			return;                                                       \
+		}                                                                  \
+		if (stats)                                                         \
+			__sync_fetch_and_add(&stats->user_hint_active_workers, 1);     \
+		if (!cfg->user_cpu_map_enabled)                                    \
+			return;                                                       \
+		cpu = cfg->user_cpu_map[(index)];                                  \
+		allowed_mask = cfg->vector_cpu_mask | cfg->ordinary_cpu_mask;      \
+		if (!allowed_mask)                                                 \
+			allowed_mask = cfg->llm_cpu_mask;                            \
+		if (!cpu_in_mask((s32)cpu, allowed_mask)) {                        \
+			if (stats)                                                     \
+				__sync_fetch_and_add(&stats->user_hint_invalid_workers, 1); \
+			return;                                                       \
+		}                                                                  \
+		state->assigned_cpu_plus1 = cpu + 1;                               \
+		state->user_cpu_forced = 1;                                       \
+		if (stats)                                                         \
+			__sync_fetch_and_add(&stats->user_hint_active_assignments, 1); \
+		return;                                                            \
+	} while (0)
+
+	TRY_WORKER_SLOT(0);
+	TRY_WORKER_SLOT(1);
+	TRY_WORKER_SLOT(2);
+	TRY_WORKER_SLOT(3);
+	TRY_WORKER_SLOT(4);
+	TRY_WORKER_SLOT(5);
+	TRY_WORKER_SLOT(6);
+	TRY_WORKER_SLOT(7);
+#undef TRY_WORKER_SLOT
+
+	if (stats)
+		__sync_fetch_and_add(&stats->user_hint_fallbacks, 1);
+}
+
 static __always_inline bool classify_rvv_vector_task(struct task_struct *p,
 						     const struct llm_pin_config *cfg,
 						     struct llm_pin_stats *stats)
@@ -186,6 +306,7 @@ static __always_inline bool classify_rvv_vector_task(struct task_struct *p,
 
 	threshold = cfg->dirty_threshold ? cfg->dirty_threshold : 2;
 	if (!state->is_vector && state->dirty_score >= threshold) {
+		apply_user_worker_hint(cfg, stats, state, tid);
 		state->is_vector = 1;
 		if (stats)
 			__sync_fetch_and_add(&stats->rvv_vector_threads, 1);
@@ -274,8 +395,22 @@ static __always_inline bool claim_vector_cpu(__u32 tid, s32 cpu,
 	return false;
 }
 
+static __always_inline void release_vector_cpu(__u32 tid, s32 cpu)
+{
+	__u32 cpu_key;
+	__u32 *owner;
+
+	if (cpu < 0 || cpu >= 8)
+		return;
+	cpu_key = (__u32)cpu;
+	owner = bpf_map_lookup_elem(&vector_cpu_owners, &cpu_key);
+	if (owner)
+		__sync_val_compare_and_swap(owner, tid, 0);
+}
+
 static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
 						      const struct llm_pin_config *cfg,
+						      struct llm_pin_stats *stats,
 						      s32 prev_cpu)
 {
 	struct rvv_task_class *state;
@@ -289,6 +424,39 @@ static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
 	state = get_rvv_task_class(tid);
 	if (!state)
 		return select_cpu_from_mask(allowed_mask, prev_cpu);
+
+	if (cfg->user_control_mode == RVV_LEASE_CONTROL_ACTIVE &&
+	    cfg->user_cpu_map_enabled && state->user_ith_plus1 &&
+	    state->user_session_id == cfg->user_session_id) {
+		__u32 ith = state->user_ith_plus1 - 1;
+
+		if (ith < RVV_LEASE_CONTROL_WORKERS) {
+			s32 user_cpu = (s32)cfg->user_cpu_map[ith];
+
+			if (cpu_in_mask(user_cpu, allowed_mask)) {
+				if (!state->user_cpu_forced ||
+				    state->assigned_cpu_plus1 != (__u32)user_cpu + 1) {
+					if (!state->user_cpu_forced &&
+					    state->assigned_cpu_plus1)
+						release_vector_cpu(
+							tid,
+							(s32)state->assigned_cpu_plus1 - 1);
+					if (stats)
+						__sync_fetch_and_add(
+							&stats->user_hint_active_assignments,
+							1);
+				}
+				state->assigned_cpu_plus1 = (__u32)user_cpu + 1;
+				state->user_cpu_forced = 1;
+				return user_cpu;
+			}
+		}
+	}
+
+	if (state->user_cpu_forced) {
+		state->assigned_cpu_plus1 = 0;
+		state->user_cpu_forced = 0;
+	}
 
 	if (state->assigned_cpu_plus1) {
 		assigned_cpu = (s32)state->assigned_cpu_plus1 - 1;
@@ -344,7 +512,7 @@ static __always_inline s32 select_rvv_vector_cpu(struct task_struct *p,
 	s32 cpu;
 
 	if (cfg->vector_local_window_ns) {
-		cpu = select_unique_vector_cpu(p, cfg, prev_cpu);
+		cpu = select_unique_vector_cpu(p, cfg, stats, prev_cpu);
 		remember_selected_cpu(p, cpu);
 		if (stats && cpu != prev_cpu)
 			__sync_fetch_and_add(&stats->cpu_migrations, 1);
@@ -455,7 +623,7 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 			__u64 now;
 
 			if (cfg->vector_local_window_ns)
-				selected_cpu = select_unique_vector_cpu(p, cfg,
+				selected_cpu = select_unique_vector_cpu(p, cfg, stats,
 								 selected_cpu);
 			remember_selected_cpu(p, selected_cpu);
 

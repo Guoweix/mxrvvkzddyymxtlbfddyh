@@ -2,6 +2,8 @@
 #ifndef __SCX_LLM_PIN_H
 #define __SCX_LLM_PIN_H
 
+#include "scx_rvv_lease_control.h"
+
 enum llm_sched_strategy {
 	LLM_STRATEGY_GLOBAL = 0,     // 最小 sched_ext 全局队列
 	LLM_STRATEGY_PIN = 1,        // CPU mask 亲和性绑定
@@ -34,6 +36,11 @@ struct llm_pin_config {
 	__u64 vector_slice_ns;    // vector 线程在激进核心上的时间片
 	__u64 ordinary_vector_slice_ns; // vector 线程在普通核心上的时间片
 	__u64 vector_local_window_ns; // vector DSQ 放行后的 local 快速窗口
+	__u32 user_control_mode; // enum rvv_lease_control_mode
+	__u32 user_cpu_map_enabled; // 1=显式 ith->CPU；0=保留 lease 自然唯一分配
+	__u32 user_cpu_map[RVV_LEASE_CONTROL_WORKERS]; // OpenMP ith -> CPU
+	__u64 user_session_id;
+	__u64 user_policy_epoch;
 };
 
 // 统计信息
@@ -60,12 +67,22 @@ struct llm_pin_stats {
 	__u64 rvv_vector_window_starts;
 	__u64 rvv_vector_slice_clamps;
 	__u64 rvv_vector_identify_barrier_dispatches;
+	__u64 user_hint_classification_reads;
+	__u64 user_hint_valid_workers;
+	__u64 user_hint_observed_workers;
+	__u64 user_hint_active_workers;
+	__u64 user_hint_active_assignments;
+	__u64 user_hint_invalid_workers;
+	__u64 user_hint_fallbacks;
 };
 
 struct rvv_task_class {
 	__u32 dirty_score;
 	__u32 is_vector;
 	__u32 assigned_cpu_plus1;
+	__u32 user_ith_plus1;
+	__u32 user_cpu_forced;
+	__u64 user_session_id;
 };
 
 #endif /* __SCX_LLM_PIN_H */
