@@ -207,10 +207,13 @@ PHASE_GATE_MAX_RETRIES=5 PHASE_GATE_TOKENS=1
 | `rvv_dirty_bind_all` | 仅保留 RVV Dirty 识别和 8 个 vector worker 一核一个；vector 使用默认 slice 并直接进入所选 CPU local DSQ |
 | `rvv_dirty_lease_all` | 500ms lease，并为 8 个 vector worker 分配互不重复的 CPU |
 | `rvv_dirty_lease_unique_all` | `rvv_dirty_lease_all` 的兼容别名 |
+| `rvv_dirty_lease_user_observe` | dirty lease 快路径不变；llama.cpp 注册 8 个 worker，内核只观测 |
+| `rvv_dirty_lease_user_active` | dirty lease 快路径不变；默认沿用自然唯一分配，可运行时更新 lease 参数并按需启用 `ith -> CPU` 映射 |
 | `rvv_dirty_local_all` | RVV Dirty vector 长时间片 + LLM 辅助线程本地 DSQ |
 | `rvv_dirty_6_2` | CPU0-5 激进计算核心，CPU6-7 普通/回退核心 |
 | `rvv_exclusive_6_2` | CPU2-7 RVV 专用核心，CPU0-1 普通核心 |
 | `rvv_lpedf_all` | 全核心 RVV Dirty + Limited-Preemption EDF vtime DSQ |
+| `rvv_barrier_gang_active` | llama.cpp 发布 barrier epoch/worker 状态，sched_ext 对 7/8 laggard 和 8/8 release 做有界 boost |
 
 `rvv_dirty_lease_all` 的唯一 CPU 分配不是普通 affinity 对照。线程达到 RVV dirty 阈值后，会原子占用一个尚未分配的 CPU，并在后续 wakeup 中继续选择该 CPU。旧 lease 只保留 `prev_cpu`，偶尔会把两个 OpenMP worker 留在同一核；此时 barrier 的 7 个等待者会频繁耗尽自旋并进入 futex，形成百万级 wakeup/dispatch storm。当前所有启用 vector-local window 的 lease 都强制使用唯一 CPU 分配，不再提供旧行为入口。
 
@@ -241,6 +244,11 @@ PHASE_GATE_MAX_RETRIES=5 PHASE_GATE_TOKENS=1
 | `SCX_LPEDF_SEGMENT_MS` | `50` | LP-EDF vector limited-preemption segment |
 | `SCX_LPEDF_PERIOD_MS` | `50` | LP-EDF vector virtual release period |
 | `SCX_LPEDF_DEADLINE_MS` | `50` | LP-EDF vector relative deadline |
+| `SCX_GANG_HINT_BOOST_US` | `250` | active barrier hint 的短时 local-head boost |
+| `SCX_GANG_HINT_LAGGARD_WAITERS` | `7` | 触发最后一个 worker laggard 检查的 barrier 到达数 |
+| `SCX_LEASE_CONTROL_MODE` | `off` | dirty lease 用户控制模式；策略 preset 设为 observe/active |
+| `SCX_LEASE_CONTROL_DIR` | `/sys/fs/bpf/scx_rvv_dirty_lease` | pinned config 和 worker map 目录 |
+| `SCX_LEASE_USER_CPU_MAP` | `auto` | `auto` 保留 dirty lease 自然唯一分配；也可传 8 个唯一 CPU，显式指定 OpenMP `ith=0..7` 的 home CPU |
 | `RVV_TRACE` | `0` | 是否启动 RVV 上下文切换观测 |
 | `RVV_TRACE_EXTRA_SEC` | `180` | trace 额外采集时间 |
 | `RVV_TRACE_SWITCH_OUT` | `1` | 是否统计 switch-out / RVV save 候选；设为 `0` 时传递 `--no-switch-out` |
