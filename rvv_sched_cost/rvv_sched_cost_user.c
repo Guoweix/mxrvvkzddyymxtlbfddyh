@@ -34,6 +34,8 @@ struct env {
 	bool sample_futex;
 	bool sample_futex_detail;
 	bool sample_futex_stack;
+	bool sample_futex_time;
+	bool futex_only;
 	bool rvv_only;
 	bool verbose_libbpf;
 	const char *comm;
@@ -64,9 +66,11 @@ static int libbpf_log_verbose(enum libbpf_print_level level, const char *fmt,
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s [--tgid PID] [--tid TID] [--comm NAME] [--duration SEC] [--json PATH] [--rvv-only] [--no-vs] [--no-switch-out] [--no-switch-out-state] [--futex] [--futex-detail] [--futex-stack]\n"
+		"Usage: %s [--tgid PID] [--tid TID] [--comm NAME] [--duration SEC] [--json PATH] [--rvv-only] [--no-vs] [--no-switch-out] [--no-switch-out-state] [--futex] [--futex-detail] [--futex-stack] [--futex-time] [--futex-only]\n"
 		"\n"
 		"Defaults: --comm llama-server --duration 10\n"
+		"  --futex-time pairs futex wait enter/exit and records elapsed time\n"
+		"  --futex-only enables futex time/detail and disables sched tracepoints\n"
 		"Examples:\n"
 		"  %s --tgid 531 --duration 60 --json result.json\n"
 		"  %s --comm llama-server --duration 30\n",
@@ -304,6 +308,21 @@ static void print_futex_stats(FILE *out, const char *name,
 		pi_ops, waitv_syscalls, other_ops);
 }
 
+static void print_futex_wait_stats(
+	FILE *out, const char *name, unsigned long long completed_ops,
+	unsigned long long completed_total_ns, unsigned long long blocked_ops,
+	unsigned long long blocked_total_ns, unsigned long long blocked_max_ns,
+	const unsigned long long ret[RVV_FUTEX_RET_BUCKETS])
+{
+	fprintf(out,
+		"  %s: completed=%llu elapsed_avg=%.0fns blocked=%llu blocked_total=%lluns blocked_avg=%.0fns blocked_max=%lluns ret[woken=%llu eagain=%llu eintr=%llu etimedout=%llu other=%llu]\n",
+		name, completed_ops, avg_ns(completed_total_ns, completed_ops),
+		blocked_ops, blocked_total_ns, avg_ns(blocked_total_ns, blocked_ops),
+		blocked_max_ns, ret[RVV_FUTEX_RET_WOKEN],
+		ret[RVV_FUTEX_RET_EAGAIN], ret[RVV_FUTEX_RET_EINTR],
+		ret[RVV_FUTEX_RET_ETIMEDOUT], ret[RVV_FUTEX_RET_OTHER]);
+}
+
 static void print_thread_line(FILE *out, const struct rvv_thread_stats *t)
 {
 	fprintf(out,
@@ -344,21 +363,39 @@ static void print_futex_addr_line(FILE *out,
 				  const struct rvv_futex_addr_stats *s)
 {
 	fprintf(out,
-		"  uaddr=0x%llx syscalls=%llu wait=%llu wake=%llu requeue=%llu wake_op=%llu pi=%llu waitv=%llu other=%llu last=%u/%u(%s)\n",
+		"  uaddr=0x%llx syscalls=%llu wait=%llu wake=%llu requeue=%llu wake_op=%llu pi=%llu waitv=%llu other=%llu wait_completed=%llu wait_blocked=%llu blocked_total=%lluns blocked_avg=%.0fns blocked_max=%lluns last=%u/%u(%s)\n",
 		s->uaddr, s->syscalls, s->wait_ops, s->wake_ops,
 		s->requeue_ops, s->wake_op_ops, s->pi_ops,
-		s->waitv_syscalls, s->other_ops, s->last_tgid, s->last_tid,
-		s->last_comm);
+		s->waitv_syscalls, s->other_ops, s->wait_completed_ops,
+		s->wait_blocked_ops, s->wait_blocked_total_ns,
+		avg_ns(s->wait_blocked_total_ns, s->wait_blocked_ops),
+		s->wait_blocked_max_ns, s->last_tgid, s->last_tid, s->last_comm);
 }
 
 static void print_futex_tid_line(FILE *out,
 				 const struct rvv_futex_tid_stats *s)
 {
 	fprintf(out,
-		"  uaddr=0x%llx tgid=%u tid=%u comm=%s syscalls=%llu wait=%llu wake=%llu requeue=%llu wake_op=%llu pi=%llu waitv=%llu other=%llu\n",
+		"  uaddr=0x%llx tgid=%u tid=%u comm=%s syscalls=%llu wait=%llu wake=%llu requeue=%llu wake_op=%llu pi=%llu waitv=%llu other=%llu wait_completed=%llu wait_blocked=%llu blocked_total=%lluns blocked_avg=%.0fns blocked_max=%lluns\n",
 		s->uaddr, s->tgid, s->tid, s->comm, s->syscalls,
 		s->wait_ops, s->wake_ops, s->requeue_ops, s->wake_op_ops,
-		s->pi_ops, s->waitv_syscalls, s->other_ops);
+		s->pi_ops, s->waitv_syscalls, s->other_ops,
+		s->wait_completed_ops, s->wait_blocked_ops,
+		s->wait_blocked_total_ns,
+		avg_ns(s->wait_blocked_total_ns, s->wait_blocked_ops),
+		s->wait_blocked_max_ns);
+}
+
+static void read_futex_addr_hist(int map_fd, unsigned long long uaddr,
+				 struct rvv_hist *hist)
+{
+	struct rvv_futex_addr_hist_key key = { .uaddr = uaddr };
+
+	memset(hist, 0, sizeof(*hist));
+	for (unsigned int i = 0; i < RVV_HIST_BUCKETS; i++) {
+		key.bucket = i;
+		(void)bpf_map_lookup_elem(map_fd, &key, &hist->buckets[i]);
+	}
 }
 
 static void print_futex_stack_line(FILE *out,
@@ -414,13 +451,15 @@ static int dump_text(struct rvv_sched_cost_bpf *skel,
 	int err;
 
 	printf("rvv_sched_cost summary\n");
-	printf("  target_tgid=%u target_tid=%u duration=%us rvv_only=%u sample_vs=%u sample_switch_out=%u sample_out_state=%u sample_futex=%u sample_futex_detail=%u sample_futex_stack=%u\n",
+	printf("  target_tgid=%u target_tid=%u duration=%us rvv_only=%u futex_only=%u sample_vs=%u sample_switch_out=%u sample_out_state=%u sample_futex=%u sample_futex_detail=%u sample_futex_stack=%u sample_futex_time=%u\n",
 	       env->tgid, env->tid, env->duration, env->rvv_only ? 1 : 0,
+	       env->futex_only ? 1 : 0,
 	       env->sample_vs ? 1 : 0,
 	       env->sample_switch_out ? 1 : 0,
 	       env->sample_out_state ? 1 : 0, env->sample_futex ? 1 : 0,
 	       env->sample_futex_detail ? 1 : 0,
-	       env->sample_futex_stack ? 1 : 0);
+	       env->sample_futex_stack ? 1 : 0,
+	       env->sample_futex_time ? 1 : 0);
 	printf("  switch_events=%llu in=%llu out=%llu wakeups=%llu\n",
 	       g->switch_events, g->switches_in, g->switches_out, g->wakeups);
 	print_out_state_samples(stdout, "switches_out_state",
@@ -448,11 +487,22 @@ static int dump_text(struct rvv_sched_cost_bpf *skel,
 			  g->futex_requeue_ops, g->futex_wake_op_ops,
 			  g->futex_pi_ops, g->futex_waitv_syscalls,
 			  g->futex_other_ops);
+	print_futex_wait_stats(stdout, "futex_wait_time",
+			       g->futex_wait_completed_ops,
+			       g->futex_wait_completed_total_ns,
+			       g->futex_wait_blocked_ops,
+			       g->futex_wait_blocked_total_ns,
+			       g->futex_wait_blocked_max_ns,
+			       g->futex_wait_ret);
+	printf("  futex_wait_start_failures=%llu\n",
+	       g->futex_wait_start_failures);
 
 	printf("histograms (log2 usec buckets)\n");
 	print_hist(stdout, "offcpu", &hists[RVV_HIST_OFFCPU]);
 	print_hist(stdout, "wake_to_run", &hists[RVV_HIST_WAKE_TO_RUN]);
 	print_hist(stdout, "switch_interval", &hists[RVV_HIST_SWITCH_INTERVAL]);
+	print_hist(stdout, "futex_wait_blocked",
+		   &hists[RVV_HIST_FUTEX_WAIT_BLOCKED]);
 
 	printf("per-cpu\n");
 	for (unsigned int i = 0; i < RVV_MAX_CPUS; i++) {
@@ -589,6 +639,7 @@ static int dump_json(struct rvv_sched_cost_bpf *skel,
 	int thread_fd = bpf_map__fd(skel->maps.thread_stats);
 	int waker_fd = bpf_map__fd(skel->maps.waker_stats);
 	int futex_addr_fd = bpf_map__fd(skel->maps.futex_addr_stats);
+	int futex_addr_hist_fd = bpf_map__fd(skel->maps.futex_addr_hists);
 	int futex_tid_fd = bpf_map__fd(skel->maps.futex_tid_stats);
 	int futex_stack_fd = bpf_map__fd(skel->maps.futex_stack_stats);
 	int stack_fd = bpf_map__fd(skel->maps.futex_user_stacks);
@@ -606,6 +657,8 @@ static int dump_json(struct rvv_sched_cost_bpf *skel,
 	fprintf(out, "  \"target_tid\": %u,\n", env->tid);
 	fprintf(out, "  \"duration_sec\": %u,\n", env->duration);
 	fprintf(out, "  \"rvv_only\": %s,\n", env->rvv_only ? "true" : "false");
+	fprintf(out, "  \"futex_only\": %s,\n",
+		env->futex_only ? "true" : "false");
 	fprintf(out, "  \"sample_vs\": %s,\n", env->sample_vs ? "true" : "false");
 	fprintf(out, "  \"sample_switch_out\": %s,\n",
 		env->sample_switch_out ? "true" : "false");
@@ -617,6 +670,8 @@ static int dump_json(struct rvv_sched_cost_bpf *skel,
 		env->sample_futex_detail ? "true" : "false");
 	fprintf(out, "  \"sample_futex_stack\": %s,\n",
 		env->sample_futex_stack ? "true" : "false");
+	fprintf(out, "  \"sample_futex_time\": %s,\n",
+		env->sample_futex_time ? "true" : "false");
 	fprintf(out, "  \"sched\": {\n");
 	fprintf(out, "    \"switch_events\": %llu,\n", g->switch_events);
 	fprintf(out, "    \"switches_in\": %llu,\n", g->switches_in);
@@ -652,7 +707,25 @@ static int dump_json(struct rvv_sched_cost_bpf *skel,
 	fprintf(out, "    \"wake_op_ops\": %llu,\n", g->futex_wake_op_ops);
 	fprintf(out, "    \"pi_ops\": %llu,\n", g->futex_pi_ops);
 	fprintf(out, "    \"waitv_syscalls\": %llu,\n", g->futex_waitv_syscalls);
-	fprintf(out, "    \"other_ops\": %llu\n", g->futex_other_ops);
+	fprintf(out, "    \"other_ops\": %llu,\n", g->futex_other_ops);
+	fprintf(out, "    \"wait_completed_ops\": %llu,\n",
+		g->futex_wait_completed_ops);
+	fprintf(out, "    \"wait_completed_total_ns\": %llu,\n",
+		g->futex_wait_completed_total_ns);
+	fprintf(out, "    \"wait_blocked_ops\": %llu,\n",
+		g->futex_wait_blocked_ops);
+	fprintf(out, "    \"wait_blocked_total_ns\": %llu,\n",
+		g->futex_wait_blocked_total_ns);
+	fprintf(out, "    \"wait_blocked_max_ns\": %llu,\n",
+		g->futex_wait_blocked_max_ns);
+	fprintf(out, "    \"wait_ret_order\": [\"woken\", \"eagain\", \"eintr\", \"etimedout\", \"other\"],\n");
+	fprintf(out, "    \"wait_ret\": ");
+	json_u64_array(out, g->futex_wait_ret, RVV_FUTEX_RET_BUCKETS);
+	fprintf(out, ",\n    \"wait_ret_total_ns\": ");
+	json_u64_array(out, g->futex_wait_ret_total_ns,
+		       RVV_FUTEX_RET_BUCKETS);
+	fprintf(out, ",\n    \"wait_start_failures\": %llu\n",
+		g->futex_wait_start_failures);
 	fprintf(out, "  },\n");
 
 	fprintf(out, "  \"vector\": {\n");
@@ -677,6 +750,9 @@ static int dump_json(struct rvv_sched_cost_bpf *skel,
 		       RVV_HIST_BUCKETS);
 	fprintf(out, ",\n    \"switch_interval\": ");
 	json_u64_array(out, hists[RVV_HIST_SWITCH_INTERVAL].buckets,
+		       RVV_HIST_BUCKETS);
+	fprintf(out, ",\n    \"futex_wait_blocked\": ");
+	json_u64_array(out, hists[RVV_HIST_FUTEX_WAIT_BLOCKED].buckets,
 		       RVV_HIST_BUCKETS);
 	fprintf(out, "\n  },\n");
 
@@ -712,7 +788,7 @@ static int dump_json(struct rvv_sched_cost_bpf *skel,
 				first ? "" : ",", t.tgid, t.tid);
 			json_string(out, t.comm);
 			fprintf(out,
-				", \"switches_in\": %llu, \"switches_out\": %llu, \"wakeups\": %llu, \"offcpu_events\": %llu, \"offcpu_avg_ns\": %.0f, \"wake_to_run_events\": %llu, \"wake_to_run_avg_ns\": %.0f, \"v_save_candidates\": %llu, \"v_restore_candidates\": %llu, \"futex_syscalls\": %llu, \"futex_wait_ops\": %llu, \"futex_wake_ops\": %llu, \"futex_requeue_ops\": %llu, \"futex_wake_op_ops\": %llu, \"futex_pi_ops\": %llu, \"futex_waitv_syscalls\": %llu, \"futex_other_ops\": %llu, \"switches_out_state\": ",
+				", \"switches_in\": %llu, \"switches_out\": %llu, \"wakeups\": %llu, \"offcpu_events\": %llu, \"offcpu_avg_ns\": %.0f, \"wake_to_run_events\": %llu, \"wake_to_run_avg_ns\": %.0f, \"v_save_candidates\": %llu, \"v_restore_candidates\": %llu, \"futex_syscalls\": %llu, \"futex_wait_ops\": %llu, \"futex_wake_ops\": %llu, \"futex_requeue_ops\": %llu, \"futex_wake_op_ops\": %llu, \"futex_pi_ops\": %llu, \"futex_waitv_syscalls\": %llu, \"futex_other_ops\": %llu, \"futex_wait_completed_ops\": %llu, \"futex_wait_completed_total_ns\": %llu, \"futex_wait_blocked_ops\": %llu, \"futex_wait_blocked_total_ns\": %llu, \"futex_wait_blocked_max_ns\": %llu, \"futex_wait_ret\": ",
 				t.switches_in, t.switches_out, t.wakeups,
 				t.offcpu_events,
 				avg_ns(t.offcpu_total_ns, t.offcpu_events),
@@ -723,7 +799,18 @@ static int dump_json(struct rvv_sched_cost_bpf *skel,
 				t.futex_syscalls, t.futex_wait_ops,
 				t.futex_wake_ops, t.futex_requeue_ops,
 				t.futex_wake_op_ops, t.futex_pi_ops,
-				t.futex_waitv_syscalls, t.futex_other_ops);
+				t.futex_waitv_syscalls, t.futex_other_ops,
+				t.futex_wait_completed_ops,
+				t.futex_wait_completed_total_ns,
+				t.futex_wait_blocked_ops,
+				t.futex_wait_blocked_total_ns,
+				t.futex_wait_blocked_max_ns);
+			json_u64_array(out, t.futex_wait_ret,
+				       RVV_FUTEX_RET_BUCKETS);
+			fprintf(out, ", \"futex_wait_ret_total_ns\": ");
+			json_u64_array(out, t.futex_wait_ret_total_ns,
+				       RVV_FUTEX_RET_BUCKETS);
+			fprintf(out, ", \"switches_out_state\": ");
 			json_u64_array(out, t.switches_out_state,
 				       RVV_OUT_STATE_BUCKETS);
 			fprintf(out, ", \"v_save_out_state\": ");
@@ -766,14 +853,31 @@ static int dump_json(struct rvv_sched_cost_bpf *skel,
 		fkey = next_fkey;
 		memset(&faddr, 0, sizeof(faddr));
 		if (!bpf_map_lookup_elem(futex_addr_fd, &fkey, &faddr)) {
+			struct rvv_hist addr_hist;
+
+			read_futex_addr_hist(futex_addr_hist_fd, faddr.uaddr,
+					     &addr_hist);
 			fprintf(out,
-				"%s\n    {\"uaddr\": \"0x%llx\", \"syscalls\": %llu, \"wait_ops\": %llu, \"wake_ops\": %llu, \"requeue_ops\": %llu, \"wake_op_ops\": %llu, \"pi_ops\": %llu, \"waitv_syscalls\": %llu, \"other_ops\": %llu, \"last_tgid\": %u, \"last_tid\": %u, \"last_comm\": ",
+				"%s\n    {\"uaddr\": \"0x%llx\", \"syscalls\": %llu, \"wait_ops\": %llu, \"wake_ops\": %llu, \"requeue_ops\": %llu, \"wake_op_ops\": %llu, \"pi_ops\": %llu, \"waitv_syscalls\": %llu, \"other_ops\": %llu, \"wait_completed_ops\": %llu, \"wait_completed_total_ns\": %llu, \"wait_blocked_ops\": %llu, \"wait_blocked_total_ns\": %llu, \"wait_blocked_max_ns\": %llu, \"wait_ret\": ",
 				first ? "" : ",", faddr.uaddr, faddr.syscalls,
 				faddr.wait_ops, faddr.wake_ops,
 				faddr.requeue_ops, faddr.wake_op_ops,
 				faddr.pi_ops, faddr.waitv_syscalls,
-				faddr.other_ops, faddr.last_tgid,
-				faddr.last_tid);
+				faddr.other_ops, faddr.wait_completed_ops,
+				faddr.wait_completed_total_ns,
+				faddr.wait_blocked_ops,
+				faddr.wait_blocked_total_ns,
+				faddr.wait_blocked_max_ns);
+			json_u64_array(out, faddr.wait_ret,
+				       RVV_FUTEX_RET_BUCKETS);
+			fprintf(out, ", \"wait_ret_total_ns\": ");
+			json_u64_array(out, faddr.wait_ret_total_ns,
+				       RVV_FUTEX_RET_BUCKETS);
+			fprintf(out, ", \"wait_blocked_hist\": ");
+			json_u64_array(out, addr_hist.buckets, RVV_HIST_BUCKETS);
+			fprintf(out,
+				", \"last_tgid\": %u, \"last_tid\": %u, \"last_comm\": ",
+				faddr.last_tgid, faddr.last_tid);
 			json_string(out, faddr.last_comm);
 			fprintf(out, "}");
 			first = false;
@@ -795,11 +899,21 @@ static int dump_json(struct rvv_sched_cost_bpf *skel,
 				ftid.tid);
 			json_string(out, ftid.comm);
 			fprintf(out,
-				", \"syscalls\": %llu, \"wait_ops\": %llu, \"wake_ops\": %llu, \"requeue_ops\": %llu, \"wake_op_ops\": %llu, \"pi_ops\": %llu, \"waitv_syscalls\": %llu, \"other_ops\": %llu}",
+				", \"syscalls\": %llu, \"wait_ops\": %llu, \"wake_ops\": %llu, \"requeue_ops\": %llu, \"wake_op_ops\": %llu, \"pi_ops\": %llu, \"waitv_syscalls\": %llu, \"other_ops\": %llu, \"wait_completed_ops\": %llu, \"wait_completed_total_ns\": %llu, \"wait_blocked_ops\": %llu, \"wait_blocked_total_ns\": %llu, \"wait_blocked_max_ns\": %llu, \"wait_ret\": ",
 				ftid.syscalls, ftid.wait_ops, ftid.wake_ops,
 				ftid.requeue_ops, ftid.wake_op_ops,
 				ftid.pi_ops, ftid.waitv_syscalls,
-				ftid.other_ops);
+				ftid.other_ops, ftid.wait_completed_ops,
+				ftid.wait_completed_total_ns,
+				ftid.wait_blocked_ops,
+				ftid.wait_blocked_total_ns,
+				ftid.wait_blocked_max_ns);
+			json_u64_array(out, ftid.wait_ret,
+				       RVV_FUTEX_RET_BUCKETS);
+			fprintf(out, ", \"wait_ret_total_ns\": ");
+			json_u64_array(out, ftid.wait_ret_total_ns,
+				       RVV_FUTEX_RET_BUCKETS);
+			fprintf(out, "}");
 			first = false;
 		}
 		err = bpf_map_get_next_key(futex_tid_fd, &ftkey, &next_ftkey);
@@ -867,6 +981,8 @@ int main(int argc, char **argv)
 		{ "futex", no_argument, NULL, 'f' },
 		{ "futex-detail", no_argument, NULL, 'F' },
 		{ "futex-stack", no_argument, NULL, 'K' },
+		{ "futex-time", no_argument, NULL, 'T' },
+		{ "futex-only", no_argument, NULL, 'O' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{}
@@ -886,7 +1002,7 @@ int main(int argc, char **argv)
 	int opt;
 	int err;
 
-	while ((opt = getopt_long(argc, argv, "p:t:c:d:j:norRfFKvh", long_options,
+	while ((opt = getopt_long(argc, argv, "p:t:c:d:j:norRfFKTOvh", long_options,
 				  NULL)) != -1) {
 		switch (opt) {
 		case 'p':
@@ -937,6 +1053,16 @@ int main(int argc, char **argv)
 			env.sample_futex = true;
 			env.sample_futex_stack = true;
 			break;
+		case 'T':
+			env.sample_futex = true;
+			env.sample_futex_time = true;
+			break;
+		case 'O':
+			env.futex_only = true;
+			env.sample_futex = true;
+			env.sample_futex_detail = true;
+			env.sample_futex_time = true;
+			break;
 		case 'v':
 			env.verbose_libbpf = true;
 			break;
@@ -963,6 +1089,10 @@ int main(int argc, char **argv)
 		usage(argv[0]);
 		return 1;
 	}
+	if (env.rvv_only && env.futex_only) {
+		fprintf(stderr, "--rvv-only and --futex-only are mutually exclusive\n");
+		return 1;
+	}
 	if (env.rvv_only) {
 		env.sample_vs = true;
 		env.sample_switch_out = true;
@@ -970,6 +1100,12 @@ int main(int argc, char **argv)
 		env.sample_futex = false;
 		env.sample_futex_detail = false;
 		env.sample_futex_stack = false;
+		env.sample_futex_time = false;
+	}
+	if (env.futex_only) {
+		env.sample_vs = false;
+		env.sample_switch_out = false;
+		env.sample_out_state = false;
 	}
 
 	signal(SIGINT, on_signal);
@@ -989,8 +1125,12 @@ int main(int argc, char **argv)
 
 	if (!env.sample_futex)
 		bpf_program__set_autoload(skel->progs.on_sys_enter, false);
-	if (env.rvv_only)
+	if (!env.sample_futex_time)
+		bpf_program__set_autoload(skel->progs.on_sys_exit, false);
+	if (env.rvv_only || env.futex_only)
 		bpf_program__set_autoload(skel->progs.on_sched_wakeup, false);
+	if (env.futex_only)
+		bpf_program__set_autoload(skel->progs.on_sched_switch, false);
 
 	err = rvv_sched_cost_bpf__load(skel);
 	if (err) {
@@ -1007,6 +1147,7 @@ int main(int argc, char **argv)
 	cfg.sample_futex = env.sample_futex ? 1 : 0;
 	cfg.sample_futex_detail = env.sample_futex_detail ? 1 : 0;
 	cfg.sample_futex_stack = env.sample_futex_stack ? 1 : 0;
+	cfg.sample_futex_time = env.sample_futex_time ? 1 : 0;
 	cfg.rvv_only = env.rvv_only ? 1 : 0;
 	err = bpf_map_update_elem(bpf_map__fd(skel->maps.cfg_map), &zero, &cfg,
 				  BPF_ANY);
@@ -1024,13 +1165,15 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	printf("attached: tgid=%u tid=%u duration=%us rvv_only=%u sample_vs=%u sample_switch_out=%u sample_out_state=%u sample_futex=%u sample_futex_detail=%u sample_futex_stack=%u\n",
+	printf("attached: tgid=%u tid=%u duration=%us rvv_only=%u futex_only=%u sample_vs=%u sample_switch_out=%u sample_out_state=%u sample_futex=%u sample_futex_detail=%u sample_futex_stack=%u sample_futex_time=%u\n",
 	       env.tgid, env.tid, env.duration, env.rvv_only ? 1 : 0,
+	       env.futex_only ? 1 : 0,
 	       env.sample_vs ? 1 : 0,
 	       env.sample_switch_out ? 1 : 0,
 	       env.sample_out_state ? 1 : 0, env.sample_futex ? 1 : 0,
 	       env.sample_futex_detail ? 1 : 0,
-	       env.sample_futex_stack ? 1 : 0);
+	       env.sample_futex_stack ? 1 : 0,
+	       env.sample_futex_time ? 1 : 0);
 	fflush(stdout);
 
 	for (unsigned int i = 0; i < env.duration && !exiting; i++)

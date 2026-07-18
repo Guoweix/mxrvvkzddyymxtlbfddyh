@@ -40,6 +40,13 @@
 - `--futex-stack`：在 `--futex` 基础上记录 futex 地址 + wait/wake 类型 + 用户态
   stack id，并在 JSON/text 中输出原始 IP。该模式依赖用户态栈回溯能力，开销和扰动
   明显高于普通 `--futex`，建议只在短窗口内用于定位 top futex 的调用来源。
+- `--futex-time`：为普通 `FUTEX_WAIT*` 调用配对 `raw_syscalls/sys_enter/sys_exit`，
+  统计 completed/blocked 次数、总耗时、最大值、返回码和 log2 直方图。`EAGAIN`
+  快速返回只计入 completed elapsed，不计入 blocked time；woken、`EINTR`、timeout
+  和 syscall restart 计入 blocked time。当前不解析 `futex_waitv` 的地址数组。
+- `--futex-only`：启用 `--futex-time` 和地址+TID detail，同时不挂载
+  `sched_switch` / `sched_wakeup`。该模式用于 barrier blocked-time 性能实验，避免
+  同时采集 RVV/sched 指标造成额外扰动。
 - histogram 使用 log2 微秒桶：bucket 0 表示 `<1us`，bucket N 表示
   `[2^(N-1), 2^N-1] us`。
 
@@ -104,6 +111,12 @@ sshpass -p bianbu ssh -o StrictHostKeyChecking=no root@192.168.3.63 \
 /tmp/rvv_sched_cost --tgid <pid> --duration 300 --futex --json /tmp/result.json
 ```
 
+若只测 futex wait 的真实系统调用耗时，不采集调度事件：
+
+```sh
+/tmp/rvv_sched_cost --tgid <pid> --duration 300 --futex-only --json /tmp/result.json
+```
+
 若需要进一步定位 futex 来源，可短时开启用户态调用栈采样，并同时保存目标进程
 `/proc/<pid>/maps`：
 
@@ -124,7 +137,7 @@ cat /proc/<pid>/maps > /tmp/llama_server_maps.txt
 - `v_save_candidates`
 - `v_restore_candidates`
 - `v_save_out_state`
-- `futex`
+- `futex`，包括 wait completed/blocked time 和返回码分布
 - `futex_addrs` / `futex_tid_addrs` / `futex_stacks`
 - `prev_vs_samples` / `next_vs_samples`
 - per-CPU summary

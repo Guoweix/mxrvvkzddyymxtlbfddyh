@@ -34,6 +34,11 @@
 #define RVV_FUTEX_LOCK_PI2	13
 #define RVV_FUTEX_CMD_MASK	0x7f
 
+#define RVV_EINTR		4
+#define RVV_EAGAIN		11
+#define RVV_ETIMEDOUT		110
+#define RVV_ERESTARTSYS		512
+
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 struct {
@@ -93,6 +98,20 @@ struct {
 } futex_stack_stats SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct rvv_futex_addr_hist_key);
+	__type(value, __u64);
+} futex_addr_hists SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct rvv_task_key);
+	__type(value, struct rvv_futex_wait_inflight);
+} futex_wait_inflight SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
 	__uint(max_entries, 4096);
 	__uint(key_size, sizeof(__u32));
@@ -119,6 +138,20 @@ struct {
 	__type(key, __u32);
 	__type(value, struct rvv_thread_stats);
 } scratch_thread_stats SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct rvv_futex_addr_stats);
+} scratch_futex_addr_stats SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct rvv_futex_tid_stats);
+} scratch_futex_tid_stats SEC(".maps");
 
 static __always_inline void inc_u64(__u64 *p)
 {
@@ -169,6 +202,26 @@ static __always_inline void hist_record(__u32 kind, __u64 ns)
 		bucket = RVV_HIST_BUCKETS - 1;
 
 	inc_u64(&hist->buckets[bucket]);
+}
+
+static __always_inline void futex_addr_hist_record(__u64 uaddr, __u64 ns)
+{
+	struct rvv_futex_addr_hist_key key = {};
+	__u64 zero = 0;
+	__u64 *count;
+
+	key.uaddr = uaddr;
+	key.bucket = hist_bucket_us(ns);
+	if (key.bucket >= RVV_HIST_BUCKETS)
+		key.bucket = RVV_HIST_BUCKETS - 1;
+
+	count = bpf_map_lookup_elem(&futex_addr_hists, &key);
+	if (!count) {
+		bpf_map_update_elem(&futex_addr_hists, &key, &zero, BPF_NOEXIST);
+		count = bpf_map_lookup_elem(&futex_addr_hists, &key);
+	}
+	if (count)
+		inc_u64(count);
 }
 
 static __always_inline __u32 vs_bucket(unsigned long vs)
@@ -368,6 +421,47 @@ static __always_inline __u32 futex_kind(long id, unsigned long op_arg)
 	}
 }
 
+static __always_inline __u32 futex_wait_ret_bucket(long ret)
+{
+	if (!ret)
+		return RVV_FUTEX_RET_WOKEN;
+	if (ret == -RVV_EAGAIN)
+		return RVV_FUTEX_RET_EAGAIN;
+	if (ret == -RVV_EINTR)
+		return RVV_FUTEX_RET_EINTR;
+	if (ret == -RVV_ETIMEDOUT)
+		return RVV_FUTEX_RET_ETIMEDOUT;
+	return RVV_FUTEX_RET_OTHER;
+}
+
+static __always_inline bool futex_wait_was_blocked(long ret)
+{
+	return !ret || ret == -RVV_EINTR || ret == -RVV_ETIMEDOUT ||
+	       ret == -RVV_ERESTARTSYS;
+}
+
+static __always_inline void record_futex_wait_duration(
+	__u64 *completed_ops, __u64 *completed_total_ns,
+	__u64 *blocked_ops, __u64 *blocked_total_ns, __u64 *blocked_max_ns,
+	__u64 ret_counts[RVV_FUTEX_RET_BUCKETS],
+	__u64 ret_total_ns[RVV_FUTEX_RET_BUCKETS], __u64 delta, long ret)
+{
+	__u32 bucket = futex_wait_ret_bucket(ret);
+
+	inc_u64(completed_ops);
+	add_u64(completed_total_ns, delta);
+	if (bucket < RVV_FUTEX_RET_BUCKETS) {
+		inc_u64(&ret_counts[bucket]);
+		add_u64(&ret_total_ns[bucket], delta);
+	}
+	if (!futex_wait_was_blocked(ret))
+		return;
+
+	inc_u64(blocked_ops);
+	add_u64(blocked_total_ns, delta);
+	update_max(blocked_max_ns, delta);
+}
+
 static __always_inline void inc_futex_counters(__u64 *syscalls,
 					       __u64 *wait_ops,
 					       __u64 *wake_ops,
@@ -412,10 +506,11 @@ static __always_inline void record_futex_addr(struct task_struct *task,
 {
 	struct rvv_futex_addr_key addr_key = {};
 	struct rvv_futex_tid_key tid_key = {};
-	struct rvv_futex_addr_stats addr_zero = {};
-	struct rvv_futex_tid_stats tid_zero = {};
+	struct rvv_futex_addr_stats *addr_zero;
+	struct rvv_futex_tid_stats *tid_zero;
 	struct rvv_futex_addr_stats *addr_stats;
 	struct rvv_futex_tid_stats *tid_stats;
+	__u32 scratch_key = 0;
 
 	if (!uaddr)
 		return;
@@ -423,12 +518,17 @@ static __always_inline void record_futex_addr(struct task_struct *task,
 	addr_key.uaddr = uaddr;
 	addr_stats = bpf_map_lookup_elem(&futex_addr_stats, &addr_key);
 	if (!addr_stats) {
-		addr_zero.uaddr = uaddr;
-		addr_zero.last_tgid = task_key->tgid;
-		addr_zero.last_tid = task_key->tid;
-		bpf_core_read_str(addr_zero.last_comm, sizeof(addr_zero.last_comm),
+		addr_zero = bpf_map_lookup_elem(&scratch_futex_addr_stats,
+						&scratch_key);
+		if (!addr_zero)
+			return;
+		__builtin_memset(addr_zero, 0, sizeof(*addr_zero));
+		addr_zero->uaddr = uaddr;
+		addr_zero->last_tgid = task_key->tgid;
+		addr_zero->last_tid = task_key->tid;
+		bpf_core_read_str(addr_zero->last_comm, sizeof(addr_zero->last_comm),
 				  &task->comm);
-		bpf_map_update_elem(&futex_addr_stats, &addr_key, &addr_zero,
+		bpf_map_update_elem(&futex_addr_stats, &addr_key, addr_zero,
 				    BPF_NOEXIST);
 		addr_stats = bpf_map_lookup_elem(&futex_addr_stats, &addr_key);
 	}
@@ -451,12 +551,17 @@ static __always_inline void record_futex_addr(struct task_struct *task,
 	tid_key.tid = task_key->tid;
 	tid_stats = bpf_map_lookup_elem(&futex_tid_stats, &tid_key);
 	if (!tid_stats) {
-		tid_zero.uaddr = uaddr;
-		tid_zero.tgid = task_key->tgid;
-		tid_zero.tid = task_key->tid;
-		bpf_core_read_str(tid_zero.comm, sizeof(tid_zero.comm),
+		tid_zero = bpf_map_lookup_elem(&scratch_futex_tid_stats,
+					       &scratch_key);
+		if (!tid_zero)
+			return;
+		__builtin_memset(tid_zero, 0, sizeof(*tid_zero));
+		tid_zero->uaddr = uaddr;
+		tid_zero->tgid = task_key->tgid;
+		tid_zero->tid = task_key->tid;
+		bpf_core_read_str(tid_zero->comm, sizeof(tid_zero->comm),
 				  &task->comm);
-		bpf_map_update_elem(&futex_tid_stats, &tid_key, &tid_zero,
+		bpf_map_update_elem(&futex_tid_stats, &tid_key, tid_zero,
 				    BPF_NOEXIST);
 		tid_stats = bpf_map_lookup_elem(&futex_tid_stats, &tid_key);
 	}
@@ -844,5 +949,114 @@ int on_sys_enter(struct trace_event_raw_sys_enter *ctx)
 	record_futex_syscall(task, &key, g, t, ctx, id, ctx->args[0],
 			     ctx->args[1], cfg->sample_futex_detail,
 			     cfg->sample_futex_stack);
+
+	if (cfg->sample_futex_time && id != RVV_NR_FUTEX_WAITV &&
+	    futex_kind(id, ctx->args[1]) == 1) {
+		struct rvv_futex_wait_inflight inflight = {
+			.start_ns = bpf_ktime_get_ns(),
+			.uaddr = ctx->args[0],
+		};
+
+		if (bpf_map_update_elem(&futex_wait_inflight, &key, &inflight,
+					BPF_ANY))
+			inc_u64(&g->futex_wait_start_failures);
+	}
+	return 0;
+}
+
+SEC("tracepoint/raw_syscalls/sys_exit")
+int on_sys_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct rvv_futex_wait_inflight *inflight_ptr;
+	struct rvv_futex_wait_inflight inflight;
+	struct rvv_futex_addr_key addr_key = {};
+	struct rvv_futex_tid_key tid_key = {};
+	struct rvv_futex_addr_stats *addr_stats;
+	struct rvv_futex_tid_stats *tid_stats;
+	struct rvv_global_stats *g;
+	struct rvv_thread_stats *t;
+	struct rvv_task_key key = {};
+	struct rvv_config *cfg;
+	struct task_struct *task;
+	__u32 zero = 0;
+	__u64 now;
+	__u64 delta;
+	long id;
+	long ret;
+
+	cfg = bpf_map_lookup_elem(&cfg_map, &zero);
+	if (!cfg || !cfg->sample_futex_time)
+		return 0;
+
+	id = ctx->id;
+	if (id != RVV_NR_FUTEX && id != RVV_NR_FUTEX_TIME64)
+		return 0;
+	if (!current_matches(cfg, &key))
+		return 0;
+
+	inflight_ptr = bpf_map_lookup_elem(&futex_wait_inflight, &key);
+	if (!inflight_ptr)
+		return 0;
+	inflight = *inflight_ptr;
+	bpf_map_delete_elem(&futex_wait_inflight, &key);
+
+	now = bpf_ktime_get_ns();
+	if (now < inflight.start_ns)
+		return 0;
+	delta = now - inflight.start_ns;
+	ret = ctx->ret;
+
+	g = bpf_map_lookup_elem(&global_stats, &zero);
+	if (!g)
+		return 0;
+	task = (struct task_struct *)bpf_get_current_task_btf();
+	t = get_thread_stats(task, &key);
+	if (!t) {
+		inc_u64(&g->lost_ts_updates);
+		return 0;
+	}
+
+	record_futex_wait_duration(
+		&g->futex_wait_completed_ops, &g->futex_wait_completed_total_ns,
+		&g->futex_wait_blocked_ops, &g->futex_wait_blocked_total_ns,
+		&g->futex_wait_blocked_max_ns, g->futex_wait_ret,
+		g->futex_wait_ret_total_ns, delta, ret);
+	record_futex_wait_duration(
+		&t->futex_wait_completed_ops, &t->futex_wait_completed_total_ns,
+		&t->futex_wait_blocked_ops, &t->futex_wait_blocked_total_ns,
+		&t->futex_wait_blocked_max_ns, t->futex_wait_ret,
+		t->futex_wait_ret_total_ns, delta, ret);
+
+	addr_key.uaddr = inflight.uaddr;
+	addr_stats = bpf_map_lookup_elem(&futex_addr_stats, &addr_key);
+	if (addr_stats)
+		record_futex_wait_duration(
+			&addr_stats->wait_completed_ops,
+			&addr_stats->wait_completed_total_ns,
+			&addr_stats->wait_blocked_ops,
+			&addr_stats->wait_blocked_total_ns,
+			&addr_stats->wait_blocked_max_ns, addr_stats->wait_ret,
+			addr_stats->wait_ret_total_ns, delta, ret);
+
+	if (cfg->sample_futex_detail) {
+		tid_key.uaddr = inflight.uaddr;
+		tid_key.tgid = key.tgid;
+		tid_key.tid = key.tid;
+		tid_stats = bpf_map_lookup_elem(&futex_tid_stats, &tid_key);
+		if (tid_stats)
+			record_futex_wait_duration(
+				&tid_stats->wait_completed_ops,
+				&tid_stats->wait_completed_total_ns,
+				&tid_stats->wait_blocked_ops,
+				&tid_stats->wait_blocked_total_ns,
+				&tid_stats->wait_blocked_max_ns,
+				tid_stats->wait_ret,
+				tid_stats->wait_ret_total_ns, delta, ret);
+	}
+
+	if (futex_wait_was_blocked(ret)) {
+		hist_record(RVV_HIST_FUTEX_WAIT_BLOCKED, delta);
+		futex_addr_hist_record(inflight.uaddr, delta);
+	}
 	return 0;
 }

@@ -21,7 +21,17 @@ enum rvv_hist_kind {
 	RVV_HIST_OFFCPU = 0,
 	RVV_HIST_WAKE_TO_RUN = 1,
 	RVV_HIST_SWITCH_INTERVAL = 2,
-	RVV_HIST_MAX = 3,
+	RVV_HIST_FUTEX_WAIT_BLOCKED = 3,
+	RVV_HIST_MAX = 4,
+};
+
+enum rvv_futex_wait_ret_bucket {
+	RVV_FUTEX_RET_WOKEN = 0,
+	RVV_FUTEX_RET_EAGAIN = 1,
+	RVV_FUTEX_RET_EINTR = 2,
+	RVV_FUTEX_RET_ETIMEDOUT = 3,
+	RVV_FUTEX_RET_OTHER = 4,
+	RVV_FUTEX_RET_BUCKETS = 5,
 };
 
 enum rvv_vs_bucket {
@@ -51,6 +61,7 @@ struct rvv_config {
 	unsigned int sample_futex;
 	unsigned int sample_futex_detail;
 	unsigned int sample_futex_stack;
+	unsigned int sample_futex_time;
 	unsigned int rvv_only;
 };
 
@@ -80,6 +91,16 @@ struct rvv_futex_stack_key {
 	unsigned long long uaddr;
 	int stack_id;
 	unsigned int kind;
+};
+
+struct rvv_futex_addr_hist_key {
+	unsigned long long uaddr;
+	unsigned int bucket;
+};
+
+struct rvv_futex_wait_inflight {
+	unsigned long long start_ns;
+	unsigned long long uaddr;
 };
 
 struct rvv_task_ts {
@@ -121,6 +142,14 @@ struct rvv_global_stats {
 	unsigned long long futex_pi_ops;
 	unsigned long long futex_waitv_syscalls;
 	unsigned long long futex_other_ops;
+	unsigned long long futex_wait_completed_ops;
+	unsigned long long futex_wait_completed_total_ns;
+	unsigned long long futex_wait_blocked_ops;
+	unsigned long long futex_wait_blocked_total_ns;
+	unsigned long long futex_wait_blocked_max_ns;
+	unsigned long long futex_wait_ret[RVV_FUTEX_RET_BUCKETS];
+	unsigned long long futex_wait_ret_total_ns[RVV_FUTEX_RET_BUCKETS];
+	unsigned long long futex_wait_start_failures;
 };
 
 struct rvv_thread_stats {
@@ -153,6 +182,13 @@ struct rvv_thread_stats {
 	unsigned long long futex_pi_ops;
 	unsigned long long futex_waitv_syscalls;
 	unsigned long long futex_other_ops;
+	unsigned long long futex_wait_completed_ops;
+	unsigned long long futex_wait_completed_total_ns;
+	unsigned long long futex_wait_blocked_ops;
+	unsigned long long futex_wait_blocked_total_ns;
+	unsigned long long futex_wait_blocked_max_ns;
+	unsigned long long futex_wait_ret[RVV_FUTEX_RET_BUCKETS];
+	unsigned long long futex_wait_ret_total_ns[RVV_FUTEX_RET_BUCKETS];
 };
 
 struct rvv_waker_stats {
@@ -176,6 +212,13 @@ struct rvv_futex_addr_stats {
 	unsigned long long pi_ops;
 	unsigned long long waitv_syscalls;
 	unsigned long long other_ops;
+	unsigned long long wait_completed_ops;
+	unsigned long long wait_completed_total_ns;
+	unsigned long long wait_blocked_ops;
+	unsigned long long wait_blocked_total_ns;
+	unsigned long long wait_blocked_max_ns;
+	unsigned long long wait_ret[RVV_FUTEX_RET_BUCKETS];
+	unsigned long long wait_ret_total_ns[RVV_FUTEX_RET_BUCKETS];
 	unsigned int last_tgid;
 	unsigned int last_tid;
 	char last_comm[RVV_COMM_LEN];
@@ -194,6 +237,13 @@ struct rvv_futex_tid_stats {
 	unsigned long long pi_ops;
 	unsigned long long waitv_syscalls;
 	unsigned long long other_ops;
+	unsigned long long wait_completed_ops;
+	unsigned long long wait_completed_total_ns;
+	unsigned long long wait_blocked_ops;
+	unsigned long long wait_blocked_total_ns;
+	unsigned long long wait_blocked_max_ns;
+	unsigned long long wait_ret[RVV_FUTEX_RET_BUCKETS];
+	unsigned long long wait_ret_total_ns[RVV_FUTEX_RET_BUCKETS];
 };
 
 struct rvv_futex_stack_stats {
