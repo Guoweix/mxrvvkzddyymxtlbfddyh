@@ -2,6 +2,8 @@
 
 `experiments/benchmark` 是当前项目的 LLM 推理基准测试入口，用于比较 CFS、sched_ext 调度策略和 RVV dirty 识别策略对 llama.cpp 推理性能的影响。
 
+双 llama-server、异步请求注入场景使用独立入口 [`dual_model/README.md`](dual_model/README.md)。它不会改变本脚本的单实例测试行为。
+
 测试脚本会自动重启板端 `llama-server`，完成正式测试前预热，启动可选 sched_ext 调度器和 RVV 上下文切换观测工具。当前默认套件：每个并发档位单轮 300 秒，按 `2,4,8` 并发请求分别运行，最终汇总 TPS、平均 TTFT 和 p95 TTFT。
 
 ## 目录结构
