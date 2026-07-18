@@ -107,6 +107,8 @@ CPU migrations:         12
 
 控制接口只在启用 `--user-control observe|active` 时创建。loader 将配置和 worker map pin 到 bpffs；llama.cpp 通过 `GGML_SCX_LEASE_HINT_PATH` 在 OpenMP graph 开始时连接一次，每个 worker 仅在 session/TID 变化时注册。BPF 只在首次 dirty 分类时读取一次 worker map，后续 enqueue/dispatch 继续走原 dirty lease 路径。
 
+传入 `--tgid2` 时启用双模型 ABI v2。worker map 包含两个 4096-byte page，两个模型分别注册 8 个 worker；CPU owner、per-CPU vector DSQ 和 local window 都按 `(team, CPU)` 隔离，因此每个模型内部都可以唯一使用 CPU0-7。
+
 ```bash
 # 默认 active 模式不改变已验证的自然唯一 CPU 分配
 ./scx_llm_pin --tgid "$LLM_PID" --strategy rvv_dirty \
@@ -119,6 +121,10 @@ CPU migrations:         12
 # 查看或原子更新在线策略
 ./rvv_lease_ctl status
 ./rvv_lease_ctl set --slice-ms 120 --window-ms 600 --dirty-threshold 3
+
+# 在 60 秒内优先消费 team 1 的 vector DSQ；off 可提前取消
+./rvv_lease_ctl set --prefer-team 1 --prefer-ms 60000
+./rvv_lease_ctl set --prefer-team off
 
 # 显式 ith0..7 -> CPU7..0；已分类 worker 在下次 wakeup 使用新映射
 ./rvv_lease_ctl set --cpu-map 7,6,5,4,3,2,1,0
@@ -133,6 +139,10 @@ CPU migrations:         12
 - `observe`：验证并缓存 worker 的 `ith/TID/session`，不改变 CPU placement。
 - `active` + `auto`：允许在线参数控制，但 CPU placement 仍使用原 dirty lease 自然唯一分配。
 - `active` + 显式 map：按用户给出的唯一排列覆盖 `ith -> CPU`；切回 `auto` 后重新进入自然分配。
+
+preferred team 是带 TTL 的低频实验提示。它只在 global/system DSQ 为空后改变两个 vector DSQ 的消费顺序，preferred DSQ 为空时立即回退；不会改变任务入队位置，也不会抑制另一 team 的 local lease。正式双模型测试未证明它有 TPS 收益，因此默认关闭。
+
+在线 `--window-ms` 可用于 phase/injection 实验。256-token 双模型正式测试中，注入时从 500ms 改为 1000ms 虽将 vector DSQ consume 减少约 43%，TPS 却下降 0.34%；推荐默认仍为 500ms。完整结果见 `docs/rvv_dirty_lease_dual_model_userspace_20260718.md`。
 
 提示页缺失、session 不匹配或 worker slot 无效时，调度器只增加 fallback 统计，仍靠 RVV dirty 识别和原 lease 路径运行，不会依赖用户态继续推进。
 

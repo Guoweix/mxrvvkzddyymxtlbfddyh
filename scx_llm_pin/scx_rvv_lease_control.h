@@ -7,8 +7,10 @@
 #endif
 
 #define RVV_LEASE_CONTROL_MAGIC       0x524c4354U
-#define RVV_LEASE_CONTROL_ABI_VERSION 1U
+#define RVV_LEASE_CONTROL_ABI_VERSION 2U
 #define RVV_LEASE_CONTROL_WORKERS     8U
+#define RVV_LEASE_CONTROL_TEAMS       2U
+#define RVV_LEASE_WORKER_PAGE_SIZE    4096U
 #define RVV_LEASE_CONTROL_DEFAULT_DIR "/sys/fs/bpf/scx_rvv_dirty_lease"
 #define RVV_LEASE_CONFIG_MAP_NAME     "config"
 #define RVV_LEASE_WORKER_MAP_NAME     "workers"
@@ -19,6 +21,11 @@ enum rvv_lease_control_mode {
 	RVV_LEASE_CONTROL_ACTIVE = 2,
 };
 
+enum rvv_lease_model_hint_flags {
+	RVV_LEASE_MODEL_ACTIVE = 1U << 0,
+	RVV_LEASE_MODEL_LATENCY_SENSITIVE = 1U << 1,
+};
+
 struct rvv_lease_worker_header {
 	__u32 magic;
 	__u32 abi_version;
@@ -26,9 +33,12 @@ struct rvv_lease_worker_header {
 	__u32 target_tgid;
 	__u32 max_workers;
 	__u32 loader_pid;
+	__u32 team_id;
+	__u32 hint_flags;
 	__u64 session_id;
 	__u64 policy_epoch;
-	__u64 reserved64[3];
+	__u64 hint_epoch;
+	__u64 reserved64;
 } __attribute__((aligned(64)));
 
 struct rvv_lease_worker_slot {
@@ -45,6 +55,10 @@ struct rvv_lease_worker_slot {
 struct rvv_lease_worker_page {
 	struct rvv_lease_worker_header header;
 	struct rvv_lease_worker_slot workers[RVV_LEASE_CONTROL_WORKERS];
+	__u8 reserved[RVV_LEASE_WORKER_PAGE_SIZE -
+		      sizeof(struct rvv_lease_worker_header) -
+		      sizeof(struct rvv_lease_worker_slot) *
+		      RVV_LEASE_CONTROL_WORKERS];
 };
 
 #ifndef __VMLINUX_H__
@@ -52,8 +66,8 @@ _Static_assert(sizeof(struct rvv_lease_worker_header) == 64,
 	       "lease worker header must occupy one cache line");
 _Static_assert(sizeof(struct rvv_lease_worker_slot) == 64,
 	       "lease worker slot must occupy one cache line");
-_Static_assert(sizeof(struct rvv_lease_worker_page) <= 4096,
-	       "lease worker page must fit in one page");
+_Static_assert(sizeof(struct rvv_lease_worker_page) == RVV_LEASE_WORKER_PAGE_SIZE,
+	       "lease worker page must occupy one page");
 #endif
 
 #endif /* __SCX_RVV_LEASE_CONTROL_H */

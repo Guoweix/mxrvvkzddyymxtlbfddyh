@@ -22,6 +22,7 @@ enum llm_sched_strategy {
 // 共享配置结构，用户态和 BPF 之间通信
 struct llm_pin_config {
 	__u32 target_tgid;        // 目标进程 TGID（llama-server）
+	__u32 target_tgid2;       // 可选的第二个 llama-server TGID
 	__u32 llm_cpu_mask;       // LLM 专用 CPU 掩码（bit 0-7 对应 CPU 0-7）
 	__u32 system_cpu_mask;    // 系统进程 CPU 掩码
 	__u32 enabled;            // 是否启用绑定策略
@@ -38,7 +39,10 @@ struct llm_pin_config {
 	__u64 vector_local_window_ns; // vector DSQ 放行后的 local 快速窗口
 	__u32 user_control_mode; // enum rvv_lease_control_mode
 	__u32 user_cpu_map_enabled; // 1=显式 ith->CPU；0=保留 lease 自然唯一分配
+	__u32 user_preferred_team_plus1; // 0=禁用；1/2=team 0/1
+	__u32 user_preference_flags; // 预留给后续模型级策略
 	__u32 user_cpu_map[RVV_LEASE_CONTROL_WORKERS]; // OpenMP ith -> CPU
+	__u64 user_preferred_until_ns; // CLOCK_MONOTONIC 绝对过期时间
 	__u64 user_session_id;
 	__u64 user_policy_epoch;
 };
@@ -55,6 +59,8 @@ struct llm_pin_stats {
 	__u64 system_dispatches;
 	__u64 rvv_dirty_samples;
 	__u64 rvv_vector_threads;
+	__u64 rvv_vector_threads_team0;
+	__u64 rvv_vector_threads_team1;
 	__u64 rvv_vector_dispatches;
 	__u64 rvv_aggressive_dispatches;
 	__u64 rvv_fallback_dispatches;
@@ -63,6 +69,10 @@ struct llm_pin_stats {
 	__u64 protected_kernel_preempts;
 	__u64 rvv_vector_dsq_dispatches;
 	__u64 rvv_vector_dsq_consumes;
+	__u64 rvv_vector_dsq_dispatches_team0;
+	__u64 rvv_vector_dsq_dispatches_team1;
+	__u64 rvv_vector_dsq_consumes_team0;
+	__u64 rvv_vector_dsq_consumes_team1;
 	__u64 rvv_vector_local_dispatches;
 	__u64 rvv_vector_window_starts;
 	__u64 rvv_vector_slice_clamps;
@@ -74,11 +84,14 @@ struct llm_pin_stats {
 	__u64 user_hint_active_assignments;
 	__u64 user_hint_invalid_workers;
 	__u64 user_hint_fallbacks;
+	__u64 user_preference_dsq_consumes;
+	__u64 user_preference_empty_fallbacks;
 };
 
 struct rvv_task_class {
 	__u32 dirty_score;
 	__u32 is_vector;
+	__u32 team_id_plus1;
 	__u32 assigned_cpu_plus1;
 	__u32 user_ith_plus1;
 	__u32 user_cpu_forced;

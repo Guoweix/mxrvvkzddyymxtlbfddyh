@@ -14,4 +14,6 @@ scx_rvv_exclusive/scx_rvv_exclusive.bpf.o
 benchmark/results
 benchmark/logs
 benchmark/__pycache__
-
+benchmark/dual_model/__pycache__
+benchmark/dual_model/results
+scx_llm_pin/rvv_lease_ctl

@@ -88,6 +88,11 @@ static __u64 new_control_session_id(void)
 	return value ? value : 1;
 }
 
+static __u32 config_team_tgid(const struct llm_pin_config *config, __u32 team)
+{
+	return team == 0 ? config->target_tgid : config->target_tgid2;
+}
+
 static int parse_cpu_order(const char *str,
 			   __u32 cpus[RVV_LEASE_CONTROL_WORKERS],
 			   __u32 *enabled)
@@ -138,7 +143,7 @@ static int initialize_and_pin_control_maps(
 	size_t config_path_size, char *worker_path, size_t worker_path_size)
 {
 	struct rvv_lease_worker_page page = {};
-	__u32 key = 0;
+	__u32 key;
 	int err;
 
 	if (mkdir(dir, 0700) && errno != EEXIST)
@@ -153,18 +158,27 @@ static int initialize_and_pin_control_maps(
 		return -EEXIST;
 	}
 
-	page.header.magic = RVV_LEASE_CONTROL_MAGIC;
-	page.header.abi_version = RVV_LEASE_CONTROL_ABI_VERSION;
-	page.header.active = 1;
-	page.header.target_tgid = config->target_tgid;
-	page.header.max_workers = RVV_LEASE_CONTROL_WORKERS;
-	page.header.loader_pid = (__u32)getpid();
-	page.header.session_id = config->user_session_id;
-	page.header.policy_epoch = config->user_policy_epoch;
-	err = bpf_map__update_elem(skel->maps.user_worker_map, &key,
-				   sizeof(key), &page, sizeof(page), BPF_ANY);
-	if (err)
-		return err;
+	for (key = 0; key < RVV_LEASE_CONTROL_TEAMS; key++) {
+		__u32 target_tgid = config_team_tgid(config, key);
+
+		memset(&page, 0, sizeof(page));
+		if (target_tgid) {
+			page.header.magic = RVV_LEASE_CONTROL_MAGIC;
+			page.header.abi_version = RVV_LEASE_CONTROL_ABI_VERSION;
+			page.header.active = 1;
+			page.header.target_tgid = target_tgid;
+			page.header.max_workers = RVV_LEASE_CONTROL_WORKERS;
+			page.header.loader_pid = (__u32)getpid();
+			page.header.team_id = key;
+			page.header.hint_flags = RVV_LEASE_MODEL_ACTIVE;
+			page.header.session_id = config->user_session_id;
+			page.header.policy_epoch = config->user_policy_epoch;
+		}
+		err = bpf_map__update_elem(skel->maps.user_worker_map, &key,
+					   sizeof(key), &page, sizeof(page), BPF_ANY);
+		if (err)
+			return err;
+	}
 	err = bpf_map__pin(skel->maps.config_map, config_path);
 	if (err)
 		return err;
@@ -183,15 +197,17 @@ static void deactivate_and_unpin_control_maps(
 	const char *worker_path, bool pinned)
 {
 	struct rvv_lease_worker_page page = {};
-	__u32 key = 0;
+	__u32 key;
 
 	if (!pinned || !skel)
 		return;
-	if (!bpf_map__lookup_elem(skel->maps.user_worker_map, &key, sizeof(key),
-				  &page, sizeof(page), 0)) {
-		page.header.active = 0;
-		bpf_map__update_elem(skel->maps.user_worker_map, &key, sizeof(key),
-				     &page, sizeof(page), BPF_ANY);
+	for (key = 0; key < RVV_LEASE_CONTROL_TEAMS; key++) {
+		if (!bpf_map__lookup_elem(skel->maps.user_worker_map, &key,
+					  sizeof(key), &page, sizeof(page), 0)) {
+			page.header.active = 0;
+			bpf_map__update_elem(skel->maps.user_worker_map, &key,
+					     sizeof(key), &page, sizeof(page), BPF_ANY);
+		}
 	}
 	bpf_map__unpin(skel->maps.user_worker_map, worker_path);
 	bpf_map__unpin(skel->maps.config_map, config_path);
@@ -201,25 +217,28 @@ static void deactivate_and_unpin_control_maps(
 static void print_worker_page(struct scx_llm_pin_bpf *skel)
 {
 	struct rvv_lease_worker_page page = {};
-	__u32 key = 0;
+	__u32 key;
 
-	if (bpf_map__lookup_elem(skel->maps.user_worker_map, &key, sizeof(key),
-				 &page, sizeof(page), 0) || !page.header.active)
-		return;
-	printf("\n=== userspace lease workers ===\n");
-	printf("active=%u tgid=%u session=%llu epoch=%llu abi=%u\n",
-	       page.header.active, page.header.target_tgid,
-	       (unsigned long long)page.header.session_id,
-	       (unsigned long long)page.header.policy_epoch,
-	       page.header.abi_version);
-	for (__u32 ith = 0; ith < RVV_LEASE_CONTROL_WORKERS; ith++) {
-		const struct rvv_lease_worker_slot *slot = &page.workers[ith];
-
-		if (!slot->sequence || !slot->tid)
+	for (key = 0; key < RVV_LEASE_CONTROL_TEAMS; key++) {
+		if (bpf_map__lookup_elem(skel->maps.user_worker_map, &key,
+					 sizeof(key), &page, sizeof(page), 0) ||
+		    !page.header.active)
 			continue;
-		printf("lease_worker ith=%u tid=%u tgid=%u n_threads=%u session=%llu seq=%u\n",
-		       slot->ith, slot->tid, slot->tgid, slot->n_threads,
-		       (unsigned long long)slot->session_id, slot->sequence);
+		printf("\n=== userspace lease workers team=%u ===\n", key);
+		printf("active=%u tgid=%u session=%llu epoch=%llu abi=%u\n",
+		       page.header.active, page.header.target_tgid,
+		       (unsigned long long)page.header.session_id,
+		       (unsigned long long)page.header.policy_epoch,
+		       page.header.abi_version);
+		for (__u32 ith = 0; ith < RVV_LEASE_CONTROL_WORKERS; ith++) {
+			const struct rvv_lease_worker_slot *slot = &page.workers[ith];
+
+			if (!slot->sequence || !slot->tid)
+				continue;
+			printf("lease_worker team=%u ith=%u tid=%u tgid=%u n_threads=%u session=%llu seq=%u\n",
+			       key, slot->ith, slot->tid, slot->tgid, slot->n_threads,
+			       (unsigned long long)slot->session_id, slot->sequence);
+		}
 	}
 	fflush(stdout);
 }
@@ -415,6 +434,8 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	printf("System dispatches:      %llu\n", stats.system_dispatches);
 	printf("RVV dirty samples:      %llu\n", stats.rvv_dirty_samples);
 	printf("RVV vector threads:     %llu\n", stats.rvv_vector_threads);
+	printf("RVV vector threads by team: %llu/%llu\n",
+	       stats.rvv_vector_threads_team0, stats.rvv_vector_threads_team1);
 	printf("RVV vector dispatches:  %llu\n", stats.rvv_vector_dispatches);
 	printf("RVV aggressive dispatches: %llu\n", stats.rvv_aggressive_dispatches);
 	printf("RVV fallback dispatches:   %llu\n", stats.rvv_fallback_dispatches);
@@ -423,6 +444,12 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	printf("Protected kernel preempts:   %llu\n", stats.protected_kernel_preempts);
 	printf("RVV vector DSQ dispatches:   %llu\n", stats.rvv_vector_dsq_dispatches);
 	printf("RVV vector DSQ consumes:     %llu\n", stats.rvv_vector_dsq_consumes);
+	printf("RVV vector DSQ dispatches by team: %llu/%llu\n",
+	       stats.rvv_vector_dsq_dispatches_team0,
+	       stats.rvv_vector_dsq_dispatches_team1);
+	printf("RVV vector DSQ consumes by team:   %llu/%llu\n",
+	       stats.rvv_vector_dsq_consumes_team0,
+	       stats.rvv_vector_dsq_consumes_team1);
 	printf("RVV vector local dispatches: %llu\n", stats.rvv_vector_local_dispatches);
 	printf("RVV vector window starts:    %llu\n", stats.rvv_vector_window_starts);
 	printf("RVV vector slice clamps:     %llu\n", stats.rvv_vector_slice_clamps);
@@ -440,6 +467,10 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	       stats.user_hint_active_assignments);
 	printf("User hint invalid/fallback:    %llu/%llu\n",
 	       stats.user_hint_invalid_workers, stats.user_hint_fallbacks);
+	printf("User preference DSQ consumes:       %llu\n",
+	       stats.user_preference_dsq_consumes);
+	printf("User preference empty fallbacks:    %llu\n",
+	       stats.user_preference_empty_fallbacks);
 	fflush(stdout);
 }
 
@@ -461,8 +492,10 @@ static void print_vector_cpu_assignments(struct scx_llm_pin_bpf *skel)
 		    task_class.is_vector) {
 			selected_cpu = -1;
 			bpf_map_lookup_elem(cpu_fd, &key, &selected_cpu);
-			printf("tid=%u dirty_score=%u selected_cpu=%d user_ith=%d user_session=%llu\n",
-			       key, task_class.dirty_score, selected_cpu,
+			printf("tid=%u team=%d dirty_score=%u selected_cpu=%d user_ith=%d user_session=%llu\n",
+			       key, task_class.team_id_plus1 ?
+			       (int)task_class.team_id_plus1 - 1 : -1,
+			       task_class.dirty_score, selected_cpu,
 			       task_class.user_ith_plus1 ?
 			       (int)task_class.user_ith_plus1 - 1 : -1,
 			       (unsigned long long)task_class.user_session_id);
@@ -476,6 +509,7 @@ enum {
 	OPT_USER_CONTROL = 1000,
 	OPT_CONTROL_DIR,
 	OPT_USER_CPU_MAP,
+	OPT_TGID2,
 };
 
 static void usage(const char *prog)
@@ -485,6 +519,7 @@ static void usage(const char *prog)
 		"\n"
 		"Options:\n"
 		"  --tgid <pid>           Target process TGID (llama-server PID)\n"
+		"  --tgid2 <pid>          Optional second llama-server TGID\n"
 		"  --strategy <name>      global|pin|long_slice|local_dsq|rvv_dirty|rvv_dirty_local (default: pin)\n"
 		"  --llm-cpus <range>     CPU mask for LLM threads (e.g., 0-3 or 0,1,2,3)\n"
 		"  --system-cpus <range>  CPU mask for system threads (e.g., 4-7)\n"
@@ -539,6 +574,7 @@ int main(int argc, char **argv)
 
 	static struct option long_options[] = {
 		{"tgid",        required_argument, 0, 't'},
+		{"tgid2",       required_argument, 0, OPT_TGID2},
 		{"strategy",    required_argument, 0, 'p'},
 		{"llm-cpus",    required_argument, 0, 'l'},
 		{"system-cpus", required_argument, 0, 's'},
@@ -570,6 +606,9 @@ int main(int argc, char **argv)
 		switch (c) {
 		case 't':
 			config.target_tgid = atoi(optarg);
+			break;
+		case OPT_TGID2:
+			config.target_tgid2 = atoi(optarg);
 			break;
 		case 'p':
 			if (parse_strategy(optarg, &config.strategy)) {
@@ -649,6 +688,10 @@ int main(int argc, char **argv)
 		usage(argv[0]);
 		return 1;
 	}
+	if (config.target_tgid2 == config.target_tgid) {
+		fprintf(stderr, "Error: --tgid2 must differ from --tgid\n");
+		return 1;
+	}
 	if (!config.llm_cpu_mask)
 		config.llm_cpu_mask = 0xFF;
 
@@ -694,6 +737,8 @@ int main(int argc, char **argv)
 	// 打印配置
 	printf("scx_llm_pin configuration:\n");
 	printf("  Target TGID:     %u\n", config.target_tgid);
+	if (config.target_tgid2)
+		printf("  Target TGID 2:   %u\n", config.target_tgid2);
 	printf("  Strategy:        %s\n", strategy_name(config.strategy));
 	printf("  LLM CPU mask:    0x%02x\n", config.llm_cpu_mask);
 	printf("  System CPU mask: 0x%02x\n", config.system_cpu_mask);
@@ -712,6 +757,7 @@ int main(int argc, char **argv)
 	printf("  Dirty threshold: %u\n", config.dirty_threshold);
 	printf("  Fallback every:  %u\n", config.fallback_every);
 	printf("  User control:    %s\n", control_mode_name(config.user_control_mode));
+	printf("  User preference: off\n");
 	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF) {
 		printf("  Control dir:     %s\n", control_dir);
 		printf("  Control session: %llu\n",
@@ -786,13 +832,24 @@ int main(int argc, char **argv)
 	if (!config.switch_all) {
 		if (tid_list)
 			err = set_tid_list_policy(tid_list, SCHED_EXT);
-		else
+		else {
 			err = set_tgid_threads_policy(config.target_tgid, SCHED_EXT);
+			if (err >= 0) {
+				moved_threads = err;
+				if (config.target_tgid2) {
+					err = set_tgid_threads_policy(config.target_tgid2,
+							      SCHED_EXT);
+					if (err >= 0)
+						moved_threads += err;
+				}
+			}
+		}
 		if (err < 0) {
 			fprintf(stderr, "failed to move target threads to SCHED_EXT: %d\n", err);
 			goto cleanup;
 		}
-		moved_threads = err;
+		if (tid_list)
+			moved_threads = err;
 		printf("Moved %d target threads to SCHED_EXT\n", moved_threads);
 	}
 
@@ -826,8 +883,11 @@ cleanup:
 	if (!config.switch_all && moved_threads > 0) {
 		if (tid_list)
 			set_tid_list_policy(tid_list, SCHED_NORMAL);
-		else
+		else {
 			set_tgid_threads_policy(config.target_tgid, SCHED_NORMAL);
+			if (config.target_tgid2)
+				set_tgid_threads_policy(config.target_tgid2, SCHED_NORMAL);
+		}
 	}
 	bpf_link__destroy(link);
 	deactivate_and_unpin_control_maps(skel, control_dir, config_map_path,
