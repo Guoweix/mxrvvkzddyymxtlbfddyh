@@ -1097,10 +1097,8 @@ int main(int argc, char **argv)
 		env.sample_vs = true;
 		env.sample_switch_out = true;
 		env.sample_out_state = false;
-		env.sample_futex = false;
 		env.sample_futex_detail = false;
 		env.sample_futex_stack = false;
-		env.sample_futex_time = false;
 	}
 	if (env.futex_only) {
 		env.sample_vs = false;

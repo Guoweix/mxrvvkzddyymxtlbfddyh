@@ -32,6 +32,10 @@
 - `--rvv-only`：只挂载 `sched_switch`，仅累计目标进程的全局
   `v_save_candidates` / `v_restore_candidates`。不维护 per-thread/per-CPU、时间戳、
   histogram、waker 或 futex 数据，适合只比较 RVV 上下文切换次数的低扰动长测。
+- `--rvv-only --futex-time`：保留上述 RVV 全局快路径，同时额外挂载 futex
+  enter/exit 配对。该组合不挂 `sched_wakeup`，不维护 sched per-thread/per-CPU
+  时间戳，用于在同一轮长测中同时比较 RVV save/restore 候选和 futex barrier
+  blocked time。单独使用 `--rvv-only` 时仍不采集任何 futex 数据。
 - `--futex`：额外挂载 `raw_syscalls/sys_enter`，只统计目标 TGID/TID 的 futex
   系统调用，并按 wait / wake / requeue / wake_op / PI / waitv 分类，同时聚合 futex
   地址。默认不启用，避免所有 syscall 都经过额外 tracepoint。
