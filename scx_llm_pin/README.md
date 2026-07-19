@@ -105,9 +105,13 @@ CPU migrations:         12
 
 ### Dirty Lease 用户态控制
 
-控制接口只在启用 `--user-control observe|active` 时创建。loader 将配置和 worker map pin 到 bpffs；llama.cpp 通过 `GGML_SCX_LEASE_HINT_PATH` 在 OpenMP graph 开始时连接一次，每个 worker 仅在 session/TID 变化时注册。BPF 只在首次 dirty 分类时读取一次 worker map，后续 enqueue/dispatch 继续走原 dirty lease 路径。
+控制接口只在启用 `--user-control observe|active` 时创建。loader 将配置和 worker map pin 到 bpffs；llama.cpp 通过 `GGML_SCX_LEASE_HINT_PATH` 在 OpenMP graph 开始时连接，每个 worker 仅在 session/TID 变化时重写 slot。BPF 在分类阶段有界读取 worker map；成员身份稳定后，常规 enqueue/dispatch 继续走 dirty lease 路径。
 
-传入 `--tgid2` 时启用双模型 ABI v2。worker map 包含两个 4096-byte page，两个模型分别注册 8 个 worker；CPU owner、per-CPU vector DSQ 和 local window 都按 `(team, CPU)` 隔离，因此每个模型内部都可以唯一使用 CPU0-7。
+传入 `--tgid2` 时启用双模型 ABI v3。worker map 包含两个 4096-byte page，两个模型分别注册 8 个 worker；每页新增一个 64-byte team phase hint。CPU owner、per-CPU vector DSQ 和 local window 都按 `(team, CPU)` 隔离，因此每个模型内部都可以唯一使用 CPU0-7。
+
+patched llama.cpp 会在每次 CPU graph 前发布 `PREFILL`、`DECODE` 或 `MIXED`，graph 返回后发布 `IDLE`。server 通过实验 C API `llama_set_sched_hint()` 标记当前 batch 中的 prompt/decode token 数；未设置 API 时 context 仍可根据 ubatch 自动推断。phase 和 worker slot 都使用 sequence counter，并校验 TGID、team、session、ABI 与 8-worker 数量。
+
+显式 worker 页是计算组成员的首选来源。页尚未完整时调度器最多等待 1 秒，让 OpenMP worker 先运行并注册；完整页中的非成员会被明确排除。只有页缺失、ABI 无效或注册 grace 超时才回退 RVV dirty，因此未打补丁的 llama.cpp 仍可运行。
 
 ```bash
 # 默认 active 模式不改变已验证的自然唯一 CPU 分配
@@ -117,6 +121,18 @@ CPU migrations:         12
   --vector-slice-ms 100 --vector-local-window-ms 500 \
   --dirty-threshold 2 --user-control active \
   --user-cpu-map auto
+
+# 双模型 phase 只观测，不改变已验收 dirty lease
+./scx_llm_pin --tgid "$MODEL_A_PID" --tgid2 "$MODEL_B_PID" \
+  --strategy rvv_dirty --llm-cpus 0-7 --system-cpus 0-7 \
+  --user-control active --team-gang observe
+
+# 在自然 500ms lease 边界优先 PREFILL/MIXED，并定向抢占同核异组 vector worker
+./scx_llm_pin --tgid "$MODEL_A_PID" --tgid2 "$MODEL_B_PID" \
+  --strategy rvv_dirty --llm-cpus 0-7 --system-cpus 0-7 \
+  --vector-slice-ms 100 --vector-local-window-ms 500 \
+  --user-control active --team-gang prefill-lease \
+  --prefill-starvation-ms 1000
 
 # 查看或原子更新在线策略
 ./rvv_lease_ctl status
@@ -139,6 +155,19 @@ CPU migrations:         12
 - `observe`：验证并缓存 worker 的 `ith/TID/session`，不改变 CPU placement。
 - `active` + `auto`：允许在线参数控制，但 CPU placement 仍使用原 dirty lease 自然唯一分配。
 - `active` + 显式 map：按用户给出的唯一排列覆盖 `ith -> CPU`；切回 `auto` 后重新进入自然分配。
+
+team gang 模式默认 `off`，均要求双 TGID 和有效用户控制页：
+
+- `off`：完全保留已验收 active-auto dirty lease。
+- `observe`：读取并统计 phase，不改变 enqueue/dispatch。
+- `always`：两组 graph 同时活跃时始终启用共享 team quantum，用于消融实验。
+- `prefill-lease`：保留 100ms vector slice 和 500ms local lease；在下一次自然 vector DSQ 消费时优先唯一的 `PREFILL/MIXED` team。该组 vector worker 因 `SCX_ENQ_WAKEUP` 入队且同核正在运行另一组 vector worker 时，使用 `SCX_ENQ_PREEMPT` 定向抢占；不会抢占普通任务、kworker 或内核线程，也不启用 gang quantum 或全核 kick。
+
+`always` active gang 期间 vector worker 进入各自 `(team, CPU)` DSQ，dispatch 先服务 global/system，再消费当前 team；当前 team 为空会立即回退另一 team，避免严格 gang 导致 CPU 空转或 watchdog。team 切换会 kick 计算 CPU，vector slice 被限制到 gang quantum。该实现是 work-conserving loose gang，不保证 8 个 worker 同时 runnable。
+
+`prefill-lease` 单独记录每个 `(team, CPU)` vector DSQ 的 runnable pending 时间。等待达到 `--prefill-starvation-ms`（默认 1000ms）时，该 worker 在 global 前获得一个 vector slice，但不续 local lease；参数限制为 100..4000ms。加入定向 wakeup 抢占后的三轮 256-token 测试相对 observe 为 TPS -1.17%、run-level mean TTFT 均值 -17.35%、TTFT max -4.24%、上下文切换 +11.24%；其中 mean TTFT 受一个批处理完成顺序改变的样本显著影响。安全门禁通过，但性能与稳定性门槛未全部通过，不能替换默认 dirty lease。完整结果见 `docs/rvv_phase_lease_wakeup_preempt_20260719.md`。
+
+`--gang-sample-us 1000` 可请求采样每个 CPU 当前运行的 team，并输出 `SCX_GANG_SAMPLES`；默认关闭，因为高频用户态轮询不应混入正式性能数据。`SCX_GANG_STATS` 始终提供机器可解析的 phase、gang、worker 和 DSQ 摘要。`rvv_lease_ctl status` 会显示 gang 配置及两页当前 phase。
 
 preferred team 是带 TTL 的低频实验提示。它只在 global/system DSQ 为空后改变两个 vector DSQ 的消费顺序，preferred DSQ 为空时立即回退；不会改变任务入队位置，也不会抑制另一 team 的 local lease。正式双模型测试未证明它有 TPS 收益，因此默认关闭。
 

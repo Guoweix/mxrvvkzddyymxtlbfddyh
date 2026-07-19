@@ -7,7 +7,7 @@
 #endif
 
 #define RVV_LEASE_CONTROL_MAGIC       0x524c4354U
-#define RVV_LEASE_CONTROL_ABI_VERSION 2U
+#define RVV_LEASE_CONTROL_ABI_VERSION 3U
 #define RVV_LEASE_CONTROL_WORKERS     8U
 #define RVV_LEASE_CONTROL_TEAMS       2U
 #define RVV_LEASE_WORKER_PAGE_SIZE    4096U
@@ -24,6 +24,13 @@ enum rvv_lease_control_mode {
 enum rvv_lease_model_hint_flags {
 	RVV_LEASE_MODEL_ACTIVE = 1U << 0,
 	RVV_LEASE_MODEL_LATENCY_SENSITIVE = 1U << 1,
+};
+
+enum rvv_lease_phase {
+	RVV_LEASE_PHASE_IDLE = 0,
+	RVV_LEASE_PHASE_PREFILL = 1,
+	RVV_LEASE_PHASE_DECODE = 2,
+	RVV_LEASE_PHASE_MIXED = 3,
 };
 
 struct rvv_lease_worker_header {
@@ -52,12 +59,28 @@ struct rvv_lease_worker_slot {
 	__u64 reserved64[4];
 } __attribute__((aligned(64)));
 
+struct rvv_lease_team_hint {
+	__u32 sequence;
+	__u32 phase;
+	__u32 active_workers;
+	__u32 flags;
+	__u32 prompt_tokens;
+	__u32 decode_tokens;
+	__u32 reserved32[2];
+	__u64 phase_epoch;
+	__u64 begin_ns;
+	__u64 expires_ns;
+	__u64 session_id;
+} __attribute__((aligned(64)));
+
 struct rvv_lease_worker_page {
 	struct rvv_lease_worker_header header;
+	struct rvv_lease_team_hint team_hint;
 	struct rvv_lease_worker_slot workers[RVV_LEASE_CONTROL_WORKERS];
 	__u8 reserved[RVV_LEASE_WORKER_PAGE_SIZE -
-		      sizeof(struct rvv_lease_worker_header) -
-		      sizeof(struct rvv_lease_worker_slot) *
+			      sizeof(struct rvv_lease_worker_header) -
+			      sizeof(struct rvv_lease_team_hint) -
+			      sizeof(struct rvv_lease_worker_slot) *
 		      RVV_LEASE_CONTROL_WORKERS];
 };
 
@@ -65,7 +88,9 @@ struct rvv_lease_worker_page {
 _Static_assert(sizeof(struct rvv_lease_worker_header) == 64,
 	       "lease worker header must occupy one cache line");
 _Static_assert(sizeof(struct rvv_lease_worker_slot) == 64,
-	       "lease worker slot must occupy one cache line");
+		       "lease worker slot must occupy one cache line");
+_Static_assert(sizeof(struct rvv_lease_team_hint) == 64,
+		       "lease team hint must occupy one cache line");
 _Static_assert(sizeof(struct rvv_lease_worker_page) == RVV_LEASE_WORKER_PAGE_SIZE,
 	       "lease worker page must occupy one page");
 #endif

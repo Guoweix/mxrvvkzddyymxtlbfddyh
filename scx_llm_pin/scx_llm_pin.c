@@ -25,6 +25,7 @@
 #include "scx_llm_pin.skel.h"
 
 #define NSEC_PER_MSEC 1000000ULL
+#define NSEC_PER_USEC 1000ULL
 #ifndef BPF_F_SLEEPABLE
 #define BPF_F_SLEEPABLE (1U << 4)
 #endif
@@ -36,6 +37,30 @@
 #endif
 
 static volatile sig_atomic_t exiting = 0;
+
+struct gang_state_snapshot {
+	__u32 lock;
+	__u32 active_team_plus1;
+	__u32 cycle_slot;
+	__u32 phase_signature;
+	__u32 engaged;
+	__u32 padding;
+	__u64 quantum_deadline_ns;
+	__u64 generation;
+};
+
+struct gang_sample_stats {
+	__u64 interval_us;
+	__u64 samples;
+	__u64 engaged_samples;
+	__u64 full_gang_samples;
+	__u64 mixed_team_samples;
+	__u64 active_team_slots;
+	__u64 wrong_team_slots;
+	__u64 idle_slots;
+	__u64 unstable_samples;
+	__u64 read_errors;
+};
 
 static void on_signal(int sig)
 {
@@ -75,6 +100,62 @@ static int parse_control_mode(const char *str, __u32 *mode)
 	else
 		return -EINVAL;
 	return 0;
+}
+
+static const char *team_gang_mode_name(__u32 mode)
+{
+	switch (mode) {
+	case LLM_TEAM_GANG_OFF:
+		return "off";
+	case LLM_TEAM_GANG_OBSERVE:
+		return "observe";
+	case LLM_TEAM_GANG_ALWAYS:
+		return "always";
+	case LLM_TEAM_GANG_PREFILL_LEASE:
+		return "prefill-lease";
+	default:
+		return "unknown";
+	}
+}
+
+static int parse_team_gang_mode(const char *str, __u32 *mode)
+{
+	if (!strcmp(str, "off"))
+		*mode = LLM_TEAM_GANG_OFF;
+	else if (!strcmp(str, "observe"))
+		*mode = LLM_TEAM_GANG_OBSERVE;
+	else if (!strcmp(str, "always"))
+		*mode = LLM_TEAM_GANG_ALWAYS;
+	else if (!strcmp(str, "prefill-lease"))
+		*mode = LLM_TEAM_GANG_PREFILL_LEASE;
+	else
+		return -EINVAL;
+	return 0;
+}
+
+static const char *phase_name(__u32 phase)
+{
+	switch (phase) {
+	case RVV_LEASE_PHASE_IDLE:
+		return "idle";
+	case RVV_LEASE_PHASE_PREFILL:
+		return "prefill";
+	case RVV_LEASE_PHASE_DECODE:
+		return "decode";
+	case RVV_LEASE_PHASE_MIXED:
+		return "mixed";
+	default:
+		return "invalid";
+	}
+}
+
+static __u64 monotonic_ns(void)
+{
+	struct timespec ts = {};
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts))
+		return 0;
+	return (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
 }
 
 static __u64 new_control_session_id(void)
@@ -173,6 +254,8 @@ static int initialize_and_pin_control_maps(
 			page.header.hint_flags = RVV_LEASE_MODEL_ACTIVE;
 			page.header.session_id = config->user_session_id;
 			page.header.policy_epoch = config->user_policy_epoch;
+			page.team_hint.phase = RVV_LEASE_PHASE_IDLE;
+			page.team_hint.session_id = config->user_session_id;
 		}
 		err = bpf_map__update_elem(skel->maps.user_worker_map, &key,
 					   sizeof(key), &page, sizeof(page), BPF_ANY);
@@ -230,6 +313,14 @@ static void print_worker_page(struct scx_llm_pin_bpf *skel)
 		       (unsigned long long)page.header.session_id,
 		       (unsigned long long)page.header.policy_epoch,
 		       page.header.abi_version);
+		printf("team_hint team=%u phase=%s phase_epoch=%llu workers=%u prompt=%u decode=%u begin_ns=%llu expires_ns=%llu seq=%u\n",
+		       key, phase_name(page.team_hint.phase),
+		       (unsigned long long)page.team_hint.phase_epoch,
+		       page.team_hint.active_workers, page.team_hint.prompt_tokens,
+		       page.team_hint.decode_tokens,
+		       (unsigned long long)page.team_hint.begin_ns,
+		       (unsigned long long)page.team_hint.expires_ns,
+		       page.team_hint.sequence);
 		for (__u32 ith = 0; ith < RVV_LEASE_CONTROL_WORKERS; ith++) {
 			const struct rvv_lease_worker_slot *slot = &page.workers[ith];
 
@@ -471,7 +562,195 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	       stats.user_preference_dsq_consumes);
 	printf("User preference empty fallbacks:    %llu\n",
 	       stats.user_preference_empty_fallbacks);
+	printf("User hint primary workers/misses:    %llu/%llu\n",
+	       stats.user_hint_primary_workers, stats.user_hint_member_misses);
+	printf("User hint deferred/excluded/demoted: %llu/%llu/%llu\n",
+	       stats.user_hint_deferred_tasks, stats.user_hint_excluded_tasks,
+	       stats.user_hint_demotions);
+	printf("Phase hint reads valid/invalid:      %llu/%llu/%llu\n",
+	       stats.phase_hint_reads, stats.phase_hint_valid, stats.phase_hint_invalid);
+	printf("Phase hint idle/prefill/decode/mixed: %llu/%llu/%llu/%llu\n",
+	       stats.phase_hint_idle, stats.phase_hint_prefill,
+	       stats.phase_hint_decode, stats.phase_hint_mixed);
+	printf("Gang engagements/quanta/switches:    %llu/%llu/%llu\n",
+	       stats.gang_engagements, stats.gang_quanta, stats.gang_team_switches);
+	printf("Gang kicks/vector enqueues:          %llu/%llu\n",
+	       stats.gang_cpu_kicks, stats.gang_vector_enqueues);
+	printf("Gang consumes selected/empty/fallback: %llu/%llu/%llu\n",
+	       stats.gang_selected_consumes, stats.gang_empty_fallbacks,
+	       stats.gang_fallback_consumes);
+	printf("Gang runs total/active/wrong:        %llu/%llu/%llu\n",
+	       stats.gang_running_samples, stats.gang_active_team_runs,
+	       stats.gang_wrong_team_runs);
+	printf("Phase lease engagements/preferred/empty/fallback: %llu/%llu/%llu/%llu\n",
+	       stats.phase_lease_engagements,
+	       stats.phase_lease_preferred_consumes,
+	       stats.phase_lease_empty_fallbacks,
+	       stats.phase_lease_fallback_consumes);
+	printf("Phase lease safety forced/miss/stale: %llu/%llu/%llu\n",
+	       stats.phase_lease_safety_forced,
+	       stats.phase_lease_safety_misses,
+	       stats.phase_lease_pending_stale);
+	printf("Phase lease pending max/ge4s:          %lluns/%llu\n",
+	       stats.phase_lease_pending_max_ns,
+	       stats.phase_lease_pending_ge_4s);
+	printf("Phase lease runs total/preferred/other: %llu/%llu/%llu\n",
+	       stats.phase_lease_running_samples,
+	       stats.phase_lease_preferred_runs,
+	       stats.phase_lease_other_runs);
+	printf("Phase lease wakeup candidates/preempts:  %llu/%llu\n",
+	       stats.phase_lease_wakeup_candidates,
+	       stats.phase_lease_wakeup_preempts);
+	printf("SCX_GANG_STATS rvv_team0=%llu rvv_team1=%llu hint_valid_workers=%llu hint_active_workers=%llu hint_fallbacks=%llu hint_deferred=%llu hint_excluded=%llu hint_demotions=%llu phase_reads=%llu phase_valid=%llu phase_invalid=%llu phase_idle=%llu phase_prefill=%llu phase_decode=%llu phase_mixed=%llu gang_engagements=%llu gang_quanta=%llu gang_switches=%llu gang_kicks=%llu gang_enqueues=%llu gang_selected=%llu gang_empty=%llu gang_fallback=%llu gang_runs=%llu gang_active_runs=%llu gang_wrong_runs=%llu phase_lease_engagements=%llu phase_lease_preferred=%llu phase_lease_empty=%llu phase_lease_fallback=%llu phase_lease_safety_forced=%llu phase_lease_safety_misses=%llu phase_lease_pending_stale=%llu phase_lease_pending_max_ns=%llu phase_lease_pending_ge_4s=%llu phase_lease_runs=%llu phase_lease_preferred_runs=%llu phase_lease_other_runs=%llu phase_lease_wakeup_candidates=%llu phase_lease_wakeup_preempts=%llu dsq_dispatches=%llu dsq_consumes=%llu dsq_dispatches_team0=%llu dsq_dispatches_team1=%llu dsq_consumes_team0=%llu dsq_consumes_team1=%llu\n",
+	       stats.rvv_vector_threads_team0, stats.rvv_vector_threads_team1,
+	       stats.user_hint_valid_workers, stats.user_hint_active_workers,
+	       stats.user_hint_fallbacks, stats.user_hint_deferred_tasks,
+	       stats.user_hint_excluded_tasks, stats.user_hint_demotions,
+	       stats.phase_hint_reads,
+	       stats.phase_hint_valid, stats.phase_hint_invalid,
+	       stats.phase_hint_idle, stats.phase_hint_prefill,
+	       stats.phase_hint_decode, stats.phase_hint_mixed,
+	       stats.gang_engagements, stats.gang_quanta,
+	       stats.gang_team_switches, stats.gang_cpu_kicks,
+	       stats.gang_vector_enqueues, stats.gang_selected_consumes,
+	       stats.gang_empty_fallbacks, stats.gang_fallback_consumes,
+	       stats.gang_running_samples, stats.gang_active_team_runs,
+	       stats.gang_wrong_team_runs,
+	       stats.phase_lease_engagements,
+	       stats.phase_lease_preferred_consumes,
+	       stats.phase_lease_empty_fallbacks,
+	       stats.phase_lease_fallback_consumes,
+	       stats.phase_lease_safety_forced,
+	       stats.phase_lease_safety_misses,
+	       stats.phase_lease_pending_stale,
+	       stats.phase_lease_pending_max_ns,
+	       stats.phase_lease_pending_ge_4s,
+	       stats.phase_lease_running_samples,
+	       stats.phase_lease_preferred_runs,
+	       stats.phase_lease_other_runs,
+	       stats.phase_lease_wakeup_candidates,
+	       stats.phase_lease_wakeup_preempts,
+	       stats.rvv_vector_dsq_dispatches,
+	       stats.rvv_vector_dsq_consumes,
+	       stats.rvv_vector_dsq_dispatches_team0,
+	       stats.rvv_vector_dsq_dispatches_team1,
+	       stats.rvv_vector_dsq_consumes_team0,
+	       stats.rvv_vector_dsq_consumes_team1);
 	fflush(stdout);
+}
+
+static void sample_gang_placement(struct scx_llm_pin_bpf *skel,
+				  const struct llm_pin_config *config,
+				  struct gang_sample_stats *samples)
+{
+	struct gang_state_snapshot before = {};
+	struct gang_state_snapshot after = {};
+	__u32 key = 0;
+	__u32 expected_slots = 0;
+	__u32 active_slots = 0;
+	__u32 wrong_slots = 0;
+	__u32 idle_slots = 0;
+
+	samples->samples++;
+	if (bpf_map__lookup_elem(skel->maps.team_gang_state_map, &key,
+				 sizeof(key), &before, sizeof(before), 0)) {
+		samples->read_errors++;
+		return;
+	}
+	if (!before.engaged || !before.active_team_plus1 ||
+	    before.active_team_plus1 > RVV_LEASE_CONTROL_TEAMS)
+		return;
+
+	for (__u32 cpu = 0; cpu < RVV_LEASE_CONTROL_WORKERS; cpu++) {
+		__u32 running_team = 0;
+
+		if (!(config->llm_cpu_mask & (1U << cpu)))
+			continue;
+		expected_slots++;
+		key = cpu;
+		if (bpf_map__lookup_elem(skel->maps.running_team_by_cpu, &key,
+					 sizeof(key), &running_team,
+					 sizeof(running_team), 0)) {
+			samples->read_errors++;
+			return;
+		}
+		if (!running_team)
+			idle_slots++;
+		else if (running_team == before.active_team_plus1)
+			active_slots++;
+		else
+			wrong_slots++;
+	}
+
+	key = 0;
+	if (bpf_map__lookup_elem(skel->maps.team_gang_state_map, &key,
+				 sizeof(key), &after, sizeof(after), 0)) {
+		samples->read_errors++;
+		return;
+	}
+	if (before.generation != after.generation ||
+	    before.engaged != after.engaged ||
+	    before.active_team_plus1 != after.active_team_plus1) {
+		samples->unstable_samples++;
+		return;
+	}
+
+	samples->engaged_samples++;
+	samples->active_team_slots += active_slots;
+	samples->wrong_team_slots += wrong_slots;
+	samples->idle_slots += idle_slots;
+	if (wrong_slots)
+		samples->mixed_team_samples++;
+	if (expected_slots && active_slots == expected_slots)
+		samples->full_gang_samples++;
+}
+
+static void print_gang_samples(const struct gang_sample_stats *samples)
+{
+	printf("SCX_GANG_SAMPLES interval_us=%llu samples=%llu engaged=%llu full_gang=%llu mixed_team=%llu active_slots=%llu wrong_slots=%llu idle_slots=%llu unstable=%llu read_errors=%llu\n",
+	       samples->interval_us, samples->samples, samples->engaged_samples,
+	       samples->full_gang_samples, samples->mixed_team_samples,
+	       samples->active_team_slots, samples->wrong_team_slots,
+	       samples->idle_slots, samples->unstable_samples,
+	       samples->read_errors);
+	fflush(stdout);
+}
+
+static void run_main_loop(struct scx_llm_pin_bpf *skel,
+			  const struct llm_pin_config *config, int duration,
+			  __u64 gang_sample_us,
+			  struct gang_sample_stats *gang_samples)
+{
+	__u64 start_ns = monotonic_ns();
+	__u64 report_ns = start_ns + 10ULL * 1000000000ULL;
+	__u64 deadline_ns = duration > 0 ?
+		start_ns + (__u64)duration * 1000000000ULL : 0;
+	struct timespec delay = {};
+
+	if (!gang_sample_us) {
+		while (!exiting && (!deadline_ns || monotonic_ns() < deadline_ns)) {
+			sleep(duration > 0 ? 1 : 5);
+			if (monotonic_ns() >= report_ns) {
+				print_stats(skel);
+				print_worker_page(skel);
+				report_ns = monotonic_ns() + 10ULL * 1000000000ULL;
+			}
+		}
+		return;
+	}
+
+	delay.tv_sec = gang_sample_us / 1000000ULL;
+	delay.tv_nsec = (gang_sample_us % 1000000ULL) * NSEC_PER_USEC;
+	while (!exiting && (!deadline_ns || monotonic_ns() < deadline_ns)) {
+		sample_gang_placement(skel, config, gang_samples);
+		if (monotonic_ns() >= report_ns) {
+			print_stats(skel);
+			print_worker_page(skel);
+			print_gang_samples(gang_samples);
+			report_ns = monotonic_ns() + 10ULL * 1000000000ULL;
+		}
+		nanosleep(&delay, NULL);
+	}
 }
 
 static void print_vector_cpu_assignments(struct scx_llm_pin_bpf *skel)
@@ -510,6 +789,11 @@ enum {
 	OPT_CONTROL_DIR,
 	OPT_USER_CPU_MAP,
 	OPT_TGID2,
+	OPT_TEAM_GANG,
+	OPT_GANG_QUANTUM_US,
+	OPT_PHASE_HINT_TIMEOUT_MS,
+	OPT_PREFILL_STARVATION_MS,
+	OPT_GANG_SAMPLE_US,
 };
 
 static void usage(const char *prog)
@@ -535,6 +819,11 @@ static void usage(const char *prog)
 		"  --user-control <mode>  off|observe|active (default: off)\n"
 		"  --control-dir <path>   Pin config/worker maps under this bpffs directory\n"
 		"  --user-cpu-map <map>   auto or OpenMP ith0..7 CPU order (default: auto)\n"
+		"  --team-gang <mode>     off|observe|always|prefill-lease (default: off)\n"
+		"  --gang-quantum-us <us> Shared team gang quantum (default: 5000)\n"
+		"  --phase-hint-timeout-ms <ms> Reject stale phase hints (default: 300000)\n"
+		"  --prefill-starvation-ms <ms> V DSQ safety wait for prefill-lease (default: 1000)\n"
+		"  --gang-sample-us <us> Sample running teams for diagnostics (0=off, min=1000)\n"
 		"  --llm-only            Do not switch all tasks; move target threads to SCHED_EXT only\n"
 		"  --tid-list <list>     With --llm-only, move only comma-separated TIDs to SCHED_EXT\n"
 		"  --duration <sec>       Run duration in seconds (0 = infinite, default: 0)\n"
@@ -556,6 +845,8 @@ int main(int argc, char **argv)
 	char config_map_path[PATH_MAX] = {};
 	char worker_map_path[PATH_MAX] = {};
 	int duration = 0;
+	__u64 gang_sample_us = 0;
+	struct gang_sample_stats gang_samples = {};
 	int moved_threads = 0;
 	bool control_maps_pinned = false;
 	int err;
@@ -568,6 +859,10 @@ int main(int argc, char **argv)
 	config.ordinary_cpu_mask = 0xFF;
 	config.dirty_threshold = 2;
 	config.vector_local_window_ns = 500 * NSEC_PER_MSEC;
+	config.team_gang_mode = LLM_TEAM_GANG_OFF;
+	config.gang_quantum_ns = 5000 * NSEC_PER_USEC;
+	config.phase_hint_timeout_ns = 300000 * NSEC_PER_MSEC;
+	config.prefill_starvation_ns = 1000 * NSEC_PER_MSEC;
 	config.switch_all = 1;
 	for (__u32 ith = 0; ith < RVV_LEASE_CONTROL_WORKERS; ith++)
 		config.user_cpu_map[ith] = ith;
@@ -590,6 +885,11 @@ int main(int argc, char **argv)
 		{"user-control", required_argument, 0, OPT_USER_CONTROL},
 		{"control-dir", required_argument, 0, OPT_CONTROL_DIR},
 		{"user-cpu-map", required_argument, 0, OPT_USER_CPU_MAP},
+		{"team-gang", required_argument, 0, OPT_TEAM_GANG},
+		{"gang-quantum-us", required_argument, 0, OPT_GANG_QUANTUM_US},
+		{"phase-hint-timeout-ms", required_argument, 0, OPT_PHASE_HINT_TIMEOUT_MS},
+		{"prefill-starvation-ms", required_argument, 0, OPT_PREFILL_STARVATION_MS},
+		{"gang-sample-us", required_argument, 0, OPT_GANG_SAMPLE_US},
 		{"llm-only",    no_argument,       0, 'o'},
 		{"tid-list",    required_argument, 0, 'T'},
 		{"duration",    required_argument, 0, 'd'},
@@ -666,6 +966,24 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			break;
+		case OPT_TEAM_GANG:
+			if (parse_team_gang_mode(optarg, &config.team_gang_mode)) {
+				fprintf(stderr, "Error: invalid --team-gang '%s'\n", optarg);
+				return 1;
+			}
+			break;
+		case OPT_GANG_QUANTUM_US:
+			config.gang_quantum_ns = strtoull(optarg, NULL, 10) * NSEC_PER_USEC;
+			break;
+		case OPT_PHASE_HINT_TIMEOUT_MS:
+			config.phase_hint_timeout_ns = strtoull(optarg, NULL, 10) * NSEC_PER_MSEC;
+			break;
+		case OPT_PREFILL_STARVATION_MS:
+			config.prefill_starvation_ns = strtoull(optarg, NULL, 10) * NSEC_PER_MSEC;
+			break;
+		case OPT_GANG_SAMPLE_US:
+			gang_sample_us = strtoull(optarg, NULL, 10);
+			break;
 		case 'o':
 			config.switch_all = 0;
 			break;
@@ -710,6 +1028,41 @@ int main(int argc, char **argv)
 	    config.strategy != LLM_STRATEGY_RVV_DIRTY &&
 	    config.strategy != LLM_STRATEGY_RVV_DIRTY_LOCAL) {
 		fprintf(stderr, "Error: userspace control requires an rvv_dirty strategy\n");
+		return 1;
+	}
+	if (config.team_gang_mode != LLM_TEAM_GANG_OFF && !config.target_tgid2) {
+		fprintf(stderr, "Error: --team-gang requires --tgid2\n");
+		return 1;
+	}
+	if (config.team_gang_mode != LLM_TEAM_GANG_OFF &&
+	    config.user_control_mode == RVV_LEASE_CONTROL_OFF) {
+		fprintf(stderr, "Error: --team-gang requires userspace control\n");
+		return 1;
+	}
+	if ((config.team_gang_mode == LLM_TEAM_GANG_ALWAYS ||
+	     config.team_gang_mode == LLM_TEAM_GANG_PREFILL_LEASE) &&
+	    config.user_control_mode != RVV_LEASE_CONTROL_ACTIVE) {
+		fprintf(stderr, "Error: active phase modes require --user-control active\n");
+		return 1;
+	}
+	if (config.gang_quantum_ns < 500 * NSEC_PER_USEC ||
+	    config.gang_quantum_ns > 50000 * NSEC_PER_USEC) {
+		fprintf(stderr, "Error: --gang-quantum-us must be in 500..50000\n");
+		return 1;
+	}
+	if (config.prefill_starvation_ns < 100 * NSEC_PER_MSEC ||
+	    config.prefill_starvation_ns > 4000 * NSEC_PER_MSEC) {
+		fprintf(stderr, "Error: --prefill-starvation-ms must be in 100..4000\n");
+		return 1;
+	}
+	if (gang_sample_us && (gang_sample_us < 1000 || gang_sample_us > 1000000)) {
+		fprintf(stderr, "Error: --gang-sample-us must be 0 or in 1000..1000000\n");
+		return 1;
+	}
+	if (gang_sample_us &&
+	    (config.team_gang_mode == LLM_TEAM_GANG_OFF ||
+	     config.team_gang_mode == LLM_TEAM_GANG_PREFILL_LEASE)) {
+		fprintf(stderr, "Error: --gang-sample-us requires --team-gang observe|always\n");
 		return 1;
 	}
 	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF &&
@@ -758,6 +1111,15 @@ int main(int argc, char **argv)
 	printf("  Fallback every:  %u\n", config.fallback_every);
 	printf("  User control:    %s\n", control_mode_name(config.user_control_mode));
 	printf("  User preference: off\n");
+	printf("  Team gang:       %s\n", team_gang_mode_name(config.team_gang_mode));
+	printf("  Gang quantum:    %lluus\n",
+	       (unsigned long long)(config.gang_quantum_ns / NSEC_PER_USEC));
+	printf("  Phase timeout:   %llums\n",
+	       (unsigned long long)(config.phase_hint_timeout_ns / NSEC_PER_MSEC));
+	printf("  Prefill starvation guard: %llums\n",
+	       (unsigned long long)(config.prefill_starvation_ns / NSEC_PER_MSEC));
+	printf("  Gang sampler:    %lluus\n",
+	       (unsigned long long)gang_sample_us);
 	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF) {
 		printf("  Control dir:     %s\n", control_dir);
 		printf("  Control session: %llu\n",
@@ -857,25 +1219,12 @@ int main(int argc, char **argv)
 	printf("Press Ctrl-C to detach\n\n");
 	fflush(stdout);
 
-	// 运行主循环
-	if (duration > 0) {
-		for (int i = 0; i < duration && !exiting; i++) {
-			sleep(1);
-			if (i > 0 && i % 10 == 0) {
-				print_stats(skel);
-				print_worker_page(skel);
-			}
-		}
-	} else {
-		while (!exiting) {
-			sleep(5);
-			print_stats(skel);
-			print_worker_page(skel);
-		}
-	}
+	gang_samples.interval_us = gang_sample_us;
+	run_main_loop(skel, &config, duration, gang_sample_us, &gang_samples);
 
 	// 打印最终统计
 	print_stats(skel);
+	print_gang_samples(&gang_samples);
 	print_vector_cpu_assignments(skel);
 	print_worker_page(skel);
 

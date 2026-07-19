@@ -13,6 +13,13 @@ enum llm_sched_strategy {
 	LLM_STRATEGY_RVV_DIRTY_LOCAL = 5, // RVV Dirty + nonvector LLM 本地 DSQ
 };
 
+enum llm_team_gang_mode {
+	LLM_TEAM_GANG_OFF = 0,
+	LLM_TEAM_GANG_OBSERVE = 1,
+	LLM_TEAM_GANG_ALWAYS = 3,
+	LLM_TEAM_GANG_PREFILL_LEASE = 4,
+};
+
 #define RVV_SR_VS		0x00000600UL
 #define RVV_SR_VS_OFF		0x00000000UL
 #define RVV_SR_VS_INITIAL	0x00000200UL
@@ -45,6 +52,11 @@ struct llm_pin_config {
 	__u64 user_preferred_until_ns; // CLOCK_MONOTONIC 绝对过期时间
 	__u64 user_session_id;
 	__u64 user_policy_epoch;
+	__u32 team_gang_mode; // enum llm_team_gang_mode
+	__u32 reserved_policy32;
+	__u64 gang_quantum_ns;
+	__u64 phase_hint_timeout_ns;
+	__u64 prefill_starvation_ns; // Max runnable wait before one safety slice
 };
 
 // 统计信息
@@ -86,6 +98,43 @@ struct llm_pin_stats {
 	__u64 user_hint_fallbacks;
 	__u64 user_preference_dsq_consumes;
 	__u64 user_preference_empty_fallbacks;
+	__u64 user_hint_primary_workers;
+	__u64 user_hint_member_misses;
+	__u64 user_hint_deferred_tasks;
+	__u64 user_hint_excluded_tasks;
+	__u64 user_hint_demotions;
+	__u64 phase_hint_reads;
+	__u64 phase_hint_valid;
+	__u64 phase_hint_invalid;
+	__u64 phase_hint_idle;
+	__u64 phase_hint_prefill;
+	__u64 phase_hint_decode;
+	__u64 phase_hint_mixed;
+	__u64 gang_engagements;
+	__u64 gang_quanta;
+	__u64 gang_team_switches;
+	__u64 gang_cpu_kicks;
+	__u64 gang_vector_enqueues;
+	__u64 gang_selected_consumes;
+	__u64 gang_empty_fallbacks;
+	__u64 gang_fallback_consumes;
+	__u64 gang_running_samples;
+	__u64 gang_active_team_runs;
+	__u64 gang_wrong_team_runs;
+	__u64 phase_lease_engagements;
+	__u64 phase_lease_preferred_consumes;
+	__u64 phase_lease_empty_fallbacks;
+	__u64 phase_lease_fallback_consumes;
+	__u64 phase_lease_safety_forced;
+	__u64 phase_lease_safety_misses;
+	__u64 phase_lease_pending_stale;
+	__u64 phase_lease_pending_max_ns;
+	__u64 phase_lease_pending_ge_4s;
+	__u64 phase_lease_running_samples;
+	__u64 phase_lease_preferred_runs;
+	__u64 phase_lease_other_runs;
+	__u64 phase_lease_wakeup_candidates;
+	__u64 phase_lease_wakeup_preempts;
 };
 
 struct rvv_task_class {
@@ -95,7 +144,13 @@ struct rvv_task_class {
 	__u32 assigned_cpu_plus1;
 	__u32 user_ith_plus1;
 	__u32 user_cpu_forced;
+	__u32 user_hint_primary;
+	__u32 running;
+	__u32 user_hint_excluded;
+	__u32 reserved32;
 	__u64 user_session_id;
+	__u64 user_hint_retry_after_ns;
+	__u64 user_hint_first_seen_ns;
 };
 
 #endif /* __SCX_LLM_PIN_H */

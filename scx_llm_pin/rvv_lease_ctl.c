@@ -63,6 +63,38 @@ static const char *mode_name(__u32 mode)
 	}
 }
 
+static const char *gang_mode_name(__u32 mode)
+{
+	switch (mode) {
+	case LLM_TEAM_GANG_OFF:
+		return "off";
+	case LLM_TEAM_GANG_OBSERVE:
+		return "observe";
+	case LLM_TEAM_GANG_ALWAYS:
+		return "always";
+	case LLM_TEAM_GANG_PREFILL_LEASE:
+		return "prefill-lease";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *phase_name(__u32 phase)
+{
+	switch (phase) {
+	case RVV_LEASE_PHASE_IDLE:
+		return "idle";
+	case RVV_LEASE_PHASE_PREFILL:
+		return "prefill";
+	case RVV_LEASE_PHASE_DECODE:
+		return "decode";
+	case RVV_LEASE_PHASE_MIXED:
+		return "mixed";
+	default:
+		return "invalid";
+	}
+}
+
 static int parse_mode(const char *value, __u32 *mode)
 {
 	if (!strcmp(value, "observe"))
@@ -175,6 +207,13 @@ static void print_status(const struct llm_pin_config *config,
 	printf("vector_local_window_ms=%llu\n",
 	       (unsigned long long)(config->vector_local_window_ns / NSEC_PER_MSEC));
 	printf("dirty_threshold=%u\n", config->dirty_threshold);
+	printf("team_gang=%s\n", gang_mode_name(config->team_gang_mode));
+	printf("gang_quantum_us=%llu\n",
+	       (unsigned long long)(config->gang_quantum_ns / 1000ULL));
+	printf("phase_hint_timeout_ms=%llu\n",
+	       (unsigned long long)(config->phase_hint_timeout_ns / NSEC_PER_MSEC));
+	printf("prefill_starvation_ms=%llu\n",
+	       (unsigned long long)(config->prefill_starvation_ns / NSEC_PER_MSEC));
 	if (config->user_preferred_team_plus1 &&
 	    config->user_preferred_until_ns > now) {
 		__u64 remaining = config->user_preferred_until_ns - now;
@@ -202,6 +241,15 @@ static void print_status(const struct llm_pin_config *config,
 		printf("worker_page[%u]_active=%u\n", team, page->header.active);
 		if (!page->header.active)
 			continue;
+		printf("team_phase[%u]=phase:%s,workers:%u,prompt:%u,decode:%u,epoch:%llu,begin_ns:%llu,expires_ns:%llu,session:%llu,sequence:%u\n",
+		       team, phase_name(page->team_hint.phase),
+		       page->team_hint.active_workers, page->team_hint.prompt_tokens,
+		       page->team_hint.decode_tokens,
+		       (unsigned long long)page->team_hint.phase_epoch,
+		       (unsigned long long)page->team_hint.begin_ns,
+		       (unsigned long long)page->team_hint.expires_ns,
+		       (unsigned long long)page->team_hint.session_id,
+		       page->team_hint.sequence);
 		for (__u32 ith = 0; ith < RVV_LEASE_CONTROL_WORKERS; ith++) {
 			const struct rvv_lease_worker_slot *slot = &page->workers[ith];
 
