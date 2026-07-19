@@ -16,6 +16,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+from scheduler_stats import detect_profile, validate_scheduler_log
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 EXPERIMENTS_DIR = SCRIPT_DIR.parents[1]
@@ -175,6 +177,9 @@ class SuiteRunner:
         self.sampler_pid = None
         self.scheduler_pid = None
         self.trace_pids = {}
+        self.scheduler_validation_profile = detect_profile(
+            args.strategy, args.external_start_cmd, args.scheduler_validation
+        )
 
     def prepare(self):
         self.remote.run(f"mkdir -p {shlex.quote(self.remote_dir)}")
@@ -215,7 +220,7 @@ class SuiteRunner:
         config = vars(self.args).copy()
         config["suite_dir"] = str(self.suite_dir)
         (self.suite_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-        shutil.copy2(SCRIPT_DIR / "prompts.json", self.suite_dir / "prompts.json")
+        shutil.copy2(self.args.prompts_file, self.suite_dir / "prompts.json")
         system_info = self.remote.run(
             "uname -a; echo; nproc; echo; free -h; echo; "
             "cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor 2>/dev/null || true; "
@@ -235,12 +240,13 @@ class SuiteRunner:
     def start_server(self, model, run_tag):
         port, model_path, threads, affinity = self.server_spec(model)
         base = self.args.llm_path
+        runtime_bin = self.args.runtime_bin_dir or f"{base}/bin"
         loader = f"{base}/bin/ld-linux-riscv64-lp64d.so.1"
         argv = [
             loader,
             "--library-path",
-            f"{base}/bin",
-            f"{base}/bin/llama-server",
+            f"{runtime_bin}:{base}/bin" if runtime_bin != f"{base}/bin" else runtime_bin,
+            f"{runtime_bin}/llama-server",
             "-m",
             model_path,
             "--host",
@@ -475,7 +481,7 @@ class SuiteRunner:
             "--injected-model",
             injected,
             "--prompts",
-            str(SCRIPT_DIR / "prompts.json"),
+            str(self.args.prompts_file),
             "--events",
             str(run_dir / "events.jsonl"),
             "--output",
@@ -561,6 +567,7 @@ class SuiteRunner:
         (run_dir / "dmesg_before.log").write_text(dmesg_before)
         return_code = 1
         run_pids = {}
+        scheduler_alive = self.args.strategy != "external"
         try:
             order = ("A", "B") if direction == "ab" else ("B", "A")
             for model in order:
@@ -571,6 +578,13 @@ class SuiteRunner:
             self.start_sampler(run_tag)
             self.start_traces(run_tag)
             return_code = self.run_workload(run_dir, direction)
+            if self.args.strategy == "external" and self.scheduler_pid:
+                scheduler_alive = (
+                    self.remote.run(
+                        f"kill -0 {int(self.scheduler_pid)} 2>/dev/null", check=False
+                    ).returncode
+                    == 0
+                )
         except Exception as exc:
             (run_dir / "harness_error.txt").write_text(f"{type(exc).__name__}: {exc}\n")
             print(f"[ERROR] {run_tag}: {exc}")
@@ -589,6 +603,14 @@ class SuiteRunner:
         valid = False
         platform_validation = self.validate_platform(run_dir)
         trace_validation = self.validate_traces(run_dir, run_pids)
+        scheduler_validation = validate_scheduler_log(
+            run_dir / "scheduler.log", self.scheduler_validation_profile
+        )
+        scheduler_validation["alive_at_workload_end"] = scheduler_alive
+        if self.scheduler_validation_profile != "none":
+            scheduler_validation["valid"] = bool(
+                scheduler_validation["valid"] and scheduler_alive
+            )
         if return_code == 0 and workload_path.exists():
             workload = json.loads(workload_path.read_text())
             valid = (
@@ -596,12 +618,14 @@ class SuiteRunner:
                 and not KERNEL_FAILURE.search((run_dir / "dmesg_delta.log").read_text())
                 and platform_validation["valid"]
                 and trace_validation["valid"]
+                and scheduler_validation["valid"]
             )
         metadata["selected"] = valid
         metadata["return_code"] = return_code
         metadata["valid"] = valid
         metadata["platform_validation"] = platform_validation
         metadata["trace_validation"] = trace_validation
+        metadata["scheduler_validation"] = scheduler_validation
         (run_dir / "run.json").write_text(json.dumps(metadata, indent=2) + "\n")
         print(f"[INFO] completed {run_tag}: valid={valid}")
         return valid
@@ -662,6 +686,8 @@ def parse_args():
     parser.add_argument("--port-a", type=int, default=9090)
     parser.add_argument("--port-b", type=int, default=9091)
     parser.add_argument("--llm-path", default="/mnt/llm/llama")
+    parser.add_argument("--runtime-bin-dir", default="")
+    parser.add_argument("--prompts-file", default=str(SCRIPT_DIR / "prompts.json"))
     parser.add_argument("--model-a", default="/mnt/llm/llama/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf")
     parser.add_argument("--model-b", default="/mnt/llm/llama/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf")
     parser.add_argument("--context", type=int, default=4096)
@@ -679,6 +705,11 @@ def parse_args():
     parser.add_argument("--results-dir", default=str(SCRIPT_DIR / "results"))
     parser.add_argument("--external-start-cmd", default="")
     parser.add_argument("--external-stop-cmd", default="")
+    parser.add_argument(
+        "--scheduler-validation",
+        choices=("auto", "none", "lease", "gang-observe", "gang-active", "phase-lease"),
+        default="auto",
+    )
     parser.add_argument("--lease-hint-path", default="")
     parser.add_argument("--injection-hook", default="")
     parser.add_argument("--injection-hook-timeout", type=float, default=30.0)
@@ -697,6 +728,9 @@ def parse_args():
         parser.error("--injection-token must be between 1 and output-tokens - 1")
     if args.loops < 1 or args.max_attempts < 1:
         parser.error("loops and max-attempts must be positive")
+    args.prompts_file = str(Path(args.prompts_file).resolve())
+    if not Path(args.prompts_file).is_file():
+        parser.error(f"prompts file does not exist: {args.prompts_file}")
     if args.smoke:
         args.loops = 1
         args.output_tokens = 16

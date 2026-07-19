@@ -3,7 +3,7 @@
 import unittest
 from types import SimpleNamespace
 
-from workload import Workload
+from workload import Workload, validate_prompt_manifest
 
 
 class EventSink:
@@ -43,6 +43,15 @@ class InjectionHookTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["return_code"], 7)
+
+
+class PromptManifestTest(unittest.TestCase):
+    def test_short_smoke_manifest_is_valid(self):
+        validate_prompt_manifest([{"id": "short"}])
+
+    def test_duplicate_prompt_ids_are_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_prompt_manifest([{"id": "same"}, {"id": "same"}])
 
 
 if __name__ == "__main__":

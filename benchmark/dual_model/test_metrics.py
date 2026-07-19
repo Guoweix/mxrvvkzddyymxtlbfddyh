@@ -7,6 +7,7 @@ from pathlib import Path
 
 from metrics import add_sampler_metrics, calculate_run_metrics, jain_fairness, percentile
 from report import add_trace_metrics, rvv_summary
+from scheduler_stats import detect_profile, validate_scheduler_log
 
 
 def request(request_id, role, model, start, times):
@@ -27,6 +28,51 @@ def request(request_id, role, model, start, times):
 
 
 class MetricsTest(unittest.TestCase):
+    def test_scheduler_gang_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scheduler.log"
+            path.write_text(
+                "scx_llm_pin attached successfully\n"
+                "SCX_GANG_STATS rvv_team0=8 rvv_team1=8 hint_valid_workers=16 "
+                "phase_valid=40 phase_prefill=10 phase_decode=20 gang_engagements=3 "
+                "gang_quanta=8 gang_enqueues=12 gang_runs=100 gang_active_runs=95 "
+                "dsq_dispatches=20 dsq_consumes=20 dsq_dispatches_team0=9 "
+                "dsq_dispatches_team1=11 dsq_consumes_team0=9 dsq_consumes_team1=11\n"
+                "SCX_GANG_SAMPLES interval_us=1000 samples=1000 engaged=100 "
+                "full_gang=75 read_errors=0\n"
+            )
+            result = validate_scheduler_log(path, "gang-active")
+            self.assertTrue(result["valid"])
+            self.assertEqual(result["gang_run_match_percent"], 95.0)
+            self.assertEqual(result["sample_full_gang_percent"], 75.0)
+
+    def test_scheduler_profile_detection(self):
+        command = "/tmp/scx_llm_pin --team-gang always --user-control active"
+        self.assertEqual(detect_profile("external", command), "gang-active")
+        lease_command = "/tmp/scx_llm_pin --team-gang prefill-lease --user-control active"
+        self.assertEqual(detect_profile("external", lease_command), "phase-lease")
+        self.assertEqual(detect_profile("cfs-shared", ""), "none")
+
+    def test_scheduler_phase_lease_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scheduler.log"
+            path.write_text(
+                "scx_llm_pin attached successfully\n"
+                "SCX_GANG_STATS rvv_team0=8 rvv_team1=8 hint_valid_workers=16 "
+                "phase_valid=40 phase_prefill=10 phase_decode=20 "
+                "gang_quanta=0 gang_kicks=0 gang_enqueues=0 "
+                "phase_lease_engagements=8 phase_lease_preferred=20 "
+                "phase_lease_runs=100 phase_lease_preferred_runs=90 "
+                "phase_lease_pending_max_ns=1200000000 phase_lease_pending_ge_4s=0 "
+                "phase_lease_wakeup_candidates=30 phase_lease_wakeup_preempts=12 "
+                "dsq_dispatches=20 dsq_consumes=20 dsq_dispatches_team0=9 "
+                "dsq_dispatches_team1=11 dsq_consumes_team0=9 dsq_consumes_team1=11\n"
+            )
+            result = validate_scheduler_log(path, "phase-lease")
+            self.assertTrue(result["valid"])
+            self.assertEqual(result["phase_lease_run_match_percent"], 90.0)
+            self.assertTrue(result["checks"]["wakeup_preemption_active"])
+
     def test_percentile_uses_nearest_rank(self):
         self.assertEqual(percentile([1, 2, 3, 4], 0.95), 4)
         self.assertEqual(percentile([1, 2, 3, 4], 0.50), 2)

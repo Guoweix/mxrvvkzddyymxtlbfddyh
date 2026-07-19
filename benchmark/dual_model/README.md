@@ -48,6 +48,8 @@ stream=true
 
 默认测试仍使用完整四档 prompt。长 prompt 在 4 核对照上可能需要数分钟，因此里程碑超时默认保留 600 秒。
 
+`--prompts-file PATH` 可为功能 smoke 指定较小的 prompt 集；正式结果必须保留默认四档文件，suite 会把实际输入复制为 `prompts.json`。
+
 原双向长测仍可显式运行：
 
 ```bash
@@ -64,6 +66,12 @@ stream=true
 
 可选的停止命令会收到 `MODEL_A_PID`、`MODEL_B_PID` 和 `SCHEDULER_PID`。未提供时，harness 对启动命令返回的进程发送 `SIGTERM`。
 
+实验版 server 可以放在独立目录，不必覆盖默认安装。loader 仍来自 `--llm-path`，动态库优先搜索 staged 目录：
+
+```bash
+./run.sh --runtime-bin-dir /tmp/llama-phase ...
+```
+
 需要 llama.cpp 向 pinned worker map 注册两组 OpenMP worker 时，在两个 server 启动前传入同一路径；客户端会按自身 TGID 选择对应页：
 
 ```bash
@@ -72,6 +80,23 @@ stream=true
   --external-start-cmd '/tmp/scx_llm_pin --tgid "$MODEL_A_PID" --tgid2 "$MODEL_B_PID" \
     --strategy rvv_dirty --user-control active'
 ```
+
+保留 dirty lease slice/window，在自然 lease 边界偏向 prefill，并定向抢占同核的另一组 vector worker：
+
+```bash
+./run.sh --strategy external \
+  --runtime-bin-dir /tmp/llama-phase \
+  --lease-hint-path /sys/fs/bpf/scx_rvv_dirty_lease/workers \
+  --external-start-cmd '/tmp/scx_llm_pin/scx_llm_pin \
+    --tgid "$MODEL_A_PID" --tgid2 "$MODEL_B_PID" \
+    --strategy rvv_dirty --vector-slice-ms 100 \
+    --vector-local-window-ms 500 --user-control active \
+    --team-gang prefill-lease --prefill-starvation-ms 1000'
+```
+
+`--scheduler-validation auto` 会从 external 命令识别 lease、gang-observe、gang-active 或 phase-lease。每轮要求调度器在 workload 结束时仍存活，并检查 8+8 worker、phase 命中、对应策略实际生效和 team DSQ 收支；phase-lease 还要求定向 wakeup 抢占实际发生、gang quanta/kick 为零且没有 4s vector-DSQ pending。任一失败会使 attempt 无效。非 `scx_llm_pin` external 命令可用 `--scheduler-validation none`，也可显式选择 validation profile。
+
+定向 wakeup 抢占的三轮正式结果与历史 observe/prefill-lease 对照见 `docs/rvv_phase_lease_wakeup_preempt_20260719.md`。
 
 `--injection-hook` 会在 incumbent 四个请求都达到注入 token、injected 请求尚未发送时执行。hook 环境提供 `INCUMBENT_MODEL`、`INJECTED_MODEL`、`INCUMBENT_TEAM` 和 `INJECTED_TEAM`；非零退出或超时会使该 attempt 无效。
 
@@ -120,6 +145,7 @@ system_info.txt
 run*/events.jsonl
 run*/workload.json
 run*/sampler.jsonl
+run*/scheduler.log
 run*/run_metrics.json
 summary.csv
 summary.json

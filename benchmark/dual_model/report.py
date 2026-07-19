@@ -145,8 +145,19 @@ def analyze_run(run_dir):
     metadata_path = run_dir / "run.json"
     metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
     platform_validation = metadata.get("platform_validation") or {}
+    trace_validation = metadata.get("trace_validation") or {}
+    scheduler_validation = metadata.get("scheduler_validation") or {}
+    gang_stats = scheduler_validation.get("stats") or {}
+    gang_samples = scheduler_validation.get("samples") or {}
     metrics["platform_valid"] = platform_validation.get("valid", True)
-    metrics["valid"] = bool(metrics["valid"] and metrics["platform_valid"])
+    metrics["trace_valid"] = trace_validation.get("valid", True)
+    metrics["scheduler_control_valid"] = scheduler_validation.get("valid", True)
+    metrics["valid"] = bool(
+        metrics["valid"]
+        and metrics["platform_valid"]
+        and metrics["trace_valid"]
+        and metrics["scheduler_control_valid"]
+    )
     metrics.update(
         {
             "run_name": run_dir.name,
@@ -154,6 +165,30 @@ def analyze_run(run_dir):
             "direction": metadata.get("direction"),
             "attempt": metadata.get("attempt"),
             "selected": metadata.get("selected", True),
+            "phase_hint_prefill": gang_stats.get("phase_prefill"),
+            "phase_hint_decode": gang_stats.get("phase_decode"),
+            "gang_engagements": gang_stats.get("gang_engagements"),
+            "gang_quanta": gang_stats.get("gang_quanta"),
+            "gang_wrong_runs": gang_stats.get("gang_wrong_runs"),
+            "gang_run_match_percent": scheduler_validation.get("gang_run_match_percent"),
+            "gang_sample_engaged": gang_samples.get("engaged"),
+            "gang_sample_full_percent": scheduler_validation.get("sample_full_gang_percent"),
+            "phase_lease_engagements": gang_stats.get("phase_lease_engagements"),
+            "phase_lease_preferred_consumes": gang_stats.get("phase_lease_preferred"),
+            "phase_lease_empty_fallbacks": gang_stats.get("phase_lease_empty"),
+            "phase_lease_fallback_consumes": gang_stats.get("phase_lease_fallback"),
+            "phase_lease_safety_forced": gang_stats.get("phase_lease_safety_forced"),
+            "phase_lease_pending_max_ns": gang_stats.get("phase_lease_pending_max_ns"),
+            "phase_lease_pending_ge_4s": gang_stats.get("phase_lease_pending_ge_4s"),
+            "phase_lease_wakeup_candidates": gang_stats.get(
+                "phase_lease_wakeup_candidates"
+            ),
+            "phase_lease_wakeup_preempts": gang_stats.get(
+                "phase_lease_wakeup_preempts"
+            ),
+            "phase_lease_run_match_percent": scheduler_validation.get(
+                "phase_lease_run_match_percent"
+            ),
         }
     )
     (run_dir / "run_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
@@ -230,6 +265,14 @@ def generate_suite(suite_dir):
         "barrier_blocked_ms_per_token",
         "futex_wait_blocked_ops",
         "futex_wait_blocked_total_ns",
+        "gang_run_match_percent",
+        "gang_sample_full_percent",
+        "phase_lease_run_match_percent",
+        "phase_lease_safety_forced",
+        "phase_lease_pending_max_ns",
+        "phase_lease_pending_ge_4s",
+        "phase_lease_wakeup_candidates",
+        "phase_lease_wakeup_preempts",
     )
     statistics = {key: summary_stats(valid_runs, key) for key in keys}
     pooled_ttfts = [value for run in valid_runs for value in run["injected_ttft_samples_ms"]]
@@ -278,6 +321,24 @@ def generate_suite(suite_dir):
             "barrier_blocked_ms_per_token",
             "futex_wait_blocked_ops",
             "futex_wait_blocked_total_ns",
+            "phase_hint_prefill",
+            "phase_hint_decode",
+            "gang_engagements",
+            "gang_quanta",
+            "gang_wrong_runs",
+            "gang_run_match_percent",
+            "gang_sample_engaged",
+            "gang_sample_full_percent",
+            "phase_lease_engagements",
+            "phase_lease_preferred_consumes",
+            "phase_lease_empty_fallbacks",
+            "phase_lease_fallback_consumes",
+            "phase_lease_safety_forced",
+            "phase_lease_pending_max_ns",
+            "phase_lease_pending_ge_4s",
+            "phase_lease_wakeup_candidates",
+            "phase_lease_wakeup_preempts",
+            "phase_lease_run_match_percent",
         ]
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
@@ -333,6 +394,14 @@ def generate_suite(suite_dir):
         "barrier_blocked_ms_per_token": "Top-futex barrier blocked time/token (ms)",
         "futex_wait_blocked_ops": "All futex blocked waits",
         "futex_wait_blocked_total_ns": "All futex blocked worker-time (ns)",
+        "gang_run_match_percent": "Gang active-team run match (%)",
+        "gang_sample_full_percent": "Fully synchronized gang samples (%)",
+        "phase_lease_run_match_percent": "Phase-lease preferred-team run match (%)",
+        "phase_lease_safety_forced": "Phase-lease forced safety slices",
+        "phase_lease_pending_max_ns": "Phase-lease maximum V DSQ wait (ns)",
+        "phase_lease_pending_ge_4s": "Phase-lease V DSQ waits >=4s",
+        "phase_lease_wakeup_candidates": "Phase-lease preferred wakeup candidates",
+        "phase_lease_wakeup_preempts": "Phase-lease targeted wakeup preempts",
     }
     for key in keys:
         item = statistics[key]

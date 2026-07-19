@@ -331,8 +331,9 @@ class Workload:
 
         alive_threads = sum(thread.is_alive() for thread in threads)
         requests = sorted(self.results.values(), key=lambda item: item["send_ns"])
+        expected_requests = 2 * len(self.prompts)
         exact_milestone_ns = None
-        if milestone_ok and len(requests) == 8:
+        if milestone_ok and len(requests) == expected_requests:
             exact_milestone_ns = max(
                 result["token_times_ns"][self.args.injection_token - 1]
                 for result in requests
@@ -342,7 +343,7 @@ class Workload:
         complete = (
             milestone_ok
             and alive_threads == 0
-            and len(requests) == 8
+            and len(requests) == expected_requests
             and all(
                 result["completed"]
                 and not result["error"]
@@ -361,7 +362,12 @@ class Workload:
         )
 
         by_key = {(result["role"], result["prompt_id"]): result for result in requests}
-        within_run_deterministic = len(requests) == 8 and all(
+        expected_keys = {
+            (role, prompt["id"])
+            for role in ("incumbent", "injected")
+            for prompt in self.prompts
+        }
+        within_run_deterministic = set(by_key) == expected_keys and all(
             by_key[("incumbent", prompt["id"])]["token_hash"]
             == by_key[("injected", prompt["id"])]["token_hash"]
             for prompt in self.prompts
@@ -396,6 +402,16 @@ class Workload:
         return valid
 
 
+def validate_prompt_manifest(prompts):
+    if not isinstance(prompts, list) or not 1 <= len(prompts) <= 4:
+        raise ValueError("the prompt manifest must contain between one and four prompts")
+    prompt_ids = [prompt.get("id") for prompt in prompts if isinstance(prompt, dict)]
+    if len(prompt_ids) != len(prompts) or any(not prompt_id for prompt_id in prompt_ids):
+        raise ValueError("every prompt must have a unique non-empty id")
+    if len(set(prompt_ids)) != len(prompt_ids):
+        raise ValueError("every prompt must have a unique non-empty id")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--incumbent-url", required=True)
@@ -422,8 +438,10 @@ def main():
         parser.error("incumbent and injected model labels must differ")
 
     prompts = json.loads(Path(args.prompts).read_text())
-    if len(prompts) != 4:
-        parser.error("the prompt manifest must contain exactly four prompts")
+    try:
+        validate_prompt_manifest(prompts)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     model_urls = {
         args.incumbent_model: args.incumbent_url,
