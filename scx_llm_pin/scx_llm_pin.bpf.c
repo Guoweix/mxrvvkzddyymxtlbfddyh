@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * scx_llm_pin - CPU affinity pinning scheduler for LLM inference workloads
- *
- * 将 llama-server 工作线程固定到指定 CPU 核心，避免跨核迁移和频繁上下文切换。
+ * scx_llm_pin - RVV-aware sched_ext scheduler for LLM inference workloads.
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -157,14 +155,6 @@ struct {
 	__type(key, __u32);
 	__type(value, __u32);
 } running_team_by_cpu SEC(".maps");
-
-// Per-CPU 调度计数器（用于轮询选择）
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, u32);
-	__type(value, __u64);
-} cpu_select_counter SEC(".maps");
 
 static __always_inline __u32 task_tgid(struct task_struct *p)
 {
@@ -363,9 +353,7 @@ static __always_inline int apply_user_worker_hint(
 		if (!cfg->user_cpu_map_enabled)                                    \
 			return 1;                                                     \
 		cpu = cfg->user_cpu_map[(index)];                                  \
-		allowed_mask = cfg->vector_cpu_mask | cfg->ordinary_cpu_mask;      \
-		if (!allowed_mask)                                                 \
-			allowed_mask = cfg->llm_cpu_mask;                            \
+		allowed_mask = LLM_CPU_MASK;                                      \
 		if (!cpu_in_mask((s32)cpu, allowed_mask)) {                        \
 			if (stats)                                                     \
 				__sync_fetch_and_add(&stats->user_hint_invalid_workers, 1); \
@@ -897,13 +885,10 @@ static __always_inline bool resolve_gang_team(
 	return true;
 }
 
-static __always_inline void kick_all_gang_cpus(
-	const struct llm_pin_config *cfg, struct llm_pin_stats *stats)
+static __always_inline void kick_all_gang_cpus(struct llm_pin_stats *stats)
 {
 	#pragma unroll
 	for (__u32 cpu = 0; cpu < 8; cpu++) {
-		if (!(cfg->llm_cpu_mask & (1U << cpu)))
-			continue;
 		scx_bpf_kick_cpu((s32)cpu, SCX_KICK_PREEMPT);
 		if (stats)
 			__sync_fetch_and_add(&stats->gang_cpu_kicks, 1);
@@ -989,11 +974,8 @@ static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
 {
 	struct rvv_task_class *state;
 	__u32 tid = task_pid(p);
-	__u32 allowed_mask = cfg->vector_cpu_mask | cfg->ordinary_cpu_mask;
+	__u32 allowed_mask = LLM_CPU_MASK;
 	s32 assigned_cpu;
-
-	if (!allowed_mask)
-		allowed_mask = cfg->llm_cpu_mask;
 
 	state = get_rvv_task_class(tid);
 	if (!state)
@@ -1057,20 +1039,9 @@ static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
 	return select_cpu_from_mask(allowed_mask, prev_cpu);
 }
 
-static __always_inline __u32 vector_unique_target(const struct llm_pin_config *cfg)
+static __always_inline __u32 vector_unique_target(void)
 {
-	__u32 allowed_mask = (cfg->vector_cpu_mask | cfg->ordinary_cpu_mask) & 0xff;
-	__u32 count = 0;
-
-	if (!allowed_mask)
-		allowed_mask = cfg->llm_cpu_mask & 0xff;
-
-	#pragma unroll
-	for (__u32 cpu = 0; cpu < 8; cpu++) {
-		if (allowed_mask & (1U << cpu))
-			count++;
-	}
-	return count;
+	return 8;
 }
 
 static __always_inline __u64 vector_threads_for_team(
@@ -1087,11 +1058,6 @@ static __always_inline s32 select_rvv_vector_cpu(struct task_struct *p,
 						  struct llm_pin_stats *stats,
 						  s32 prev_cpu, __u32 team)
 {
-	__u32 aggressive_mask = cfg->vector_cpu_mask ? cfg->vector_cpu_mask : cfg->llm_cpu_mask;
-	__u32 ordinary_mask = cfg->ordinary_cpu_mask;
-	__u32 selected_mask = aggressive_mask;
-	__u32 key = 0;
-	__u64 *counter;
 	s32 cpu;
 
 	if (cfg->vector_local_window_ns) {
@@ -1102,22 +1068,11 @@ static __always_inline s32 select_rvv_vector_cpu(struct task_struct *p,
 		return cpu;
 	}
 
-	if (cpu_in_mask(prev_cpu, aggressive_mask) || cpu_in_mask(prev_cpu, ordinary_mask)) {
+	if (cpu_in_mask(prev_cpu, LLM_CPU_MASK)) {
 		remember_selected_cpu(p, prev_cpu);
 		return prev_cpu;
 	}
-
-	if (cfg->fallback_every && ordinary_mask) {
-		counter = bpf_map_lookup_elem(&cpu_select_counter, &key);
-		if (counter) {
-			__u64 next = *counter + 1;
-			*counter = next;
-			if ((next % cfg->fallback_every) == 0)
-				selected_mask = ordinary_mask;
-		}
-	}
-
-	cpu = select_cpu_from_mask(selected_mask, prev_cpu);
+	cpu = select_cpu_from_mask(LLM_CPU_MASK, prev_cpu);
 	remember_selected_cpu(p, cpu);
 
 	if (stats && cpu != prev_cpu)
@@ -1146,10 +1101,10 @@ s32 BPF_PROG(scx_llm_pin_select_cpu, struct task_struct *p, s32 prev_cpu,
 	team = llm_team_id(p, cfg);
 
 	if (team >= 0) {
-		s32 cpu;
-
 		if (is_rvv_dirty_strategy(cfg->strategy) &&
 		    classify_rvv_vector_task(p, cfg, stats, (__u32)team)) {
+			s32 cpu;
+
 			cpu = select_rvv_vector_cpu(p, cfg, stats, prev_cpu,
 						    (__u32)team);
 			if (stats) {
@@ -1159,27 +1114,13 @@ s32 BPF_PROG(scx_llm_pin_select_cpu, struct task_struct *p, s32 prev_cpu,
 			return cpu;
 		}
 
-		// LLM任务 -> 固定到 llm_cpu_mask
-		cpu = select_cpu_from_mask(cfg->llm_cpu_mask, prev_cpu);
-		remember_selected_cpu(p, cpu);
-		if (stats) {
+		if (stats)
 			__sync_fetch_and_add(&stats->llm_scheduled, 1);
-			__sync_fetch_and_add(&stats->llm_pinned, 1);
-			if (cpu != prev_cpu)
-				__sync_fetch_and_add(&stats->cpu_migrations, 1);
-		}
-		return cpu;
+		return prev_cpu;
 	} else {
-		s32 cpu;
-
-		// 系统任务 -> 固定到 system_cpu_mask
-		cpu = select_cpu_from_mask(cfg->system_cpu_mask, prev_cpu);
-		if (stats) {
+		if (stats)
 			__sync_fetch_and_add(&stats->system_scheduled, 1);
-			if (cpu != prev_cpu)
-				__sync_fetch_and_add(&stats->cpu_migrations, 1);
-		}
-		return cpu;
+		return prev_cpu;
 	}
 }
 
@@ -1227,7 +1168,7 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 
 			if (cfg->vector_local_window_ns && stats &&
 			    vector_threads_for_team(stats, (__u32)team) <
-				    vector_unique_target(cfg)) {
+				    vector_unique_target()) {
 				cpu_key = team_cpu_key((__u32)team, selected_cpu);
 				local_until = bpf_map_lookup_elem(
 					&vector_local_until_ns, &cpu_key);
@@ -1246,29 +1187,15 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 				gang_engaged = resolve_gang_team(
 					cfg, stats, now, &gang_team, &gang_kick);
 			if (gang_kick)
-				kick_all_gang_cpus(cfg, stats);
+				kick_all_gang_cpus(stats);
 			if (gang_engaged) {
 				slice = cfg->gang_quantum_ns;
 				if (stats)
 					__sync_fetch_and_add(&stats->gang_vector_enqueues, 1);
 			}
 
-			if (!cpu_in_mask(selected_cpu, cfg->vector_cpu_mask) &&
-			    cpu_in_mask(selected_cpu, cfg->ordinary_cpu_mask)) {
-				if (cfg->ordinary_vector_slice_ns)
-					slice = cfg->ordinary_vector_slice_ns;
-				else if (cfg->llm_slice_ns)
-					slice = cfg->llm_slice_ns;
-				if (stats)
-					__sync_fetch_and_add(&stats->rvv_fallback_dispatches, 1);
-			} else {
-				if (cfg->vector_slice_ns)
-					slice = cfg->vector_slice_ns;
-				else if (cfg->llm_slice_ns)
-					slice = cfg->llm_slice_ns;
-				if (stats)
-					__sync_fetch_and_add(&stats->rvv_aggressive_dispatches, 1);
-			}
+			if (cfg->vector_slice_ns)
+				slice = cfg->vector_slice_ns;
 
 			if (stats) {
 				__sync_fetch_and_add(&stats->rvv_vector_dispatches, 1);
@@ -1314,17 +1241,10 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 			return;
 		}
 
-		if (cfg->llm_slice_ns)
-			slice = cfg->llm_slice_ns;
-
 		if (is_rvv_dirty_strategy(cfg->strategy) && stats)
 			__sync_fetch_and_add(&stats->rvv_nonvector_llm_dispatches, 1);
 
-		if (cfg->strategy == LLM_STRATEGY_LONG_SLICE && stats)
-			__sync_fetch_and_add(&stats->llm_long_slices, 1);
-
-		if (cfg->strategy == LLM_STRATEGY_LOCAL_DSQ ||
-		    is_rvv_dirty_local_strategy(cfg->strategy)) {
+		if (is_rvv_dirty_local_strategy(cfg->strategy)) {
 			if (stats)
 				__sync_fetch_and_add(&stats->llm_local_dispatches, 1);
 			scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice, enq_flags);
@@ -1334,8 +1254,6 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 			scx_bpf_dispatch(p, SCX_DSQ_GLOBAL, slice, enq_flags);
 		}
 	} else {
-		if (cfg->system_slice_ns)
-			slice = cfg->system_slice_ns;
 		if (stats)
 			__sync_fetch_and_add(&stats->system_dispatches, 1);
 		scx_bpf_dispatch(p, SCX_DSQ_GLOBAL, slice, enq_flags);
@@ -1464,7 +1382,7 @@ void BPF_PROG(scx_llm_pin_dispatch, s32 cpu, struct task_struct *prev)
 	     cfg->team_gang_mode == LLM_TEAM_GANG_ALWAYS) &&
 	    resolve_gang_team(cfg, stats, now, &gang_team, &gang_kick)) {
 		if (gang_kick)
-			kick_all_gang_cpus(cfg, stats);
+			kick_all_gang_cpus(stats);
 		if (consume_vector_team(cpu, gang_team, cfg, stats, false)) {
 			if (stats)
 				__sync_fetch_and_add(&stats->gang_selected_consumes, 1);
@@ -1598,13 +1516,9 @@ void BPF_PROG(scx_llm_pin_stopping, struct task_struct *p, bool runnable)
 SEC("struct_ops/scx_llm_pin_init")
 s32 BPF_PROG(scx_llm_pin_init)
 {
-	struct llm_pin_config *cfg;
-	u32 key = 0;
 	s32 ret;
 
-	cfg = bpf_map_lookup_elem(&config_map, &key);
-	if (!cfg || cfg->switch_all)
-		scx_bpf_switch_all();
+	scx_bpf_switch_all();
 
 	#pragma unroll
 	for (u32 team = 0; team < RVV_LEASE_CONTROL_TEAMS; team++) {

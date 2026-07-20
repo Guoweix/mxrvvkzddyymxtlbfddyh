@@ -26,37 +26,15 @@ export RESTART_LLM="${RESTART_LLM:-1}"
 # sched_ext / eBPF策略配置
 # ========================================
 # BENCHMARK_STRATEGY 可选：
-#   cfs, scx_global, pin_all, pin_0_3_iso_4_7, pin_4_7_iso_0_3,
-#   long_slice, local_dsq, local_dsq_50ms, local_dsq_100ms,
-#   long_slice_isolated, llm_only_pin, llm_only_local_dsq,
-#   llm_only_local_dsq_50ms, llm_workers_pin, llm_workers_local_dsq,
-#   rvv_dirty_all, rvv_dirty_bind_all, rvv_dirty_lease_all, rvv_dirty_lease_unique_all,
+#   cfs, linux_affinity, scx_global,
+#   rvv_dirty_all, rvv_dirty_lease_all, rvv_dirty_lease_unique_all,
 #   rvv_dirty_lease_user_observe, rvv_dirty_lease_user_active,
-#   rvv_dirty_local_all, rvv_dirty_6_2,
-#   linux_affinity
+#   rvv_dirty_local_all
 export BENCHMARK_STRATEGY="${BENCHMARK_STRATEGY:-cfs}"
 export SCX_AUTO_DEPLOY="${SCX_AUTO_DEPLOY:-1}"
 export SCX_LOCAL_BIN="${SCX_LOCAL_BIN:-../scx_llm_pin/scx_llm_pin}"
 export SCX_LEASE_CTL_LOCAL_BIN="${SCX_LEASE_CTL_LOCAL_BIN:-../scx_llm_pin/rvv_lease_ctl}"
 export SCX_REMOTE_DIR="${SCX_REMOTE_DIR:-/tmp/scx_llm_pin}"
-export SCX_REMOTE_LOG="${SCX_REMOTE_LOG:-/tmp/scx_llm_pin.log}"
-export SCX_LOADER_STRATEGY="${SCX_LOADER_STRATEGY:-pin}"
-export SCX_LLM_CPUS="${SCX_LLM_CPUS:-0-7}"
-export SCX_SYSTEM_CPUS="${SCX_SYSTEM_CPUS:-0-7}"
-export SCX_SLICE_MS="${SCX_SLICE_MS:-0}"
-export SCX_SYSTEM_SLICE_MS="${SCX_SYSTEM_SLICE_MS:-0}"
-export SCX_SWITCH_ALL="${SCX_SWITCH_ALL:-1}"
-export SCX_WORKER_ONLY="${SCX_WORKER_ONLY:-0}"
-export SCX_PARALLEL_WARMUP="${SCX_PARALLEL_WARMUP:-1}"
-export SCX_WARMUP_TOKENS="${SCX_WARMUP_TOKENS:-1}"
-export SCX_VECTOR_CPUS="${SCX_VECTOR_CPUS:-0-7}"
-export SCX_ORDINARY_CPUS="${SCX_ORDINARY_CPUS:-0-7}"
-export SCX_VECTOR_SLICE_MS="${SCX_VECTOR_SLICE_MS:-0}"
-export SCX_ORDINARY_VECTOR_SLICE_MS="${SCX_ORDINARY_VECTOR_SLICE_MS:-0}"
-export SCX_VECTOR_LOCAL_WINDOW_MS="${SCX_VECTOR_LOCAL_WINDOW_MS:-500}"
-export SCX_DIRTY_THRESHOLD="${SCX_DIRTY_THRESHOLD:-2}"
-export SCX_FALLBACK_EVERY="${SCX_FALLBACK_EVERY:-0}"
-export SCX_LEASE_CONTROL_MODE="${SCX_LEASE_CONTROL_MODE:-off}"
 export SCX_LEASE_CONTROL_DIR="${SCX_LEASE_CONTROL_DIR:-/sys/fs/bpf/scx_rvv_dirty_lease}"
 export SCX_LEASE_USER_CPU_MAP="${SCX_LEASE_USER_CPU_MAP:-auto}"
 export SCX_LEASE_HINT_LOCAL_LIB="${SCX_LEASE_HINT_LOCAL_LIB:-../../kbuild/llama.cpp/build-riscv-hint/bin/libggml-cpu.so.0.13.0}"
@@ -122,7 +100,7 @@ else
     export PRE_BENCH_WARMUP_REQUESTS
     export PRE_BENCH_WARMUP_REQUESTS_AUTO=0
 fi
-export PRE_BENCH_WARMUP_TOKENS="${PRE_BENCH_WARMUP_TOKENS:-${SCX_WARMUP_TOKENS:-1}}"
+export PRE_BENCH_WARMUP_TOKENS="${PRE_BENCH_WARMUP_TOKENS:-1}"
 export PRE_BENCH_WARMUP_RETRIES="${PRE_BENCH_WARMUP_RETRIES:-3}"
 export PRE_BENCH_WARMUP_TIMEOUT="${PRE_BENCH_WARMUP_TIMEOUT:-120}"
 export PRE_BENCH_WARMUP_STRICT="${PRE_BENCH_WARMUP_STRICT:-1}"

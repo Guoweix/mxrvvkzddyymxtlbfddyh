@@ -147,27 +147,12 @@ cd /home/gwx/Workdir/riscv-rvv/experiments/benchmark
 | `cfs` | Linux CFS baseline，不加载 sched_ext |
 | `linux_affinity` | CFS 下使用 task affinity 固定高 runtime worker |
 | `scx_global` | sched_ext global DSQ |
-| `pin_all` | LLM 任务保持 CPU 亲和性 |
-| `pin_0_3_iso_4_7` | LLM 使用 CPU0-3，系统任务使用 CPU4-7 |
-| `pin_4_7_iso_0_3` | LLM 使用 CPU4-7，系统任务使用 CPU0-3 |
-| `long_slice` | 全 CPU，长时间片 |
-| `local_dsq` | 优先使用当前 CPU 的 local DSQ |
-| `local_dsq_50ms` | local DSQ + 50 ms slice |
-| `local_dsq_100ms` | local DSQ + 100 ms slice |
-| `long_slice_isolated` | LLM CPU0-3 + 长时间片，系统任务 CPU4-7 |
-| `llm_only_pin` | 仅 llama-server 线程进入 sched_ext 并 pin |
-| `llm_only_local_dsq` | 仅 llama-server 线程使用 local DSQ |
-| `llm_only_local_dsq_50ms` | 仅 llama-server 线程使用 local DSQ + 50 ms slice |
-| `llm_workers_pin` | 仅高 runtime worker 进入 sched_ext 并 pin |
-| `llm_workers_local_dsq` | 仅高 runtime worker 使用 local DSQ |
 | `rvv_dirty_all` | 全核心 RVV dirty 识别和 vector DSQ |
-| `rvv_dirty_bind_all` | RVV dirty worker 唯一 CPU 分配和 local DSQ |
 | `rvv_dirty_lease_all` | RVV dirty worker 唯一 CPU + lease 窗口 |
 | `rvv_dirty_lease_unique_all` | `rvv_dirty_lease_all` 兼容别名 |
 | `rvv_dirty_lease_user_observe` | dirty lease + 用户 worker 注册，仅观测 |
 | `rvv_dirty_lease_user_active` | dirty lease + 用户 worker/CPU 控制 |
 | `rvv_dirty_local_all` | RVV dirty vector 长 slice + 辅助线程 local DSQ |
-| `rvv_dirty_6_2` | CPU0-5 激进计算核心，CPU6-7 普通/回退核心 |
 
 ## 测试场景与策略适用性
 

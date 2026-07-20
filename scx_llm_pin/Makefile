@@ -11,7 +11,7 @@ CROSS_CC ?= $(CROSS_COMPILE)gcc
 CROSS_STRIP ?= $(CROSS_COMPILE)strip
 BPFTOOL ?= $(KERNEL_SRC)/tools/bpf/bpftool/bpftool
 
-BOARD_IP ?= 192.168.3.63
+BOARD_IP ?= 192.168.3.67
 BOARD_USER ?= root
 BOARD_PASS ?= bianbu
 BOARD ?= $(BOARD_USER)@$(BOARD_IP)

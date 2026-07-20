@@ -135,199 +135,38 @@ is_user_controlled_lease_scheduler() {
 
 apply_strategy_preset() {
     SCX_ENABLED=1
-    SCX_WORKER_ONLY="0"
+    SCX_LOADER_STRATEGY="global"
+    SCX_VECTOR_SLICE_MS="0"
+    SCX_VECTOR_LOCAL_WINDOW_MS="0"
+    SCX_DIRTY_THRESHOLD="2"
+    SCX_LEASE_CONTROL_MODE="off"
 
     case "$BENCHMARK_STRATEGY" in
         cfs|baseline)
             BENCHMARK_STRATEGY="cfs"
             SCX_ENABLED=0
-            SCX_SWITCH_ALL="1"
             ;;
         linux_affinity|affinity)
             BENCHMARK_STRATEGY="linux_affinity"
             SCX_ENABLED=0
-            SCX_SWITCH_ALL="1"
             ;;
         scx_global)
             SCX_LOADER_STRATEGY="global"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="1"
-            ;;
-        pin_all)
-            SCX_LOADER_STRATEGY="pin"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="1"
-            ;;
-        pin_0_3_iso_4_7)
-            SCX_LOADER_STRATEGY="pin"
-            SCX_LLM_CPUS="0-3"
-            SCX_SYSTEM_CPUS="4-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="1"
-            ;;
-        pin_4_7_iso_0_3)
-            SCX_LOADER_STRATEGY="pin"
-            SCX_LLM_CPUS="4-7"
-            SCX_SYSTEM_CPUS="0-3"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="1"
-            ;;
-        long_slice)
-            SCX_LOADER_STRATEGY="long_slice"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="100"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="1"
-            ;;
-        local_dsq)
-            SCX_LOADER_STRATEGY="local_dsq"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="1"
-            ;;
-        local_dsq_50ms)
-            SCX_LOADER_STRATEGY="local_dsq"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="50"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="1"
-            ;;
-        local_dsq_100ms)
-            SCX_LOADER_STRATEGY="local_dsq"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="100"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="1"
-            ;;
-        long_slice_isolated)
-            SCX_LOADER_STRATEGY="long_slice"
-            SCX_LLM_CPUS="0-3"
-            SCX_SYSTEM_CPUS="4-7"
-            SCX_SLICE_MS="100"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="1"
-            ;;
-        llm_only_pin)
-            SCX_LOADER_STRATEGY="pin"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="0"
-            SCX_WORKER_ONLY="0"
-            ;;
-        llm_only_local_dsq)
-            SCX_LOADER_STRATEGY="local_dsq"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="0"
-            SCX_WORKER_ONLY="0"
-            ;;
-        llm_only_local_dsq_50ms)
-            SCX_LOADER_STRATEGY="local_dsq"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="50"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="0"
-            SCX_WORKER_ONLY="0"
-            ;;
-        llm_workers_pin)
-            SCX_LOADER_STRATEGY="pin"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="0"
-            SCX_WORKER_ONLY="1"
-            ;;
-        llm_workers_local_dsq)
-            SCX_LOADER_STRATEGY="local_dsq"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_SWITCH_ALL="0"
-            SCX_WORKER_ONLY="1"
             ;;
         rvv_dirty_all)
             SCX_LOADER_STRATEGY="rvv_dirty"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_VECTOR_CPUS="0-7"
-            SCX_ORDINARY_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
             SCX_VECTOR_SLICE_MS="100"
-            SCX_ORDINARY_VECTOR_SLICE_MS="50"
             SCX_VECTOR_LOCAL_WINDOW_MS="0"
-            SCX_DIRTY_THRESHOLD="2"
-            SCX_FALLBACK_EVERY="0"
-            SCX_SWITCH_ALL="1"
-            SCX_WORKER_ONLY="0"
-            ;;
-        rvv_dirty_bind|rvv_dirty_bind_all)
-            SCX_LOADER_STRATEGY="rvv_dirty_bind"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_VECTOR_CPUS="0-7"
-            SCX_ORDINARY_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_VECTOR_SLICE_MS="0"
-            SCX_ORDINARY_VECTOR_SLICE_MS="0"
-            SCX_VECTOR_LOCAL_WINDOW_MS="0"
-            SCX_DIRTY_THRESHOLD="2"
-            SCX_FALLBACK_EVERY="0"
-            SCX_SWITCH_ALL="1"
-            SCX_WORKER_ONLY="0"
             ;;
         rvv_dirty_lease|rvv_dirty_lease_all|rvv_dirty_lease_unique|rvv_dirty_lease_unique_all)
             SCX_LOADER_STRATEGY="rvv_dirty"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_VECTOR_CPUS="0-7"
-            SCX_ORDINARY_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
             SCX_VECTOR_SLICE_MS="100"
-            SCX_ORDINARY_VECTOR_SLICE_MS="50"
             SCX_VECTOR_LOCAL_WINDOW_MS="500"
-            SCX_DIRTY_THRESHOLD="2"
-            SCX_FALLBACK_EVERY="0"
-            SCX_SWITCH_ALL="1"
-            SCX_WORKER_ONLY="0"
             ;;
         rvv_dirty_lease_user_observe|rvv_dirty_lease_user_active)
             SCX_LOADER_STRATEGY="rvv_dirty"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_VECTOR_CPUS="0-7"
-            SCX_ORDINARY_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
             SCX_VECTOR_SLICE_MS="100"
-            SCX_ORDINARY_VECTOR_SLICE_MS="50"
             SCX_VECTOR_LOCAL_WINDOW_MS="500"
-            SCX_DIRTY_THRESHOLD="2"
-            SCX_FALLBACK_EVERY="0"
-            SCX_SWITCH_ALL="1"
-            SCX_WORKER_ONLY="0"
             if [ "$BENCHMARK_STRATEGY" = "rvv_dirty_lease_user_active" ]; then
                 SCX_LEASE_CONTROL_MODE="active"
             else
@@ -336,39 +175,12 @@ apply_strategy_preset() {
             ;;
         rvv_dirty_local_all)
             SCX_LOADER_STRATEGY="rvv_dirty_local"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_VECTOR_CPUS="0-7"
-            SCX_ORDINARY_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
             SCX_VECTOR_SLICE_MS="100"
-            SCX_ORDINARY_VECTOR_SLICE_MS="50"
             SCX_VECTOR_LOCAL_WINDOW_MS="500"
-            SCX_DIRTY_THRESHOLD="2"
-            SCX_FALLBACK_EVERY="0"
-            SCX_SWITCH_ALL="1"
-            SCX_WORKER_ONLY="0"
-            ;;
-        rvv_dirty_6_2)
-            SCX_LOADER_STRATEGY="rvv_dirty"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="6-7"
-            SCX_VECTOR_CPUS="0-5"
-            SCX_ORDINARY_CPUS="6-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_VECTOR_SLICE_MS="200"
-            SCX_ORDINARY_VECTOR_SLICE_MS="50"
-            SCX_VECTOR_LOCAL_WINDOW_MS="500"
-            SCX_DIRTY_THRESHOLD="2"
-            SCX_FALLBACK_EVERY="4"
-            SCX_SWITCH_ALL="1"
-            SCX_WORKER_ONLY="0"
             ;;
         *)
             log_error "未知策略: $BENCHMARK_STRATEGY"
-            echo "可选策略: cfs, linux_affinity, scx_global, pin_all, pin_0_3_iso_4_7, pin_4_7_iso_0_3, long_slice, local_dsq, local_dsq_50ms, local_dsq_100ms, long_slice_isolated, llm_only_pin, llm_only_local_dsq, llm_only_local_dsq_50ms, llm_workers_pin, llm_workers_local_dsq, rvv_dirty_all, rvv_dirty_bind_all, rvv_dirty_lease_all, rvv_dirty_lease_unique_all, rvv_dirty_lease_user_observe, rvv_dirty_lease_user_active, rvv_dirty_local_all, rvv_dirty_6_2"
+            echo "可选策略: cfs, linux_affinity, scx_global, rvv_dirty_all, rvv_dirty_lease_all, rvv_dirty_lease_unique_all, rvv_dirty_lease_user_observe, rvv_dirty_lease_user_active, rvv_dirty_local_all"
             exit 1
             ;;
     esac
@@ -380,27 +192,12 @@ list_strategies() {
   cfs                    默认 CFS baseline，不加载 sched_ext
   linux_affinity         CFS + Linux task affinity worker pin，不加载 sched_ext
   scx_global             最小 sched_ext 全局队列
-  pin_all                LLM 全 CPU 亲和，保持原 CPU
-  pin_0_3_iso_4_7        LLM CPU0-3，系统任务 CPU4-7
-  pin_4_7_iso_0_3        LLM CPU4-7，系统任务 CPU0-3
-  long_slice             LLM 全 CPU，100ms 长时间片
-  local_dsq              LLM 优先当前 CPU 本地 DSQ
-  local_dsq_50ms         LLM 本地 DSQ + 50ms 时间片
-  local_dsq_100ms        LLM 本地 DSQ + 100ms 时间片
-  long_slice_isolated    LLM CPU0-3 + 100ms 长时间片，系统任务 CPU4-7
-  llm_only_pin           仅 llama-server 线程进入 SCHED_EXT + pin
-  llm_only_local_dsq     仅 llama-server 线程进入 SCHED_EXT + local DSQ
-  llm_only_local_dsq_50ms 仅 llama-server 线程进入 SCHED_EXT + local DSQ + 50ms
-  llm_workers_pin        仅运行时间最高的计算worker进入 SCHED_EXT + pin
-  llm_workers_local_dsq  仅运行时间最高的计算worker进入 SCHED_EXT + local DSQ
   rvv_dirty_all          旧版全核心 RVV Dirty，vector 每次 wakeup 进入 vector DSQ
-  rvv_dirty_bind_all     仅 RVV Dirty 识别 + 8个vector worker一核一个，默认 slice、本地 DSQ
   rvv_dirty_lease_all    500ms lease + 8个vector worker一核一个
   rvv_dirty_lease_unique_all  rvv_dirty_lease_all 的兼容别名
   rvv_dirty_lease_user_observe  dirty lease + 用户worker注册，仅观测
   rvv_dirty_lease_user_active   dirty lease + 用户CPU映射和运行时参数控制
   rvv_dirty_local_all    RVV Dirty vector 长时间片 + LLM 辅助线程本地 DSQ
-  rvv_dirty_6_2          CPU0-5 激进计算核心，CPU6-7 普通/回退核心
 EOF
 }
 
@@ -858,30 +655,13 @@ start_scheduler() {
     remote_kill_by_pattern "scx_llm_pin" "-TERM"
     sleep 1
 
-    local llm_only_arg=""
-    local tid_list_arg=""
     local lease_control_args=""
-    if [ "${SCX_SWITCH_ALL:-1}" = "0" ]; then
-        llm_only_arg="--llm-only"
-        if [ "${SCX_WORKER_ONLY:-0}" = "1" ]; then
-            local tid_list
-            tid_list=$(select_worker_tids "$llm_pid")
-            if [ -z "$tid_list" ]; then
-                log_error "worker-only策略无法选择TID"
-                exit 1
-            fi
-            tid_list_arg="--tid-list '$tid_list'"
-            echo "$tid_list" > "$result_dir/scx_worker_tids.txt"
-            log_info "worker-only TIDs: $tid_list"
-        fi
-    fi
-
     if is_user_controlled_lease_scheduler; then
         lease_control_args="--user-control '$SCX_LEASE_CONTROL_MODE' --control-dir '$SCX_LEASE_CONTROL_DIR' --user-cpu-map '$SCX_LEASE_USER_CPU_MAP'"
     fi
 
-    log_info "启动策略: loader=$SCX_LOADER_STRATEGY, tgid=$llm_pid, llm_cpus=$SCX_LLM_CPUS, system_cpus=$SCX_SYSTEM_CPUS, vector_cpus=$SCX_VECTOR_CPUS, ordinary_cpus=$SCX_ORDINARY_CPUS, slice=${SCX_SLICE_MS}ms, vector_slice=${SCX_VECTOR_SLICE_MS}ms, ordinary_vector_slice=${SCX_ORDINARY_VECTOR_SLICE_MS}ms, vector_local_window=${SCX_VECTOR_LOCAL_WINDOW_MS}ms, switch_all=${SCX_SWITCH_ALL}, worker_only=${SCX_WORKER_ONLY}"
-    ssh_exec "cd '$scheduler_dir' && nohup ./$scheduler_bin --tgid '$llm_pid' --strategy '$SCX_LOADER_STRATEGY' --llm-cpus '$SCX_LLM_CPUS' --system-cpus '$SCX_SYSTEM_CPUS' --vector-cpus '$SCX_VECTOR_CPUS' --ordinary-cpus '$SCX_ORDINARY_CPUS' --slice-ms '$SCX_SLICE_MS' --system-slice-ms '$SCX_SYSTEM_SLICE_MS' --vector-slice-ms '$SCX_VECTOR_SLICE_MS' --ordinary-vector-slice-ms '$SCX_ORDINARY_VECTOR_SLICE_MS' --vector-local-window-ms '$SCX_VECTOR_LOCAL_WINDOW_MS' --dirty-threshold '$SCX_DIRTY_THRESHOLD' --fallback-every '$SCX_FALLBACK_EVERY' $lease_control_args $llm_only_arg $tid_list_arg > '$SCX_ACTIVE_LOG' 2>&1 &"
+    log_info "启动策略: loader=$SCX_LOADER_STRATEGY, tgid=$llm_pid, vector_slice=${SCX_VECTOR_SLICE_MS}ms, vector_local_window=${SCX_VECTOR_LOCAL_WINDOW_MS}ms, dirty_threshold=$SCX_DIRTY_THRESHOLD"
+    ssh_exec "cd '$scheduler_dir' && nohup ./$scheduler_bin --tgid '$llm_pid' --strategy '$SCX_LOADER_STRATEGY' --vector-slice-ms '$SCX_VECTOR_SLICE_MS' --vector-local-window-ms '$SCX_VECTOR_LOCAL_WINDOW_MS' --dirty-threshold '$SCX_DIRTY_THRESHOLD' $lease_control_args > '$SCX_ACTIVE_LOG' 2>&1 &"
     sleep 3
 
     if [ -n "$(remote_pid_by_pattern "$scheduler_pattern")" ]; then
@@ -990,7 +770,7 @@ validate_user_controlled_lease_ready() {
         local checks=""
         local ith
         for ith in $(seq 0 7); do
-            checks="$checks grep -q 'lease_worker ith=$ith ' '$SCX_ACTIVE_LOG' &&"
+            checks="$checks grep -q 'lease_worker team=0 ith=$ith ' '$SCX_ACTIVE_LOG' &&"
         done
         if ssh_exec "${checks%&&}" >/dev/null 2>&1 && \
            ssh_exec "grep -Eq 'User hint valid workers:[[:space:]]+8' '$SCX_ACTIVE_LOG'" && \
@@ -1443,21 +1223,9 @@ Restart LLM: $RESTART_LLM
 Benchmark Strategy: $BENCHMARK_STRATEGY
 SCX Enabled: ${SCX_ENABLED:-0}
 SCX Loader Strategy: $SCX_LOADER_STRATEGY
-SCX LLM CPUs: $SCX_LLM_CPUS
-SCX System CPUs: $SCX_SYSTEM_CPUS
-SCX LLM Slice ms: $SCX_SLICE_MS
-SCX System Slice ms: $SCX_SYSTEM_SLICE_MS
-SCX Switch All: $SCX_SWITCH_ALL
-SCX Worker Only: $SCX_WORKER_ONLY
-SCX Parallel Warmup: $SCX_PARALLEL_WARMUP
-SCX Warmup Tokens: $SCX_WARMUP_TOKENS
-SCX Vector CPUs: $SCX_VECTOR_CPUS
-SCX Ordinary CPUs: $SCX_ORDINARY_CPUS
 SCX Vector Slice ms: $SCX_VECTOR_SLICE_MS
-SCX Ordinary Vector Slice ms: $SCX_ORDINARY_VECTOR_SLICE_MS
 SCX Vector Local Window ms: $SCX_VECTOR_LOCAL_WINDOW_MS
 SCX Dirty Threshold: $SCX_DIRTY_THRESHOLD
-SCX Fallback Every: $SCX_FALLBACK_EVERY
 SCX Lease Control Mode: $SCX_LEASE_CONTROL_MODE
 SCX Lease Control Dir: $SCX_LEASE_CONTROL_DIR
 SCX Lease User CPU Map: $SCX_LEASE_USER_CPU_MAP
@@ -1753,20 +1521,9 @@ generate_report() {
         echo "Request Seed: ${REQUEST_SEED:-1234}"
         echo "Request Ignore EOS: ${REQUEST_IGNORE_EOS:-1}"
         echo "SCX加载策略: $SCX_LOADER_STRATEGY"
-        echo "SCX LLM CPUs: $SCX_LLM_CPUS"
-        echo "SCX System CPUs: $SCX_SYSTEM_CPUS"
-        echo "SCX LLM Slice: ${SCX_SLICE_MS}ms"
-        echo "SCX Switch All: $SCX_SWITCH_ALL"
-        echo "SCX Worker Only: $SCX_WORKER_ONLY"
-        echo "SCX Parallel Warmup: $SCX_PARALLEL_WARMUP"
-        echo "SCX Warmup Tokens: $SCX_WARMUP_TOKENS"
-        echo "SCX Vector CPUs: $SCX_VECTOR_CPUS"
-        echo "SCX Ordinary CPUs: $SCX_ORDINARY_CPUS"
         echo "SCX Vector Slice: ${SCX_VECTOR_SLICE_MS}ms"
-        echo "SCX Ordinary Vector Slice: ${SCX_ORDINARY_VECTOR_SLICE_MS}ms"
         echo "SCX Vector Local Window: ${SCX_VECTOR_LOCAL_WINDOW_MS}ms"
         echo "SCX Dirty Threshold: $SCX_DIRTY_THRESHOLD"
-        echo "SCX Fallback Every: $SCX_FALLBACK_EVERY"
         echo "SCX Lease Control Mode: $SCX_LEASE_CONTROL_MODE"
         echo "SCX Lease Control Dir: $SCX_LEASE_CONTROL_DIR"
         echo "SCX Lease User CPU Map: $SCX_LEASE_USER_CPU_MAP"
