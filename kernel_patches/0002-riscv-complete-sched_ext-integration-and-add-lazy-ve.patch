@@ -4,7 +4,7 @@ Date: Mon, 20 Jul 2026 13:55:08 +0800
 Subject: [PATCH 2/2] riscv: complete sched_ext integration and add lazy vector
  restore
 
-Complete the sched_ext backport integration for the vendor 6.6 scheduler and cgroup interfaces, increase the dispatch loop budget, and retain the local scheduler header needed by the core implementation.
+Complete the sched_ext port integration for the vendor 6.6 scheduler and cgroup interfaces, increase the dispatch loop budget, and retain the local scheduler header needed by the core implementation.
 
 Add an opt-in per-CPU userspace Vector owner. Keep eager saves as the memory fallback, elide only the v0-v31 payload restore on a valid owner hit, and always restore Vector CSRs. Cover kernel Vector use, KVM, CPU power transitions, signal restore, ptrace and exec invalidation, with debugfs counters and a context selftest.
 
@@ -1823,4 +1823,3 @@ index 000000000..e3ab7cac4
 +}
 -- 
 2.54.0
-

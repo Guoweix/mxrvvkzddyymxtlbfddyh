@@ -8,17 +8,20 @@
 2. `0002` 补齐 sched_ext 在该厂商树上的兼容代码，并加入可选的 RISC-V RVV
    lazy restore 实验功能。
 
+Linux 6.6 主线和 K1 厂商基线都不包含 sched_ext；该功能在 Linux 6.12 才正式
+合入主线。本补丁集采用 sched-ext 项目在主线化之前维护的非主线
+`v6.6.4-scx2` 发布树作为实现来源，并将其移植到 K1 厂商 Linux 6.6。
+
 这两个补丁从本项目 Linux 分支 `k1-bl-v2.1.y` 导出，必须按编号顺序应用。
 `0002` 依赖 `0001`，不能单独应用。
 
 ## 补丁 1：为原厂内核添加 sched_ext
 
-文件：`0001-sched_ext-add-sched_ext-backport-from-v6.6.4-scx2.patch`
+文件：`0001-sched_ext-port-sched_ext-from-scx-v6.6.4-scx2.patch`
 
 ### 作用
 
-K1 原厂 Linux 6.6 基线没有本项目所需的完整 sched_ext 实现。该补丁完成以下
-内核能力回移：
+K1 原厂 Linux 6.6 基线没有 sched_ext 实现。该补丁完成以下内核能力移植：
 
 - 加入 `SCHED_CLASS_EXT` 调度类及 `sched_ext_ops` BPF struct_ops 接口。
 - 将 sched_ext 接入 `core`、`fair`、`idle`、`deadline`、SysRq 和调度类链接布局。
@@ -32,7 +35,7 @@ sched_ext 调度器时，系统仍按默认 Linux 调度路径运行。
 
 ### 上游来源
 
-sched_ext 主体来自 sched_ext 项目的 Linux 内核发布仓库：
+sched_ext 主体来自 sched-ext 项目的非主线 Linux 内核发布仓库：
 
 - 仓库：<https://github.com/sched-ext/scx-kernel-releases>
 - 参考版本：[`v6.6.4-scx2`](https://github.com/sched-ext/scx-kernel-releases/tree/v6.6.4-scx2)
@@ -40,8 +43,8 @@ sched_ext 主体来自 sched_ext 项目的 Linux 内核发布仓库：
 
 其中 `kernel/sched/ext.c` 和 `include/linux/sched/ext.h` 以该版本为移植源；其余
 调度器文件的修改是把该版本的 sched_ext 接口接入 K1 原厂 6.6 内核时所做的
-适配。因此，`0001` 是面向原厂树的 backport，不应理解为可直接应用到任意
-Linux 6.6 分支的原始上游提交。
+适配。`v6.6.4-scx2` 不是 vanilla Linux 6.6，也不是 Linux 6.12 主线提交的直接
+回放；`0001` 是面向 K1 厂商树的移植补丁，不能直接应用到任意 Linux 6.6 分支。
 
 ### 开源许可证
 
@@ -96,7 +99,7 @@ git -C "$KERNEL_SRC" status --short
 git -C "$KERNEL_SRC" switch -c sched-ext-rvv \
     46ef2dae4ac50c7e556137e4cbbdcc024921d9e3
 git -C "$KERNEL_SRC" am --3way \
-    "$PATCH_DIR/0001-sched_ext-add-sched_ext-backport-from-v6.6.4-scx2.patch" \
+    "$PATCH_DIR/0001-sched_ext-port-sched_ext-from-scx-v6.6.4-scx2.patch" \
     "$PATCH_DIR/0002-riscv-complete-sched_ext-integration-and-add-lazy-ve.patch"
 ```
 

@@ -1,7 +1,7 @@
 From 9f4dcfbe92abf3ef8abc6ace03af006c5919c772 Mon Sep 17 00:00:00 2001
 From: Build <build@local>
 Date: Mon, 15 Jun 2026 09:47:03 +0800
-Subject: [PATCH 1/2] sched_ext: add sched_ext backport from v6.6.4-scx2
+Subject: [PATCH 1/2] sched_ext: port sched_ext from scx v6.6.4-scx2
 
 - Copy kernel/sched/ext.c and include/linux/sched/ext.h from sched-ext/scx-kernel-releases v6.6.4-scx2
 - Apply scheduler integration patches (core.c, fair.c, idle.c, etc.)
@@ -7243,4 +7243,3 @@ index 5007b25c5..b33cefeb4 100644
  
 -- 
 2.54.0
-
