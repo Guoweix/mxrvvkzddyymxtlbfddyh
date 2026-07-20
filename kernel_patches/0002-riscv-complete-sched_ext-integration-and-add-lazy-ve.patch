@@ -1,0 +1,1826 @@
+From e85820376b67919b6e312ca98cd3d9dd8904f663 Mon Sep 17 00:00:00 2001
+From: Build <build@local>
+Date: Mon, 20 Jul 2026 13:55:08 +0800
+Subject: [PATCH 2/2] riscv: complete sched_ext integration and add lazy vector
+ restore
+
+Complete the sched_ext backport integration for the vendor 6.6 scheduler and cgroup interfaces, increase the dispatch loop budget, and retain the local scheduler header needed by the core implementation.
+
+Add an opt-in per-CPU userspace Vector owner. Keep eager saves as the memory fallback, elide only the v0-v31 payload restore on a valid owner hit, and always restore Vector CSRs. Cover kernel Vector use, KVM, CPU power transitions, signal restore, ptrace and exec invalidation, with debugfs counters and a context selftest.
+
+Also fix the bcmdhd source include path for out-of-tree builds and the host libbpf const qualifier needed by clean kernel builds.
+---
+ arch/riscv/Kconfig                            |  13 +
+ arch/riscv/include/asm/processor.h            |   5 +
+ arch/riscv/include/asm/vector.h               |  22 +-
+ arch/riscv/include/asm/vector_user_owner.h    |  48 +++
+ arch/riscv/kernel/Makefile                    |   1 +
+ arch/riscv/kernel/kernel_mode_vector.c        |   2 +
+ arch/riscv/kernel/process.c                   |   6 +-
+ arch/riscv/kernel/ptrace.c                    |   3 +
+ arch/riscv/kernel/signal.c                    |   3 +
+ arch/riscv/kernel/suspend.c                   |   2 +
+ arch/riscv/kernel/vector_user_owner.c         | 290 ++++++++++++++++
+ arch/riscv/kvm/vcpu_vector.c                  |   1 +
+ drivers/net/wireless/bcmdhd/Makefile          |   3 +-
+ include/linux/cgroup-defs.h                   |  15 +-
+ include/linux/cgroup.h                        |   5 +-
+ init/init_task.c                              |  13 +-
+ kernel/bpf/bpf_struct_ops_types.h             |   4 +
+ kernel/fork.c                                 |  18 +-
+ kernel/sched/core.c                           |   1 +
+ kernel/sched/ext.c                            |   2 +-
+ kernel/sched/ext.h                            | 269 +++++++++++++++
+ kernel/sched/rt.c                             |   4 +-
+ kernel/sched/sched.h                          | 138 ++++++--
+ kernel/sched/topology.c                       |   4 +-
+ tools/lib/bpf/libbpf.c                        |   3 +-
+ tools/testing/selftests/riscv/vector/Makefile |   5 +-
+ .../selftests/riscv/vector/v_owner_context.c  | 326 ++++++++++++++++++
+ 27 files changed, 1153 insertions(+), 53 deletions(-)
+ create mode 100644 arch/riscv/include/asm/vector_user_owner.h
+ create mode 100644 arch/riscv/kernel/vector_user_owner.c
+ create mode 100644 kernel/sched/ext.h
+ create mode 100644 tools/testing/selftests/riscv/vector/v_owner_context.c
+
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index 247c53645..0ef8b28cf 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -569,6 +569,19 @@ config RISCV_ISA_V_PREEMPTIVE
+ 	  preemption. Enabling this config will result in higher memory
+ 	  consumption due to the allocation of per-task's kernel Vector context.
+ 
++config RISCV_ISA_V_USER_OWNER
++	bool "Cache userspace Vector register ownership per CPU"
++	depends on RISCV_ISA_V
++	default n
++	help
++	  Track which userspace task owns the Vector registers resident on each
++	  CPU. With riscv_v_user_owner=restore, returning to the same task on the
++	  same CPU can skip an otherwise redundant Vector restore. Dirty Vector
++	  state is still saved eagerly on switch-out, so memory always contains a
++	  valid fallback copy.
++
++	  The feature is disabled unless enabled with the kernel command line.
++
+ config RISCV_ISA_ZAWRS
+ 	bool "Zawrs extension support for more efficient busy waiting"
+ 	depends on RISCV_ALTERNATIVE
+diff --git a/arch/riscv/include/asm/processor.h b/arch/riscv/include/asm/processor.h
+index d19c24ada..01217fb19 100644
+--- a/arch/riscv/include/asm/processor.h
++++ b/arch/riscv/include/asm/processor.h
+@@ -121,6 +121,11 @@ struct thread_struct {
+ 	u32 riscv_v_flags;
+ 	u32 vstate_ctrl;
+ 	struct __riscv_v_ext_state vstate;
++#ifdef CONFIG_RISCV_ISA_V_USER_OWNER
++	u64 vstate_owner_cookie;
++	u64 vstate_owner_sequence;
++	int vstate_owner_cpu;
++#endif
+ 	unsigned long align_ctl;
+ 	struct __riscv_v_ext_state kernel_vstate;
+ };
+diff --git a/arch/riscv/include/asm/vector.h b/arch/riscv/include/asm/vector.h
+index c741e7b29..7ca3053a2 100644
+--- a/arch/riscv/include/asm/vector.h
++++ b/arch/riscv/include/asm/vector.h
+@@ -18,6 +18,7 @@
+ #include <asm/cpufeature.h>
+ #include <asm/csr.h>
+ #include <asm/asm.h>
++#include <asm/vector_user_owner.h>
+ 
+ extern unsigned long riscv_v_vsize;
+ int riscv_v_setup_vsize(void);
+@@ -146,6 +147,14 @@ static inline void __riscv_v_vstate_restore(struct __riscv_v_ext_state *restore_
+ 	riscv_v_disable();
+ }
+ 
++static inline void __riscv_v_vstate_restore_csrs(
++	struct __riscv_v_ext_state *restore_from)
++{
++	riscv_v_enable();
++	__vstate_csr_restore(restore_from);
++	riscv_v_disable();
++}
++
+ static inline void __riscv_v_vstate_discard(void)
+ {
+ 	unsigned long vl, vtype_inval = 1UL << (BITS_PER_LONG - 1);
+@@ -178,6 +187,7 @@ static inline void riscv_v_vstate_save(struct __riscv_v_ext_state *vstate,
+ 				       struct pt_regs *regs)
+ {
+ 	if ((regs->status & SR_VS) == SR_VS_DIRTY) {
++		riscv_v_user_owner_note_save();
+ 		__riscv_v_vstate_save(vstate, vstate->datap);
+ 		__riscv_v_vstate_clean(regs);
+ 	}
+@@ -189,6 +199,7 @@ static inline void riscv_v_vstate_restore(struct __riscv_v_ext_state *vstate,
+ 	if ((regs->status & SR_VS) != SR_VS_OFF) {
+ 		__riscv_v_vstate_restore(vstate, vstate->datap);
+ 		__riscv_v_vstate_clean(regs);
++		riscv_v_user_owner_note_restore(current);
+ 	}
+ }
+ 
+@@ -253,10 +264,17 @@ static inline void __switch_to_vector(struct task_struct *prev,
+ 		riscv_v_vstate_save(&prev->thread.vstate, regs);
+ 	}
+ 
+-	if (riscv_preempt_v_started(next))
++	if (riscv_preempt_v_started(next)) {
++		riscv_v_user_owner_invalidate_cpu(
++			RISCV_V_USER_OWNER_INVALID_KERNEL);
+ 		riscv_preempt_v_set_restore(next);
+-	else
++	} else if (riscv_v_user_owner_try_restore_elide(next)) {
++		__riscv_v_vstate_restore_csrs(&next->thread.vstate);
++		clear_tsk_thread_flag(next, TIF_RISCV_V_DEFER_RESTORE);
++		__riscv_v_vstate_clean(task_pt_regs(next));
++	} else {
+ 		riscv_v_vstate_set_restore(next, task_pt_regs(next));
++	}
+ }
+ 
+ void riscv_v_vstate_ctrl_init(struct task_struct *tsk);
+diff --git a/arch/riscv/include/asm/vector_user_owner.h b/arch/riscv/include/asm/vector_user_owner.h
+new file mode 100644
+index 000000000..d04d81c95
+--- /dev/null
++++ b/arch/riscv/include/asm/vector_user_owner.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_RISCV_VECTOR_USER_OWNER_H
++#define _ASM_RISCV_VECTOR_USER_OWNER_H
++
++#include <linux/types.h>
++
++struct task_struct;
++
++enum riscv_v_user_owner_invalidate_reason {
++	RISCV_V_USER_OWNER_INVALID_KERNEL,
++	RISCV_V_USER_OWNER_INVALID_KVM,
++	RISCV_V_USER_OWNER_INVALID_CPU_PM,
++};
++
++enum riscv_v_user_owner_state_reason {
++	RISCV_V_USER_OWNER_STATE_SIGNAL,
++	RISCV_V_USER_OWNER_STATE_PTRACE,
++	RISCV_V_USER_OWNER_STATE_EXEC,
++};
++
++#ifdef CONFIG_RISCV_ISA_V_USER_OWNER
++bool riscv_v_user_owner_enabled(void);
++bool riscv_v_user_owner_try_restore_elide(struct task_struct *task);
++void riscv_v_user_owner_note_save(void);
++void riscv_v_user_owner_note_restore(struct task_struct *task);
++void riscv_v_user_owner_invalidate_cpu(
++	enum riscv_v_user_owner_invalidate_reason reason);
++void riscv_v_user_owner_state_changed(
++	struct task_struct *task,
++	enum riscv_v_user_owner_state_reason reason);
++void riscv_v_user_owner_task_init(struct task_struct *task);
++#else
++static inline bool riscv_v_user_owner_enabled(void) { return false; }
++static inline bool riscv_v_user_owner_try_restore_elide(struct task_struct *task)
++{
++	return false;
++}
++static inline void riscv_v_user_owner_note_save(void) { }
++static inline void riscv_v_user_owner_note_restore(struct task_struct *task) { }
++static inline void riscv_v_user_owner_invalidate_cpu(
++	enum riscv_v_user_owner_invalidate_reason reason) { }
++static inline void riscv_v_user_owner_state_changed(
++	struct task_struct *task,
++	enum riscv_v_user_owner_state_reason reason) { }
++static inline void riscv_v_user_owner_task_init(struct task_struct *task) { }
++#endif
++
++#endif /* _ASM_RISCV_VECTOR_USER_OWNER_H */
+diff --git a/arch/riscv/kernel/Makefile b/arch/riscv/kernel/Makefile
+index fd7894020..030788d07 100644
+--- a/arch/riscv/kernel/Makefile
++++ b/arch/riscv/kernel/Makefile
+@@ -68,6 +68,7 @@ obj-$(CONFIG_RISCV_PROBE_UNALIGNED_ACCESS)	+= copy-unaligned.o
+ obj-$(CONFIG_FPU)		+= fpu.o
+ obj-$(CONFIG_RISCV_ISA_V)	+= vector.o
+ obj-$(CONFIG_RISCV_ISA_V)	+= kernel_mode_vector.o
++obj-$(CONFIG_RISCV_ISA_V_USER_OWNER) += vector_user_owner.o
+ obj-$(CONFIG_SMP)		+= smpboot.o
+ obj-$(CONFIG_SMP)		+= smp.o
+ obj-$(CONFIG_SMP)		+= cpu_ops.o
+diff --git a/arch/riscv/kernel/kernel_mode_vector.c b/arch/riscv/kernel/kernel_mode_vector.c
+index 6afe80c7f..c37cd8a25 100644
+--- a/arch/riscv/kernel/kernel_mode_vector.c
++++ b/arch/riscv/kernel/kernel_mode_vector.c
+@@ -61,6 +61,7 @@ void get_cpu_vector_context(void)
+ 		preempt_disable();
+ 
+ 	riscv_v_start(RISCV_KERNEL_MODE_V);
++	riscv_v_user_owner_invalidate_cpu(RISCV_V_USER_OWNER_INVALID_KERNEL);
+ }
+ 
+ /*
+@@ -212,6 +213,7 @@ void kernel_vector_begin(void)
+ 		return;
+ 
+ 	BUG_ON(!may_use_simd());
++	riscv_v_user_owner_invalidate_cpu(RISCV_V_USER_OWNER_INVALID_KERNEL);
+ 
+ 	if (riscv_v_start_kernel_context(&nested)) {
+ 		get_cpu_vector_context();
+diff --git a/arch/riscv/kernel/process.c b/arch/riscv/kernel/process.c
+index 51042f48d..74fe983fa 100644
+--- a/arch/riscv/kernel/process.c
++++ b/arch/riscv/kernel/process.c
+@@ -165,6 +165,8 @@ void flush_thread(void)
+ #endif
+ #ifdef CONFIG_RISCV_ISA_V
+ 	/* Reset vector state */
++	riscv_v_user_owner_state_changed(current,
++					 RISCV_V_USER_OWNER_STATE_EXEC);
+ 	riscv_v_vstate_ctrl_init(current);
+ 	riscv_v_vstate_off(task_pt_regs(current));
+ 	kfree(current->thread.vstate.datap);
+@@ -222,8 +224,10 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 		p->thread.s[0] = 0;
+ 	}
+ 	p->thread.riscv_v_flags = 0;
+-	if (has_vector())
++	if (has_vector()) {
++		riscv_v_user_owner_task_init(p);
+ 		riscv_v_thread_alloc(p);
++	}
+ 	p->thread.ra = (unsigned long)ret_from_fork;
+ 	p->thread.sp = (unsigned long)childregs; /* kernel sp */
+ 	return 0;
+diff --git a/arch/riscv/kernel/ptrace.c b/arch/riscv/kernel/ptrace.c
+index e8515aa9d..af5f36fe7 100644
+--- a/arch/riscv/kernel/ptrace.c
++++ b/arch/riscv/kernel/ptrace.c
+@@ -130,6 +130,9 @@ static int riscv_vr_set(struct task_struct *target,
+ 	if (!riscv_v_vstate_query(task_pt_regs(target)))
+ 		return -EINVAL;
+ 
++	riscv_v_user_owner_state_changed(target,
++					 RISCV_V_USER_OWNER_STATE_PTRACE);
++
+ 	/* Copy rest of the vstate except datap */
+ 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &ptrace_vstate, 0,
+ 				 sizeof(struct __riscv_v_regset_state));
+diff --git a/arch/riscv/kernel/signal.c b/arch/riscv/kernel/signal.c
+index e81871ca4..560a4e3c4 100644
+--- a/arch/riscv/kernel/signal.c
++++ b/arch/riscv/kernel/signal.c
+@@ -119,6 +119,9 @@ static long __restore_v_state(struct pt_regs *regs, void __user *sc_vec)
+ 	struct __sc_riscv_v_state __user *state = sc_vec;
+ 	void __user *datap;
+ 
++	riscv_v_user_owner_state_changed(current,
++					 RISCV_V_USER_OWNER_STATE_SIGNAL);
++
+ 	/*
+ 	 * Mark the vstate as clean prior performing the actual copy,
+ 	 * to avoid getting the vstate incorrectly clobbered by the
+diff --git a/arch/riscv/kernel/suspend.c b/arch/riscv/kernel/suspend.c
+index c410783f6..f56d23afd 100644
+--- a/arch/riscv/kernel/suspend.c
++++ b/arch/riscv/kernel/suspend.c
+@@ -10,9 +10,11 @@
+ #include <asm/csr.h>
+ #include <asm/sbi.h>
+ #include <asm/suspend.h>
++#include <asm/vector_user_owner.h>
+ 
+ void suspend_save_csrs(struct suspend_context *context)
+ {
++	riscv_v_user_owner_invalidate_cpu(RISCV_V_USER_OWNER_INVALID_CPU_PM);
+ 	context->scratch = csr_read(CSR_SCRATCH);
+ 	context->tvec = csr_read(CSR_TVEC);
+ 	context->ie = csr_read(CSR_IE);
+diff --git a/arch/riscv/kernel/vector_user_owner.c b/arch/riscv/kernel/vector_user_owner.c
+new file mode 100644
+index 000000000..a9d10f195
+--- /dev/null
++++ b/arch/riscv/kernel/vector_user_owner.c
+@@ -0,0 +1,290 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/atomic.h>
++#include <linux/cpuhotplug.h>
++#include <linux/cpu.h>
++#include <linux/debugfs.h>
++#include <linux/export.h>
++#include <linux/init.h>
++#include <linux/percpu.h>
++#include <linux/preempt.h>
++#include <linux/sched.h>
++#include <linux/seq_file.h>
++#include <linux/string.h>
++
++#include <asm/processor.h>
++#include <asm/vector.h>
++#include <asm/vector_user_owner.h>
++
++enum riscv_v_user_owner_mode {
++	RISCV_V_USER_OWNER_OFF,
++	RISCV_V_USER_OWNER_RESTORE,
++};
++
++struct riscv_v_user_owner_cpu {
++	u64 cookie;
++	u64 sequence;
++	pid_t pid;
++	u64 saves;
++	u64 restores;
++	u64 restore_elided;
++	u64 owner_hits;
++	u64 miss_empty;
++	u64 miss_other_task;
++	u64 miss_state;
++	u64 miss_cpu;
++	u64 invalid_kernel;
++	u64 invalid_kvm;
++	u64 invalid_cpu_pm;
++	u64 state_signal;
++	u64 state_ptrace;
++	u64 state_exec;
++};
++
++static DEFINE_PER_CPU(struct riscv_v_user_owner_cpu, riscv_v_user_owner_cpus);
++static atomic64_t riscv_v_user_owner_cookie = ATOMIC64_INIT(0);
++static enum riscv_v_user_owner_mode riscv_v_user_owner_mode __ro_after_init;
++
++static int __init riscv_v_user_owner_setup(char *str)
++{
++	if (!str || !strcmp(str, "off")) {
++		riscv_v_user_owner_mode = RISCV_V_USER_OWNER_OFF;
++		return 0;
++	}
++
++	if (!strcmp(str, "restore")) {
++		riscv_v_user_owner_mode = RISCV_V_USER_OWNER_RESTORE;
++		return 0;
++	}
++
++	pr_warn("riscv_v_user_owner: unknown mode '%s', using off\n", str);
++	riscv_v_user_owner_mode = RISCV_V_USER_OWNER_OFF;
++	return 0;
++}
++early_param("riscv_v_user_owner", riscv_v_user_owner_setup);
++
++bool riscv_v_user_owner_enabled(void)
++{
++	return READ_ONCE(riscv_v_user_owner_mode) ==
++	       RISCV_V_USER_OWNER_RESTORE;
++}
++
++static struct riscv_v_user_owner_cpu *riscv_v_user_owner_this_cpu(void)
++{
++	return this_cpu_ptr(&riscv_v_user_owner_cpus);
++}
++
++static void riscv_v_user_owner_clear(struct riscv_v_user_owner_cpu *owner)
++{
++	owner->cookie = 0;
++	owner->sequence = 0;
++	owner->pid = 0;
++}
++
++void riscv_v_user_owner_task_init(struct task_struct *task)
++{
++	u64 cookie = atomic64_inc_return(&riscv_v_user_owner_cookie);
++
++	WRITE_ONCE(task->thread.vstate_owner_cookie, cookie);
++	WRITE_ONCE(task->thread.vstate_owner_sequence, 0);
++	WRITE_ONCE(task->thread.vstate_owner_cpu, -1);
++}
++
++static u64 riscv_v_user_owner_ensure_cookie(struct task_struct *task)
++{
++	u64 cookie = READ_ONCE(task->thread.vstate_owner_cookie);
++
++	if (likely(cookie))
++		return cookie;
++
++	cookie = atomic64_inc_return(&riscv_v_user_owner_cookie);
++	WRITE_ONCE(task->thread.vstate_owner_cookie, cookie);
++	return cookie;
++}
++
++void riscv_v_user_owner_note_save(void)
++{
++	struct riscv_v_user_owner_cpu *owner = riscv_v_user_owner_this_cpu();
++
++	owner->saves++;
++}
++
++void riscv_v_user_owner_note_restore(struct task_struct *task)
++{
++	struct riscv_v_user_owner_cpu *owner = riscv_v_user_owner_this_cpu();
++	u64 sequence;
++	u64 cookie;
++
++	owner->restores++;
++	if (!riscv_v_user_owner_enabled())
++		return;
++
++	cookie = riscv_v_user_owner_ensure_cookie(task);
++	sequence = READ_ONCE(task->thread.vstate_owner_sequence) + 1;
++	WRITE_ONCE(task->thread.vstate_owner_sequence, sequence);
++	WRITE_ONCE(task->thread.vstate_owner_cpu, raw_smp_processor_id());
++
++	owner->cookie = cookie;
++	owner->sequence = sequence;
++	owner->pid = task_pid_nr(task);
++}
++
++bool riscv_v_user_owner_try_restore_elide(struct task_struct *task)
++{
++	struct riscv_v_user_owner_cpu *owner;
++	u64 sequence;
++	u64 cookie;
++	int cpu;
++
++	if (!riscv_v_user_owner_enabled())
++		return false;
++	if ((task_pt_regs(task)->status & SR_VS) == SR_VS_OFF)
++		return false;
++
++	owner = riscv_v_user_owner_this_cpu();
++	cookie = READ_ONCE(task->thread.vstate_owner_cookie);
++	sequence = READ_ONCE(task->thread.vstate_owner_sequence);
++	cpu = READ_ONCE(task->thread.vstate_owner_cpu);
++
++	if (!owner->cookie) {
++		owner->miss_empty++;
++		return false;
++	}
++	if (!cookie || owner->cookie != cookie) {
++		owner->miss_other_task++;
++		return false;
++	}
++	if (owner->sequence != sequence) {
++		owner->miss_state++;
++		return false;
++	}
++	if (cpu != raw_smp_processor_id()) {
++		owner->miss_cpu++;
++		return false;
++	}
++
++	owner->owner_hits++;
++	owner->restore_elided++;
++	return true;
++}
++
++void riscv_v_user_owner_invalidate_cpu(
++	enum riscv_v_user_owner_invalidate_reason reason)
++{
++	struct riscv_v_user_owner_cpu *owner;
++
++	if (!riscv_v_user_owner_enabled())
++		return;
++
++	preempt_disable();
++	owner = riscv_v_user_owner_this_cpu();
++	if (owner->cookie) {
++		switch (reason) {
++		case RISCV_V_USER_OWNER_INVALID_KERNEL:
++			owner->invalid_kernel++;
++			break;
++		case RISCV_V_USER_OWNER_INVALID_KVM:
++			owner->invalid_kvm++;
++			break;
++		case RISCV_V_USER_OWNER_INVALID_CPU_PM:
++			owner->invalid_cpu_pm++;
++			break;
++		}
++		riscv_v_user_owner_clear(owner);
++	}
++	preempt_enable();
++}
++EXPORT_SYMBOL_GPL(riscv_v_user_owner_invalidate_cpu);
++
++void riscv_v_user_owner_state_changed(
++	struct task_struct *task,
++	enum riscv_v_user_owner_state_reason reason)
++{
++	struct riscv_v_user_owner_cpu *stats;
++	u64 sequence;
++
++	sequence = READ_ONCE(task->thread.vstate_owner_sequence) + 1;
++	WRITE_ONCE(task->thread.vstate_owner_sequence, sequence);
++	WRITE_ONCE(task->thread.vstate_owner_cpu, -1);
++
++	preempt_disable();
++	stats = riscv_v_user_owner_this_cpu();
++	switch (reason) {
++	case RISCV_V_USER_OWNER_STATE_SIGNAL:
++		stats->state_signal++;
++		break;
++	case RISCV_V_USER_OWNER_STATE_PTRACE:
++		stats->state_ptrace++;
++		break;
++	case RISCV_V_USER_OWNER_STATE_EXEC:
++		stats->state_exec++;
++		break;
++	}
++	preempt_enable();
++}
++
++static int riscv_v_user_owner_cpu_online(unsigned int cpu)
++{
++	struct riscv_v_user_owner_cpu *owner;
++
++	owner = per_cpu_ptr(&riscv_v_user_owner_cpus, cpu);
++	riscv_v_user_owner_clear(owner);
++	return 0;
++}
++
++static int riscv_v_user_owner_cpu_offline(unsigned int cpu)
++{
++	struct riscv_v_user_owner_cpu *owner;
++
++	owner = per_cpu_ptr(&riscv_v_user_owner_cpus, cpu);
++	if (owner->cookie)
++		owner->invalid_cpu_pm++;
++	riscv_v_user_owner_clear(owner);
++	return 0;
++}
++
++static int riscv_v_user_owner_stats_show(struct seq_file *m, void *unused)
++{
++	unsigned int cpu;
++
++	seq_printf(m, "mode=%s\n",
++		   riscv_v_user_owner_enabled() ? "restore" : "off");
++	seq_puts(m, "cpu owner_pid cookie sequence saves restores elided hits ");
++	seq_puts(m, "miss_empty miss_other miss_state miss_cpu invalid_kernel ");
++	seq_puts(m, "invalid_kvm invalid_cpu_pm state_signal state_ptrace state_exec\n");
++
++	for_each_possible_cpu(cpu) {
++		struct riscv_v_user_owner_cpu *s;
++
++		s = per_cpu_ptr(&riscv_v_user_owner_cpus, cpu);
++		seq_printf(m,
++			   "%u %d %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
++			   cpu, s->pid, s->cookie, s->sequence, s->saves,
++			   s->restores, s->restore_elided, s->owner_hits,
++			   s->miss_empty, s->miss_other_task, s->miss_state,
++			   s->miss_cpu, s->invalid_kernel, s->invalid_kvm,
++			   s->invalid_cpu_pm, s->state_signal,
++			   s->state_ptrace, s->state_exec);
++	}
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(riscv_v_user_owner_stats);
++
++static int __init riscv_v_user_owner_init(void)
++{
++	int ret;
++
++	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
++					"riscv/vector_user_owner:online",
++					riscv_v_user_owner_cpu_online,
++					riscv_v_user_owner_cpu_offline);
++	if (ret < 0)
++		pr_warn("riscv_v_user_owner: CPU hotplug setup failed: %d\n", ret);
++
++	debugfs_create_file("riscv_v_user_owner_stats", 0444, NULL, NULL,
++			    &riscv_v_user_owner_stats_fops);
++	pr_info("riscv_v_user_owner: mode=%s\n",
++		riscv_v_user_owner_enabled() ? "restore" : "off");
++	return 0;
++}
++arch_initcall(riscv_v_user_owner_init);
+diff --git a/arch/riscv/kvm/vcpu_vector.c b/arch/riscv/kvm/vcpu_vector.c
+index b339a2682..a84be6266 100644
+--- a/arch/riscv/kvm/vcpu_vector.c
++++ b/arch/riscv/kvm/vcpu_vector.c
+@@ -59,6 +59,7 @@ void kvm_riscv_vcpu_guest_vector_restore(struct kvm_cpu_context *cntx,
+ 
+ void kvm_riscv_vcpu_host_vector_save(struct kvm_cpu_context *cntx)
+ {
++	riscv_v_user_owner_invalidate_cpu(RISCV_V_USER_OWNER_INVALID_KVM);
+ 	/* No need to check host sstatus as it can be modified outside */
+ 	if (riscv_isa_extension_available(NULL, v))
+ 		__kvm_riscv_vector_save(cntx);
+diff --git a/drivers/net/wireless/bcmdhd/Makefile b/drivers/net/wireless/bcmdhd/Makefile
+index 46bc816c5..680b8b409 100644
+--- a/drivers/net/wireless/bcmdhd/Makefile
++++ b/drivers/net/wireless/bcmdhd/Makefile
+@@ -481,10 +481,11 @@ endif
+ 
+ ARCH ?= arm64
+ BCMDHD_ROOT = $(src)
++BCMDHD_SRC_ROOT = $(srctree)/$(src)
+ #$(warning "BCMDHD_ROOT=$(BCMDHD_ROOT)")
+ EXTRA_CFLAGS = $(DHDCFLAGS)
+ EXTRA_CFLAGS += -DDHD_COMPILED=\"$(BCMDHD_ROOT)\"
+-EXTRA_CFLAGS += -I$(BCMDHD_ROOT)/include/ -I$(BCMDHD_ROOT)/
++EXTRA_CFLAGS += -I$(BCMDHD_SRC_ROOT)/include/ -I$(BCMDHD_SRC_ROOT)/
+ ifeq ($(CONFIG_BCMDHD),m)
+ EXTRA_LDFLAGS += --strip-debug
+ endif
+diff --git a/include/linux/cgroup-defs.h b/include/linux/cgroup-defs.h
+index 6194d7c13..6eefe5153 100644
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@ -127,18 +127,12 @@ enum {
+ 	CFTYPE_WORLD_WRITABLE	= (1 << 4),	/* (DON'T USE FOR NEW FILES) S_IWUGO */
+ 	CFTYPE_DEBUG		= (1 << 5),	/* create when cgroup_debug */
+ 
+-	CFTYPE_HIDDEN		= (1 << 6),	/* file type hidden, see cgroup_show_cftypes() */
+-
+ 	/* internal flags, do not use outside cgroup core proper */
+ 	__CFTYPE_ONLY_ON_DFL	= (1 << 16),	/* only on default hierarchy */
+ 	__CFTYPE_NOT_ON_DFL	= (1 << 17),	/* not on default hierarchy */
+ 	__CFTYPE_ADDED		= (1 << 18),
+ };
+ 
+-enum cfile_flags {
+-	CFILE_HIDDEN		= (1 << 0),	/* file instance hidden */
+-};
+-
+ /*
+  * cgroup_file is the handle for a file instance created in a cgroup which
+  * is used, for example, to generate file changed notifications.  This can
+@@ -146,9 +140,7 @@ enum cfile_flags {
+  */
+ struct cgroup_file {
+ 	/* do not access any fields from outside cgroup core */
+-	struct cftype *cft;
+ 	struct kernfs_node *kn;
+-	unsigned int flags;
+ 	unsigned long notified_at;
+ 	struct timer_list notify_timer;
+ };
+@@ -551,6 +543,10 @@ struct cgroup_root {
+ 	/* Unique id for this hierarchy. */
+ 	int hierarchy_id;
+ 
++	/* A list running through the active hierarchies */
++	struct list_head root_list;
++	struct rcu_head rcu;	/* Must be near the top */
++
+ 	/*
+ 	 * The root cgroup. The containing cgroup_root will be destroyed on its
+ 	 * release. cgrp->ancestors[0] will be used overflowing into the
+@@ -564,9 +560,6 @@ struct cgroup_root {
+ 	/* Number of cgroups in the hierarchy, used only for /proc/cgroups */
+ 	atomic_t nr_cgrps;
+ 
+-	/* A list running through the active hierarchies */
+-	struct list_head root_list;
+-
+ 	/* Hierarchy-specific flags */
+ 	unsigned int flags;
+ 
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 08b54094b..b307013b9 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -29,6 +29,8 @@
+ 
+ struct kernel_clone_args;
+ 
++#ifdef CONFIG_CGROUPS
++
+ /*
+  * All weight knobs on the default hierarchy should use the following min,
+  * default and max values.  The default value is the logarithmic center of
+@@ -38,8 +40,6 @@ struct kernel_clone_args;
+ #define CGROUP_WEIGHT_DFL		100
+ #define CGROUP_WEIGHT_MAX		10000
+ 
+-#ifdef CONFIG_CGROUPS
+-
+ /* walk only threadgroup leaders */
+ #define CSS_TASK_ITER_PROCS		(1U << 0)
+ /* walk all threaded css_sets in the domain */
+@@ -115,7 +115,6 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from);
+ int cgroup_add_dfl_cftypes(struct cgroup_subsys *ss, struct cftype *cfts);
+ int cgroup_add_legacy_cftypes(struct cgroup_subsys *ss, struct cftype *cfts);
+ int cgroup_rm_cftypes(struct cftype *cfts);
+-void cgroup_show_cftype(struct cftype *cft, bool show);
+ void cgroup_file_notify(struct cgroup_file *cfile);
+ void cgroup_file_show(struct cgroup_file *cfile, bool show);
+ 
+diff --git a/init/init_task.c b/init/init_task.c
+index fd9e27185..d9b20c8d0 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -6,6 +6,7 @@
+ #include <linux/sched/sysctl.h>
+ #include <linux/sched/rt.h>
+ #include <linux/sched/task.h>
++#include <linux/sched/ext.h>
+ #include <linux/init.h>
+ #include <linux/fs.h>
+ #include <linux/mm.h>
+@@ -101,6 +102,17 @@ struct task_struct init_task
+ #endif
+ #ifdef CONFIG_CGROUP_SCHED
+ 	.sched_task_group = &root_task_group,
++#endif
++#ifdef CONFIG_SCHED_CLASS_EXT
++	.scx		= {
++		.dsq_node.fifo	= LIST_HEAD_INIT(init_task.scx.dsq_node.fifo),
++		.watchdog_node	= LIST_HEAD_INIT(init_task.scx.watchdog_node),
++		.sticky_cpu	= -1,
++		.holding_cpu	= -1,
++		.ops_state	= ATOMIC_LONG_INIT(0),
++		.runnable_at	= INITIAL_JIFFIES,
++		.slice		= SCX_SLICE_DFL,
++	},
+ #endif
+ 	.ptraced	= LIST_HEAD_INIT(init_task.ptraced),
+ 	.ptrace_entry	= LIST_HEAD_INIT(init_task.ptrace_entry),
+@@ -152,7 +164,6 @@ struct task_struct init_task
+ 	.rcu_tasks_holdout = false,
+ 	.rcu_tasks_holdout_list = LIST_HEAD_INIT(init_task.rcu_tasks_holdout_list),
+ 	.rcu_tasks_idle_cpu = -1,
+-	.rcu_tasks_exit_list = LIST_HEAD_INIT(init_task.rcu_tasks_exit_list),
+ #endif
+ #ifdef CONFIG_TASKS_TRACE_RCU
+ 	.trc_reader_nesting = 0,
+diff --git a/kernel/bpf/bpf_struct_ops_types.h b/kernel/bpf/bpf_struct_ops_types.h
+index 5678a9ddf..3618769d8 100644
+--- a/kernel/bpf/bpf_struct_ops_types.h
++++ b/kernel/bpf/bpf_struct_ops_types.h
+@@ -9,4 +9,8 @@ BPF_STRUCT_OPS_TYPE(bpf_dummy_ops)
+ #include <net/tcp.h>
+ BPF_STRUCT_OPS_TYPE(tcp_congestion_ops)
+ #endif
++#ifdef CONFIG_SCHED_CLASS_EXT
++#include <linux/sched/ext.h>
++BPF_STRUCT_OPS_TYPE(sched_ext_ops)
++#endif
+ #endif
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 23efaa2c4..055e60561 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -23,6 +23,7 @@
+ #include <linux/sched/task.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/sched/cputime.h>
++#include <linux/sched/ext.h>
+ #include <linux/seq_file.h>
+ #include <linux/rtmutex.h>
+ #include <linux/init.h>
+@@ -971,6 +972,7 @@ void __put_task_struct(struct task_struct *tsk)
+ 	WARN_ON(refcount_read(&tsk->usage));
+ 	WARN_ON(tsk == current);
+ 
++	sched_ext_free(tsk);
+ 	io_uring_free(tsk);
+ 	cgroup_free(tsk);
+ 	task_numa_free(tsk, true);
+@@ -1974,7 +1976,6 @@ static inline void rcu_copy_process(struct task_struct *p)
+ 	p->rcu_tasks_holdout = false;
+ 	INIT_LIST_HEAD(&p->rcu_tasks_holdout_list);
+ 	p->rcu_tasks_idle_cpu = -1;
+-	INIT_LIST_HEAD(&p->rcu_tasks_exit_list);
+ #endif /* #ifdef CONFIG_TASKS_RCU */
+ #ifdef CONFIG_TASKS_TRACE_RCU
+ 	p->trc_reader_nesting = 0;
+@@ -2474,7 +2475,7 @@ __latent_entropy struct task_struct *copy_process(
+ 
+ 	retval = perf_event_init_task(p, clone_flags);
+ 	if (retval)
+-		goto bad_fork_cleanup_policy;
++		goto bad_fork_sched_cancel_fork;
+ 	retval = audit_alloc(p);
+ 	if (retval)
+ 		goto bad_fork_cleanup_perf;
+@@ -2606,7 +2607,9 @@ __latent_entropy struct task_struct *copy_process(
+ 	 * cgroup specific, it unconditionally needs to place the task on a
+ 	 * runqueue.
+ 	 */
+-	sched_cgroup_fork(p, args);
++	retval = sched_cgroup_fork(p, args);
++	if (retval)
++		goto bad_fork_cancel_cgroup;
+ 
+ 	/*
+ 	 * From this point on we must avoid any synchronous user-space
+@@ -2652,13 +2655,13 @@ __latent_entropy struct task_struct *copy_process(
+ 	/* Don't start children in a dying pid namespace */
+ 	if (unlikely(!(ns_of_pid(pid)->pid_allocated & PIDNS_ADDING))) {
+ 		retval = -ENOMEM;
+-		goto bad_fork_cancel_cgroup;
++		goto bad_fork_core_free;
+ 	}
+ 
+ 	/* Let kill terminate clone/fork in the middle */
+ 	if (fatal_signal_pending(current)) {
+ 		retval = -EINTR;
+-		goto bad_fork_cancel_cgroup;
++		goto bad_fork_core_free;
+ 	}
+ 
+ 	/* No more failure paths after this point. */
+@@ -2734,10 +2737,11 @@ __latent_entropy struct task_struct *copy_process(
+ 
+ 	return p;
+ 
+-bad_fork_cancel_cgroup:
++bad_fork_core_free:
+ 	sched_core_free(p);
+ 	spin_unlock(&current->sighand->siglock);
+ 	write_unlock_irq(&tasklist_lock);
++bad_fork_cancel_cgroup:
+ 	cgroup_cancel_fork(p, args);
+ bad_fork_put_pidfd:
+ 	if (clone_flags & CLONE_PIDFD) {
+@@ -2776,6 +2780,8 @@ __latent_entropy struct task_struct *copy_process(
+ 	audit_free(p);
+ bad_fork_cleanup_perf:
+ 	perf_event_free_task(p);
++bad_fork_sched_cancel_fork:
++	sched_cancel_fork(p);
+ bad_fork_cleanup_policy:
+ 	lockdep_free_task(p);
+ #ifdef CONFIG_NUMA
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index dffde9121..773209068 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -84,6 +84,7 @@
+ #undef CREATE_TRACE_POINTS
+ 
+ #include "sched.h"
++#include "ext.h"
+ #include "stats.h"
+ #include "autogroup.h"
+ 
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 8b5ae9535..7ea7f9ce9 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -11,7 +11,7 @@
+ enum scx_internal_consts {
+ 	SCX_NR_ONLINE_OPS	= SCX_OP_IDX(init),
+ 	SCX_DSP_DFL_MAX_BATCH	= 32,
+-	SCX_DSP_MAX_LOOPS	= 32,
++	SCX_DSP_MAX_LOOPS	= 1024,
+ 	SCX_WATCHDOG_MAX_TIMEOUT = 30 * HZ,
+ };
+ 
+diff --git a/kernel/sched/ext.h b/kernel/sched/ext.h
+new file mode 100644
+index 000000000..a71ffa8f4
+--- /dev/null
++++ b/kernel/sched/ext.h
+@@ -0,0 +1,269 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __KERNEL_SCHED_EXT_H
++#define __KERNEL_SCHED_EXT_H
++/*
++ * BPF extensible scheduler class: Documentation/scheduler/sched-ext.rst
++ *
++ * Copyright (c) 2022 Meta Platforms, Inc. and affiliates.
++ * Copyright (c) 2022 Tejun Heo <tj@kernel.org>
++ * Copyright (c) 2022 David Vernet <dvernet@meta.com>
++ */
++enum scx_wake_flags {
++	/* expose select WF_* flags as enums */
++	SCX_WAKE_EXEC		= WF_EXEC,
++	SCX_WAKE_FORK		= WF_FORK,
++	SCX_WAKE_TTWU		= WF_TTWU,
++	SCX_WAKE_SYNC		= WF_SYNC,
++};
++
++enum scx_enq_flags {
++	/* expose select ENQUEUE_* flags as enums */
++	SCX_ENQ_WAKEUP		= ENQUEUE_WAKEUP,
++	SCX_ENQ_HEAD		= ENQUEUE_HEAD,
++
++	/* high 32bits are SCX specific */
++
++	/*
++	 * Set the following to trigger preemption when calling
++	 * scx_bpf_dispatch() with a local dsq as the target. The slice of the
++	 * current task is cleared to zero and the CPU is kicked into the
++	 * scheduling path. Implies %SCX_ENQ_HEAD.
++	 */
++	SCX_ENQ_PREEMPT		= 1LLU << 32,
++
++	/*
++	 * The task being enqueued was previously enqueued on the current CPU's
++	 * %SCX_DSQ_LOCAL, but was removed from it in a call to the
++	 * bpf_scx_reenqueue_local() kfunc. If bpf_scx_reenqueue_local() was
++	 * invoked in a ->cpu_release() callback, and the task is again
++	 * dispatched back to %SCX_LOCAL_DSQ by this current ->enqueue(), the
++	 * task will not be scheduled on the CPU until at least the next invocation
++	 * of the ->cpu_acquire() callback.
++	 */
++	SCX_ENQ_REENQ		= 1LLU << 40,
++
++	/*
++	 * The task being enqueued is the only task available for the cpu. By
++	 * default, ext core keeps executing such tasks but when
++	 * %SCX_OPS_ENQ_LAST is specified, they're ops.enqueue()'d with
++	 * %SCX_ENQ_LAST and %SCX_ENQ_LOCAL flags set.
++	 *
++	 * If the BPF scheduler wants to continue executing the task,
++	 * ops.enqueue() should dispatch the task to %SCX_DSQ_LOCAL immediately.
++	 * If the task gets queued on a different dsq or the BPF side, the BPF
++	 * scheduler is responsible for triggering a follow-up scheduling event.
++	 * Otherwise, Execution may stall.
++	 */
++	SCX_ENQ_LAST		= 1LLU << 41,
++
++	/*
++	 * A hint indicating that it's advisable to enqueue the task on the
++	 * local dsq of the currently selected CPU. Currently used by
++	 * select_cpu_dfl() and together with %SCX_ENQ_LAST.
++	 */
++	SCX_ENQ_LOCAL		= 1LLU << 42,
++
++	/* high 8 bits are internal */
++	__SCX_ENQ_INTERNAL_MASK	= 0xffLLU << 56,
++
++	SCX_ENQ_CLEAR_OPSS	= 1LLU << 56,
++	SCX_ENQ_DSQ_PRIQ	= 1LLU << 57,
++};
++
++enum scx_deq_flags {
++	/* expose select DEQUEUE_* flags as enums */
++	SCX_DEQ_SLEEP		= DEQUEUE_SLEEP,
++
++	/* high 32bits are SCX specific */
++
++	/*
++	 * The generic core-sched layer decided to execute the task even though
++	 * it hasn't been dispatched yet. Dequeue from the BPF side.
++	 */
++	SCX_DEQ_CORE_SCHED_EXEC	= 1LLU << 32,
++};
++
++enum scx_pick_idle_cpu_flags {
++	SCX_PICK_IDLE_CORE	= 1LLU << 0,	/* pick a CPU whose SMT siblings are also idle */
++};
++
++enum scx_kick_flags {
++	SCX_KICK_PREEMPT	= 1LLU << 0,	/* force scheduling on the CPU */
++	SCX_KICK_WAIT		= 1LLU << 1,	/* wait for the CPU to be rescheduled */
++};
++
++enum scx_tg_flags {
++	SCX_TG_ONLINE		= 1U << 0,
++	SCX_TG_INITED		= 1U << 1,
++};
++
++#ifdef CONFIG_SCHED_CLASS_EXT
++
++struct sched_enq_and_set_ctx {
++	struct task_struct	*p;
++	int			queue_flags;
++	bool			queued;
++	bool			running;
++};
++
++void sched_deq_and_put_task(struct task_struct *p, int queue_flags,
++			    struct sched_enq_and_set_ctx *ctx);
++void sched_enq_and_set_task(struct sched_enq_and_set_ctx *ctx);
++
++extern const struct sched_class ext_sched_class;
++extern const struct bpf_verifier_ops bpf_sched_ext_verifier_ops;
++extern const struct file_operations sched_ext_fops;
++extern unsigned long scx_watchdog_timeout;
++extern unsigned long scx_watchdog_timestamp;
++
++DECLARE_STATIC_KEY_FALSE(__scx_ops_enabled);
++DECLARE_STATIC_KEY_FALSE(__scx_switched_all);
++#define scx_enabled()		static_branch_unlikely(&__scx_ops_enabled)
++#define scx_switched_all()	static_branch_unlikely(&__scx_switched_all)
++
++DECLARE_STATIC_KEY_FALSE(scx_ops_cpu_preempt);
++
++static inline bool task_on_scx(const struct task_struct *p)
++{
++	return scx_enabled() && p->sched_class == &ext_sched_class;
++}
++
++bool task_should_scx(struct task_struct *p);
++void scx_pre_fork(struct task_struct *p);
++int scx_fork(struct task_struct *p);
++void scx_post_fork(struct task_struct *p);
++void scx_cancel_fork(struct task_struct *p);
++int scx_check_setscheduler(struct task_struct *p, int policy);
++bool scx_can_stop_tick(struct rq *rq);
++void init_sched_ext_class(void);
++
++__printf(2, 3) void scx_ops_error_kind(enum scx_exit_kind kind,
++				       const char *fmt, ...);
++#define scx_ops_error(fmt, args...)						\
++	scx_ops_error_kind(SCX_EXIT_ERROR, fmt, ##args)
++
++void __scx_notify_pick_next_task(struct rq *rq,
++				 struct task_struct *p,
++				 const struct sched_class *active);
++
++static inline void scx_notify_pick_next_task(struct rq *rq,
++					     struct task_struct *p,
++					     const struct sched_class *active)
++{
++	if (!scx_enabled())
++		return;
++#ifdef CONFIG_SMP
++	/*
++	 * Pairs with the smp_load_acquire() issued by a CPU in
++	 * kick_cpus_irq_workfn() who is waiting for this CPU to perform a
++	 * resched.
++	 */
++	smp_store_release(&rq->scx.pnt_seq, rq->scx.pnt_seq + 1);
++#endif
++	if (!static_branch_unlikely(&scx_ops_cpu_preempt))
++		return;
++	__scx_notify_pick_next_task(rq, p, active);
++}
++
++static inline void scx_notify_sched_tick(void)
++{
++	unsigned long last_check;
++
++	if (!scx_enabled())
++		return;
++
++	last_check = scx_watchdog_timestamp;
++	if (unlikely(time_after(jiffies, last_check + scx_watchdog_timeout))) {
++		u32 dur_ms = jiffies_to_msecs(jiffies - last_check);
++
++		scx_ops_error_kind(SCX_EXIT_ERROR_STALL,
++				   "watchdog failed to check in for %u.%03us",
++				   dur_ms / 1000, dur_ms % 1000);
++	}
++}
++
++static inline const struct sched_class *next_active_class(const struct sched_class *class)
++{
++	class++;
++	if (scx_switched_all() && class == &fair_sched_class)
++		class++;
++	if (!scx_enabled() && class == &ext_sched_class)
++		class++;
++	return class;
++}
++
++#define for_active_class_range(class, _from, _to)				\
++	for (class = (_from); class != (_to); class = next_active_class(class))
++
++#define for_each_active_class(class)						\
++	for_active_class_range(class, __sched_class_highest, __sched_class_lowest)
++
++/*
++ * SCX requires a balance() call before every pick_next_task() call including
++ * when waking up from idle.
++ */
++#define for_balance_class_range(class, prev_class, end_class)			\
++	for_active_class_range(class, (prev_class) > &ext_sched_class ?		\
++			       &ext_sched_class : (prev_class), (end_class))
++
++#ifdef CONFIG_SCHED_CORE
++bool scx_prio_less(const struct task_struct *a, const struct task_struct *b,
++		   bool in_fi);
++#endif
++
++#else	/* CONFIG_SCHED_CLASS_EXT */
++
++#define scx_enabled()		false
++#define scx_switched_all()	false
++
++static inline bool task_on_scx(const struct task_struct *p) { return false; }
++static inline void scx_pre_fork(struct task_struct *p) {}
++static inline int scx_fork(struct task_struct *p) { return 0; }
++static inline void scx_post_fork(struct task_struct *p) {}
++static inline void scx_cancel_fork(struct task_struct *p) {}
++static inline int scx_check_setscheduler(struct task_struct *p,
++					 int policy) { return 0; }
++static inline bool scx_can_stop_tick(struct rq *rq) { return true; }
++static inline void init_sched_ext_class(void) {}
++static inline void scx_notify_pick_next_task(struct rq *rq,
++					     const struct task_struct *p,
++					     const struct sched_class *active) {}
++static inline void scx_notify_sched_tick(void) {}
++
++#define for_each_active_class		for_each_class
++#define for_balance_class_range		for_class_range
++
++#endif	/* CONFIG_SCHED_CLASS_EXT */
++
++#if defined(CONFIG_SCHED_CLASS_EXT) && defined(CONFIG_SMP)
++void __scx_update_idle(struct rq *rq, bool idle);
++
++static inline void scx_update_idle(struct rq *rq, bool idle)
++{
++	if (scx_enabled())
++		__scx_update_idle(rq, idle);
++}
++#else
++static inline void scx_update_idle(struct rq *rq, bool idle) {}
++#endif
++
++#ifdef CONFIG_CGROUP_SCHED
++#ifdef CONFIG_EXT_GROUP_SCHED
++int scx_tg_online(struct task_group *tg);
++void scx_tg_offline(struct task_group *tg);
++int scx_cgroup_can_attach(struct cgroup_taskset *tset);
++void scx_move_task(struct task_struct *p);
++void scx_cgroup_finish_attach(void);
++void scx_cgroup_cancel_attach(struct cgroup_taskset *tset);
++void scx_group_set_weight(struct task_group *tg, unsigned long cgrp_weight);
++#else	/* CONFIG_EXT_GROUP_SCHED */
++static inline int scx_tg_online(struct task_group *tg) { return 0; }
++static inline void scx_tg_offline(struct task_group *tg) {}
++static inline int scx_cgroup_can_attach(struct cgroup_taskset *tset) { return 0; }
++static inline void scx_move_task(struct task_struct *p) {}
++static inline void scx_cgroup_finish_attach(void) {}
++static inline void scx_cgroup_cancel_attach(struct cgroup_taskset *tset) {}
++static inline void scx_group_set_weight(struct task_group *tg, unsigned long cgrp_weight) {}
++#endif	/* CONFIG_EXT_GROUP_SCHED */
++#endif	/* CONFIG_CGROUP_SCHED */
++#endif /* __KERNEL_SCHED_EXT_H */
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 4ac36eb4c..452fe2b08 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -2485,7 +2485,7 @@ static void task_woken_rt(struct rq *rq, struct task_struct *p)
+ }
+ 
+ /* Assumes rq->lock is held */
+-static void rq_online_rt(struct rq *rq)
++static void rq_online_rt(struct rq *rq, enum rq_onoff_reason reason)
+ {
+ 	if (rq->rt.overloaded)
+ 		rt_set_overload(rq);
+@@ -2496,7 +2496,7 @@ static void rq_online_rt(struct rq *rq)
+ }
+ 
+ /* Assumes rq->lock is held */
+-static void rq_offline_rt(struct rq *rq)
++static void rq_offline_rt(struct rq *rq, enum rq_onoff_reason reason)
+ {
+ 	if (rq->rt.overloaded)
+ 		rt_clear_overload(rq);
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 8cbbbea7f..fa44e8a88 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -88,8 +88,6 @@
+ # include <asm/paravirt_api_clock.h>
+ #endif
+ 
+-#include <asm/barrier.h>
+-
+ #include "cpupri.h"
+ #include "cpudeadline.h"
+ 
+@@ -184,9 +182,19 @@ static inline int idle_policy(int policy)
+ {
+ 	return policy == SCHED_IDLE;
+ }
++
++static inline int normal_policy(int policy)
++{
++#ifdef CONFIG_SCHED_CLASS_EXT
++	if (policy == SCHED_EXT)
++		return true;
++#endif
++	return policy == SCHED_NORMAL;
++}
++
+ static inline int fair_policy(int policy)
+ {
+-	return policy == SCHED_NORMAL || policy == SCHED_BATCH;
++	return normal_policy(policy) || policy == SCHED_BATCH;
+ }
+ 
+ static inline int rt_policy(int policy)
+@@ -234,6 +242,24 @@ static inline void update_avg(u64 *avg, u64 sample)
+ #define shr_bound(val, shift)							\
+ 	(val >> min_t(typeof(shift), shift, BITS_PER_TYPE(typeof(val)) - 1))
+ 
++/*
++ * cgroup weight knobs should use the common MIN, DFL and MAX values which are
++ * 1, 100 and 10000 respectively. While it loses a bit of range on both ends, it
++ * maps pretty well onto the shares value used by scheduler and the round-trip
++ * conversions preserve the original value over the entire range.
++ */
++static inline unsigned long sched_weight_from_cgroup(unsigned long cgrp_weight)
++{
++	return DIV_ROUND_CLOSEST_ULL(cgrp_weight * 1024, CGROUP_WEIGHT_DFL);
++}
++
++static inline unsigned long sched_weight_to_cgroup(unsigned long weight)
++{
++	return clamp_t(unsigned long,
++		       DIV_ROUND_CLOSEST_ULL(weight * CGROUP_WEIGHT_DFL, 1024),
++		       CGROUP_WEIGHT_MIN, CGROUP_WEIGHT_MAX);
++}
++
+ /*
+  * !! For sched_setattr_nocheck() (kernel) only !!
+  *
+@@ -392,6 +418,11 @@ struct task_group {
+ 	struct rt_bandwidth	rt_bandwidth;
+ #endif
+ 
++#ifdef CONFIG_EXT_GROUP_SCHED
++	u32			scx_flags;	/* SCX_TG_* */
++	u32			scx_weight;
++#endif
++
+ 	struct rcu_head		rcu;
+ 	struct list_head	list;
+ 
+@@ -447,6 +478,11 @@ static inline int walk_tg_tree(tg_visitor down, tg_visitor up, void *data)
+ 	return walk_tg_tree_from(&root_task_group, down, up, data);
+ }
+ 
++static inline struct task_group *css_tg(struct cgroup_subsys_state *css)
++{
++	return css ? container_of(css, struct task_group, css) : NULL;
++}
++
+ extern int tg_nop(struct task_group *tg, void *data);
+ 
+ extern void free_fair_sched_group(struct task_group *tg);
+@@ -492,6 +528,11 @@ extern void set_task_rq_fair(struct sched_entity *se,
+ static inline void set_task_rq_fair(struct sched_entity *se,
+ 			     struct cfs_rq *prev, struct cfs_rq *next) { }
+ #endif /* CONFIG_SMP */
++#else /* CONFIG_FAIR_GROUP_SCHED */
++static inline int sched_group_set_shares(struct task_group *tg, unsigned long shares)
++{
++	return 0;
++}
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ 
+ #else /* CONFIG_CGROUP_SCHED */
+@@ -653,6 +694,28 @@ struct cfs_rq {
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ };
+ 
++#ifdef CONFIG_SCHED_CLASS_EXT
++/* scx_rq->flags, protected by the rq lock */
++enum scx_rq_flags {
++	SCX_RQ_CAN_STOP_TICK	= 1 << 0,
++};
++
++struct scx_rq {
++	struct scx_dispatch_q	local_dsq;
++	struct list_head	watchdog_list;
++	unsigned long		ops_qseq;
++	u64			extra_enq_flags;	/* see move_task_to_local_dsq() */
++	u32			nr_running;
++	u32			flags;
++	bool			cpu_released;
++	cpumask_var_t		cpus_to_kick;
++	cpumask_var_t		cpus_to_preempt;
++	cpumask_var_t		cpus_to_wait;
++	unsigned long		pnt_seq;
++	struct irq_work		kick_cpus_irq_work;
++};
++#endif /* CONFIG_SCHED_CLASS_EXT */
++
+ static inline int rt_bandwidth_enabled(void)
+ {
+ 	return sysctl_sched_rt_runtime >= 0;
+@@ -1000,6 +1063,9 @@ struct rq {
+ 	struct cfs_rq		cfs;
+ 	struct rt_rq		rt;
+ 	struct dl_rq		dl;
++#ifdef CONFIG_SCHED_CLASS_EXT
++	struct scx_rq		scx;
++#endif
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/* list of leaf cfs_rq on this CPU: */
+@@ -1094,7 +1160,6 @@ struct rq {
+ 
+ #ifdef CONFIG_IRQ_TIME_ACCOUNTING
+ 	u64			prev_irq_time;
+-	u64			psi_irq_time;
+ #endif
+ #ifdef CONFIG_PARAVIRT
+ 	u64			prev_steal_time;
+@@ -2225,6 +2290,11 @@ extern const u32		sched_prio_to_wmult[40];
+ 
+ #define RETRY_TASK		((void *)-1UL)
+ 
++enum rq_onoff_reason {
++	RQ_ONOFF_HOTPLUG,		/* CPU is going on/offline */
++	RQ_ONOFF_TOPOLOGY,		/* sched domain topology update */
++};
++
+ struct affinity_context {
+ 	const struct cpumask *new_mask;
+ 	struct cpumask *user_mask;
+@@ -2261,8 +2331,8 @@ struct sched_class {
+ 
+ 	void (*set_cpus_allowed)(struct task_struct *p, struct affinity_context *ctx);
+ 
+-	void (*rq_online)(struct rq *rq);
+-	void (*rq_offline)(struct rq *rq);
++	void (*rq_online)(struct rq *rq, enum rq_onoff_reason reason);
++	void (*rq_offline)(struct rq *rq, enum rq_onoff_reason reason);
+ 
+ 	struct rq *(*find_lock_rq)(struct task_struct *p, struct rq *rq);
+ #endif
+@@ -2276,8 +2346,11 @@ struct sched_class {
+ 	 * cannot assume the switched_from/switched_to pair is serialized by
+ 	 * rq->lock. They are however serialized by p->pi_lock.
+ 	 */
++	void (*switching_to)(struct rq *this_rq, struct task_struct *task);
+ 	void (*switched_from)(struct rq *this_rq, struct task_struct *task);
+ 	void (*switched_to)  (struct rq *this_rq, struct task_struct *task);
++	void (*reweight_task)(struct rq *this_rq, struct task_struct *task,
++			      int newprio);
+ 	void (*prio_changed) (struct rq *this_rq, struct task_struct *task,
+ 			      int oldprio);
+ 
+@@ -2435,7 +2508,7 @@ extern void init_sched_dl_class(void);
+ extern void init_sched_rt_class(void);
+ extern void init_sched_fair_class(void);
+ 
+-extern void reweight_task(struct task_struct *p, const struct load_weight *lw);
++extern void __setscheduler_prio(struct task_struct *p, int prio);
+ 
+ extern void resched_curr(struct rq *rq);
+ extern void resched_cpu(int cpu);
+@@ -2516,6 +2589,12 @@ static inline void sub_nr_running(struct rq *rq, unsigned count)
+ extern void activate_task(struct rq *rq, struct task_struct *p, int flags);
+ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
+ 
++extern void check_class_changing(struct rq *rq, struct task_struct *p,
++				 const struct sched_class *prev_class);
++extern void check_class_changed(struct rq *rq, struct task_struct *p,
++				const struct sched_class *prev_class,
++				int oldprio);
++
+ extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
+ 
+ #ifdef CONFIG_PREEMPT_RT
+@@ -2797,8 +2876,8 @@ static inline void double_rq_unlock(struct rq *rq1, struct rq *rq2)
+ 	raw_spin_rq_unlock(rq1);
+ }
+ 
+-extern void set_rq_online (struct rq *rq);
+-extern void set_rq_offline(struct rq *rq);
++extern void set_rq_online(struct rq *rq, enum rq_onoff_reason reason);
++extern void set_rq_offline(struct rq *rq, enum rq_onoff_reason reason);
+ extern bool sched_smp_initialized;
+ 
+ #else /* CONFIG_SMP */
+@@ -3503,19 +3582,13 @@ static inline void switch_mm_cid(struct rq *rq,
+ 		 * between rq->curr store and load of {prev,next}->mm->pcpu_cid[cpu].
+ 		 * Provide it here.
+ 		 */
+-		if (!prev->mm) {                        // from kernel
++		if (!prev->mm)                          // from kernel
+ 			smp_mb();
+-		} else {				// from user
+-			/*
+-			 * user->user transition relies on an implicit
+-			 * memory barrier in switch_mm() when
+-			 * current->mm changes. If the architecture
+-			 * switch_mm() does not have an implicit memory
+-			 * barrier, it is emitted here.  If current->mm
+-			 * is unchanged, no barrier is needed.
+-			 */
+-			smp_mb__after_switch_mm();
+-		}
++		/*
++		 * user -> user transition guarantees a memory barrier through
++		 * switch_mm() when current->mm changes. If current->mm is
++		 * unchanged, no barrier is needed.
++		 */
+ 	}
+ 	if (prev->mm_cid_active) {
+ 		mm_cid_snapshot_time(rq, prev->mm);
+@@ -3537,4 +3610,27 @@ static inline void init_sched_mm_cid(struct task_struct *t) { }
+ extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
+ extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
+ 
++#ifdef CONFIG_CGROUP_SCHED
++enum cpu_cftype_id {
++#if defined(CONFIG_FAIR_GROUP_SCHED) || defined(CONFIG_EXT_GROUP_SCHED)
++	CPU_CFTYPE_WEIGHT,
++	CPU_CFTYPE_WEIGHT_NICE,
++	CPU_CFTYPE_IDLE,
++#endif
++#ifdef CONFIG_CFS_BANDWIDTH
++	CPU_CFTYPE_MAX,
++	CPU_CFTYPE_MAX_BURST,
++#endif
++#ifdef CONFIG_UCLAMP_TASK_GROUP
++	CPU_CFTYPE_UCLAMP_MIN,
++	CPU_CFTYPE_UCLAMP_MAX,
++#endif
++	CPU_CFTYPE_CNT,
++};
++
++extern struct cftype cpu_cftypes[CPU_CFTYPE_CNT + 1];
++#endif /* CONFIG_CGROUP_SCHED */
++
++#include "ext.h"
++
+ #endif /* _KERNEL_SCHED_SCHED_H */
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 3a13cecf1..c806cf6ea 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -495,7 +495,7 @@ void rq_attach_root(struct rq *rq, struct root_domain *rd)
+ 		old_rd = rq->rd;
+ 
+ 		if (cpumask_test_cpu(rq->cpu, old_rd->online))
+-			set_rq_offline(rq);
++			set_rq_offline(rq, RQ_ONOFF_HOTPLUG);
+ 
+ 		cpumask_clear_cpu(rq->cpu, old_rd->span);
+ 
+@@ -513,7 +513,7 @@ void rq_attach_root(struct rq *rq, struct root_domain *rd)
+ 
+ 	cpumask_set_cpu(rq->cpu, rd->span);
+ 	if (cpumask_test_cpu(rq->cpu, cpu_active_mask))
+-		set_rq_online(rq);
++		set_rq_online(rq, RQ_ONOFF_HOTPLUG);
+ 
+ 	rq_unlock_irqrestore(rq, &rf);
+ 
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index ceed16a10..14e38e8b3 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -11229,7 +11229,8 @@ static int resolve_full_path(const char *file, char *result, size_t result_sz)
+ 		if (!search_paths[i])
+ 			continue;
+ 		for (s = search_paths[i]; s != NULL; s = strchr(s, ':')) {
+-			char *next_path;
++
++			const char *next_path;
+ 			int seg_len;
+ 
+ 			if (s[0] == ':')
+diff --git a/tools/testing/selftests/riscv/vector/Makefile b/tools/testing/selftests/riscv/vector/Makefile
+index bfff0ff4f..0e2e94985 100644
+--- a/tools/testing/selftests/riscv/vector/Makefile
++++ b/tools/testing/selftests/riscv/vector/Makefile
+@@ -2,7 +2,7 @@
+ # Copyright (C) 2021 ARM Limited
+ # Originally tools/testing/arm64/abi/Makefile
+ 
+-TEST_GEN_PROGS := vstate_prctl v_initval_nolibc
++TEST_GEN_PROGS := vstate_prctl v_initval_nolibc v_owner_context
+ TEST_GEN_PROGS_EXTENDED := vstate_exec_nolibc
+ 
+ include ../../lib.mk
+@@ -17,3 +17,6 @@ $(OUTPUT)/vstate_exec_nolibc: vstate_exec_nolibc.c
+ $(OUTPUT)/v_initval_nolibc: v_initval_nolibc.c
+ 	$(CC) -nostdlib -static -include ../../../../include/nolibc/nolibc.h \
+ 		-Wall $(CFLAGS) $(LDFLAGS) $^ -o $@ -lgcc
++
++$(OUTPUT)/v_owner_context: v_owner_context.c
++	$(CC) -static -pthread -Wall $(CFLAGS) $(LDFLAGS) $^ -o $@
+diff --git a/tools/testing/selftests/riscv/vector/v_owner_context.c b/tools/testing/selftests/riscv/vector/v_owner_context.c
+new file mode 100644
+index 000000000..e3ab7cac4
+--- /dev/null
++++ b/tools/testing/selftests/riscv/vector/v_owner_context.c
+@@ -0,0 +1,326 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <sched.h>
++#include <signal.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "../../kselftest.h"
++
++#define VECTOR_ROUNDS 32
++#define BUSY_LOOPS 20000000UL
++#define MIGRATION_LOOPS 200000000UL
++
++struct vector_worker_args {
++	int cpu;
++	uint8_t seed;
++	unsigned int rounds;
++	unsigned long loops;
++	pthread_barrier_t *barrier;
++	atomic_int *failures;
++};
++
++struct noise_worker_args {
++	int cpu;
++	pthread_barrier_t *barrier;
++	atomic_bool *stop;
++	atomic_int *failures;
++};
++
++static volatile sig_atomic_t signal_seen;
++
++static int pin_current_thread(int cpu)
++{
++	cpu_set_t set;
++
++	CPU_ZERO(&set);
++	CPU_SET(cpu, &set);
++	return pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
++}
++
++static size_t vector_state_size(void)
++{
++	unsigned long vlenb;
++
++	asm volatile (
++		".option push\n\t"
++		".option arch, +v\n\t"
++		"csrr %0, vlenb\n\t"
++		".option pop\n\t"
++		: "=r" (vlenb));
++	return vlenb * 32;
++}
++
++static bool vector_busy_roundtrip(const uint8_t *input, uint8_t *output,
++				  unsigned long loops)
++{
++	unsigned long expected_vl, expected_vtype;
++	unsigned long actual_vl, actual_vtype, actual_vstart, actual_vcsr;
++	unsigned long avl;
++	unsigned long vl;
++	const uint8_t *src_tmp;
++	uint8_t *dst_tmp;
++
++	asm volatile (
++		".option push\n\t"
++		".option arch, +v\n\t"
++		"vsetvli %[vl], x0, e8, m8, ta, ma\n\t"
++		"mv %[src_tmp], %[input]\n\t"
++		"vle8.v v0, (%[src_tmp])\n\t"
++		"add %[src_tmp], %[src_tmp], %[vl]\n\t"
++		"vle8.v v8, (%[src_tmp])\n\t"
++		"add %[src_tmp], %[src_tmp], %[vl]\n\t"
++		"vle8.v v16, (%[src_tmp])\n\t"
++		"add %[src_tmp], %[src_tmp], %[vl]\n\t"
++		"vle8.v v24, (%[src_tmp])\n\t"
++		"li %[avl], 7\n\t"
++		"vsetvli %[expected_vl], %[avl], e16, m4, tu, mu\n\t"
++		"csrr %[expected_vtype], vtype\n\t"
++		"csrwi vcsr, 3\n\t"
++		"csrwi vstart, 2\n\t"
++		"1:\n\t"
++		"addi %[loops], %[loops], -1\n\t"
++		"bnez %[loops], 1b\n\t"
++		"csrr %[actual_vl], vl\n\t"
++		"csrr %[actual_vtype], vtype\n\t"
++		"csrr %[actual_vstart], vstart\n\t"
++		"csrr %[actual_vcsr], vcsr\n\t"
++		"vsetvli %[vl], x0, e8, m8, ta, ma\n\t"
++		"mv %[dst_tmp], %[output]\n\t"
++		"vse8.v v0, (%[dst_tmp])\n\t"
++		"add %[dst_tmp], %[dst_tmp], %[vl]\n\t"
++		"vse8.v v8, (%[dst_tmp])\n\t"
++		"add %[dst_tmp], %[dst_tmp], %[vl]\n\t"
++		"vse8.v v16, (%[dst_tmp])\n\t"
++		"add %[dst_tmp], %[dst_tmp], %[vl]\n\t"
++		"vse8.v v24, (%[dst_tmp])\n\t"
++		".option pop\n\t"
++		: [vl] "=&r" (vl), [src_tmp] "=&r" (src_tmp),
++		  [dst_tmp] "=&r" (dst_tmp), [avl] "=&r" (avl),
++		  [expected_vl] "=&r" (expected_vl),
++		  [expected_vtype] "=&r" (expected_vtype),
++		  [actual_vl] "=&r" (actual_vl),
++		  [actual_vtype] "=&r" (actual_vtype),
++		  [actual_vstart] "=&r" (actual_vstart),
++		  [actual_vcsr] "=&r" (actual_vcsr), [loops] "+r" (loops)
++		: [input] "r" (input), [output] "r" (output)
++		: "memory");
++
++	return actual_vl == expected_vl &&
++	       actual_vtype == expected_vtype && actual_vstart == 2 &&
++	       actual_vcsr == 3;
++}
++
++static void fill_pattern(uint8_t *buffer, size_t size, uint8_t seed,
++			 unsigned int round)
++{
++	size_t i;
++
++	for (i = 0; i < size; i++)
++		buffer[i] = seed ^ (uint8_t)i ^ (uint8_t)(round * 17);
++}
++
++static void *vector_worker(void *opaque)
++{
++	struct vector_worker_args *args = opaque;
++	uint8_t *input = NULL;
++	uint8_t *output = NULL;
++	size_t size = vector_state_size();
++	unsigned int round;
++	bool ready = true;
++
++	if (pin_current_thread(args->cpu)) {
++		atomic_fetch_add(args->failures, 1);
++		ready = false;
++	}
++	if (ready && (posix_memalign((void **)&input, 64, size) ||
++	    posix_memalign((void **)&output, 64, size))) {
++		atomic_fetch_add(args->failures, 1);
++		ready = false;
++	}
++
++	pthread_barrier_wait(args->barrier);
++	if (!ready)
++		goto out;
++	for (round = 0; round < args->rounds; round++) {
++		fill_pattern(input, size, args->seed, round);
++		memset(output, 0, size);
++		if (!vector_busy_roundtrip(input, output, args->loops) ||
++		    memcmp(input, output, size)) {
++			atomic_fetch_add(args->failures, 1);
++			break;
++		}
++	}
++
++out:
++	free(output);
++	free(input);
++	return NULL;
++}
++
++static void *usercopy_noise_worker(void *opaque)
++{
++	struct noise_worker_args *args = opaque;
++	uint8_t buffer[4096];
++	int fd = -1;
++	bool ready = true;
++
++	if (pin_current_thread(args->cpu))
++		ready = false;
++	if (ready) {
++		fd = open("/dev/zero", O_RDONLY);
++		if (fd < 0)
++			ready = false;
++	}
++	if (!ready)
++		atomic_fetch_add(args->failures, 1);
++
++	pthread_barrier_wait(args->barrier);
++	if (!ready)
++		return NULL;
++	while (!atomic_load_explicit(args->stop, memory_order_relaxed)) {
++		if (read(fd, buffer, sizeof(buffer)) != (ssize_t)sizeof(buffer))
++			break;
++	}
++	close(fd);
++	return NULL;
++}
++
++static bool run_nonvector_noise_test(void)
++{
++	pthread_barrier_t barrier;
++	atomic_int failures = 0;
++	atomic_bool stop = false;
++	struct vector_worker_args vector_args = {
++		.cpu = 0,
++		.seed = 0x31,
++		.rounds = VECTOR_ROUNDS,
++		.loops = BUSY_LOOPS,
++		.barrier = &barrier,
++		.failures = &failures,
++	};
++	struct noise_worker_args noise_args = {
++		.cpu = 0,
++		.barrier = &barrier,
++		.stop = &stop,
++		.failures = &failures,
++	};
++	pthread_t vector_thread;
++	pthread_t noise_thread;
++
++	pthread_barrier_init(&barrier, NULL, 2);
++	if (pthread_create(&vector_thread, NULL, vector_worker, &vector_args) ||
++	    pthread_create(&noise_thread, NULL, usercopy_noise_worker, &noise_args))
++		return false;
++	pthread_join(vector_thread, NULL);
++	atomic_store(&stop, true);
++	pthread_join(noise_thread, NULL);
++	pthread_barrier_destroy(&barrier);
++	return atomic_load(&failures) == 0;
++}
++
++static bool run_two_vector_test(void)
++{
++	pthread_barrier_t barrier;
++	atomic_int failures = 0;
++	struct vector_worker_args args[2] = {
++		{
++			.cpu = 0,
++			.seed = 0x55,
++			.rounds = VECTOR_ROUNDS,
++			.loops = BUSY_LOOPS,
++			.barrier = &barrier,
++			.failures = &failures,
++		},
++		{
++			.cpu = 0,
++			.seed = 0xaa,
++			.rounds = VECTOR_ROUNDS,
++			.loops = BUSY_LOOPS,
++			.barrier = &barrier,
++			.failures = &failures,
++		},
++	};
++	pthread_t threads[2];
++
++	pthread_barrier_init(&barrier, NULL, 2);
++	if (pthread_create(&threads[0], NULL, vector_worker, &args[0]) ||
++	    pthread_create(&threads[1], NULL, vector_worker, &args[1]))
++		return false;
++	pthread_join(threads[0], NULL);
++	pthread_join(threads[1], NULL);
++	pthread_barrier_destroy(&barrier);
++	return atomic_load(&failures) == 0;
++}
++
++static void signal_handler(int signo)
++{
++	(void)signo;
++	signal_seen = 1;
++}
++
++static bool run_migration_signal_test(void)
++{
++	pthread_barrier_t barrier;
++	atomic_int failures = 0;
++	struct vector_worker_args args = {
++		.cpu = 0,
++		.seed = 0xc3,
++		.rounds = 1,
++		.loops = MIGRATION_LOOPS,
++		.barrier = &barrier,
++		.failures = &failures,
++	};
++	struct sigaction action = {
++		.sa_handler = signal_handler,
++	};
++	cpu_set_t set;
++	pthread_t thread;
++
++	if (sysconf(_SC_NPROCESSORS_ONLN) < 2)
++		return true;
++
++	sigemptyset(&action.sa_mask);
++	sigaction(SIGUSR1, &action, NULL);
++	signal_seen = 0;
++	pthread_barrier_init(&barrier, NULL, 2);
++	if (pthread_create(&thread, NULL, vector_worker, &args))
++		return false;
++	pthread_barrier_wait(&barrier);
++	usleep(10000);
++	CPU_ZERO(&set);
++	CPU_SET(1, &set);
++	if (pthread_setaffinity_np(thread, sizeof(set), &set))
++		atomic_fetch_add(&failures, 1);
++	usleep(10000);
++	if (pthread_kill(thread, SIGUSR1))
++		atomic_fetch_add(&failures, 1);
++	pthread_join(thread, NULL);
++	pthread_barrier_destroy(&barrier);
++	return atomic_load(&failures) == 0 && signal_seen;
++}
++
++int main(void)
++{
++	bool ok;
++
++	ksft_print_header();
++	ksft_set_plan(3);
++
++	ok = run_nonvector_noise_test();
++	ksft_test_result(ok, "vector owner survives non-vector and kernel usercopy noise\n");
++	ok = run_two_vector_test();
++	ksft_test_result(ok, "two vector tasks sharing one CPU preserve independent state\n");
++	ok = run_migration_signal_test();
++	ksft_test_result(ok, "vector state survives migration and signal delivery\n");
++
++	ksft_finished();
++}
+-- 
+2.54.0
+
