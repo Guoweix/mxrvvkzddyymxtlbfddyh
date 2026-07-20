@@ -3,7 +3,7 @@
 import unittest
 from types import SimpleNamespace
 
-from workload import Workload, validate_prompt_manifest
+from workload import Workload, select_prompts, validate_prompt_manifest
 
 
 class EventSink:
@@ -52,6 +52,17 @@ class PromptManifestTest(unittest.TestCase):
     def test_duplicate_prompt_ids_are_rejected(self):
         with self.assertRaises(ValueError):
             validate_prompt_manifest([{"id": "same"}, {"id": "same"}])
+
+    def test_request_count_selects_fixed_prefix(self):
+        prompts = [{"id": "short"}, {"id": "medium"}, {"id": "long"}]
+        self.assertEqual(
+            [item["id"] for item in select_prompts(prompts, 2)],
+            ["short", "medium"],
+        )
+
+    def test_request_count_rejects_zero(self):
+        with self.assertRaises(ValueError):
+            select_prompts([{"id": "short"}], 0)
 
 
 if __name__ == "__main__":

@@ -389,6 +389,8 @@ class Workload:
             "incumbent_model": self.args.incumbent_model,
             "injected_model": self.args.injected_model,
             "output_tokens_per_request": self.args.output_tokens,
+            "request_count_per_model": len(self.prompts),
+            "total_concurrency": 2 * len(self.prompts),
             "injection_token": self.args.injection_token,
             "arrival_gap_sec": self.args.arrival_gap_sec,
             "prompt_tokens": {
@@ -412,6 +414,14 @@ def validate_prompt_manifest(prompts):
         raise ValueError("every prompt must have a unique non-empty id")
 
 
+def select_prompts(prompts, request_count):
+    if not 1 <= request_count <= len(prompts):
+        raise ValueError(
+            f"request count must be between 1 and {len(prompts)}"
+        )
+    return prompts[:request_count]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--incumbent-url", required=True)
@@ -419,6 +429,7 @@ def main():
     parser.add_argument("--incumbent-model", choices=("A", "B"), required=True)
     parser.add_argument("--injected-model", choices=("A", "B"), required=True)
     parser.add_argument("--prompts", required=True)
+    parser.add_argument("--request-count", type=int, default=4)
     parser.add_argument("--events", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--output-tokens", type=int, default=256)
@@ -440,6 +451,7 @@ def main():
     prompts = json.loads(Path(args.prompts).read_text())
     try:
         validate_prompt_manifest(prompts)
+        prompts = select_prompts(prompts, args.request_count)
     except ValueError as exc:
         parser.error(str(exc))
 

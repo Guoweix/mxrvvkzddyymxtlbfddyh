@@ -4,13 +4,17 @@
 
 ## Workload
 
-- 每个 server 使用 4 个并行 slot。
-- 四个 incumbent 请求按 1 秒间隔到达。
-- 四个请求都输出第 4 个 token 后，向另一个 server 注入四个请求。
+- 每个 server 默认使用 4 个并行 slot。
+- `--concurrency` 可设置总并发为 2、4、8；两个 server 分别使用 1、2、4 个 slot 和请求。
+- incumbent 请求按 1 秒间隔到达；全部 incumbent 请求都输出第 4 个 token 后，向另一个 server 注入等量请求。
 - injected 请求同样按 1 秒间隔到达。
 - 每个请求默认固定输出 256 token，8 个请求共输出 2048 token。
 - 默认只运行一个 `A -> B` 方向和一个 loop。该配置显著长于之前的 16-token 五分钟场景。
 - 四个固定 prompt 在当前模型上分别为 27、111、326、713 input token。
+
+并发低于 8 时，固定 prompt 文件按顺序取前 N 档。例如总并发 2/4/8
+分别使用 short、short+medium、全部四档 prompt。每个 server 使用相同的
+prompt 子集，保证两组请求对称。
 
 所有正式请求固定使用：
 
@@ -54,7 +58,7 @@ stream=true
 
 ```bash
 ./run.sh --strategy cfs-shared --directions both --loops 3 \
-  --output-tokens 256 --injection-token 32
+  --concurrency 8 --output-tokens 256 --injection-token 32
 ```
 
 `external` 模式把两个 PID 作为板端环境变量交给一个外部调度器命令：

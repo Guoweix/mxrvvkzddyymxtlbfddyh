@@ -169,7 +169,9 @@ class SuiteRunner:
         self.args = args
         self.remote = Remote(args.host, args.user, args.password)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.suite_dir = Path(args.results_dir) / f"{timestamp}_{args.strategy}_dual_suite"
+        self.suite_dir = Path(args.results_dir) / (
+            f"{timestamp}_c{args.concurrency}_{args.strategy}_dual_suite"
+        )
         self.suite_dir.mkdir(parents=True)
         self.remote_dir = f"/tmp/dual_model_benchmark_{os.getpid()}"
         self.restore_default_server = False
@@ -262,7 +264,7 @@ class SuiteRunner:
             "-c",
             str(self.args.context),
             "-np",
-            "4",
+            str(self.args.requests_per_model),
             "--cache-ram",
             "0",
         ]
@@ -313,7 +315,11 @@ class SuiteRunner:
                 raise RuntimeError(f"incomplete warmup for {model} slot {slot}")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            futures = [pool.submit(one, model, slot) for model in ("A", "B") for slot in range(4)]
+            futures = [
+                pool.submit(one, model, slot)
+                for model in ("A", "B")
+                for slot in range(self.args.requests_per_model)
+            ]
             for future in futures:
                 future.result()
         time.sleep(self.args.quiet_sec)
@@ -482,6 +488,8 @@ class SuiteRunner:
             injected,
             "--prompts",
             str(self.args.prompts_file),
+            "--request-count",
+            str(self.args.requests_per_model),
             "--events",
             str(run_dir / "events.jsonl"),
             "--output",
@@ -674,6 +682,7 @@ def parse_args():
     parser.add_argument("--strategy", choices=("cfs-shared", "cfs-split", "external"), default="cfs-shared")
     parser.add_argument("--loops", type=int, default=1)
     parser.add_argument("--directions", choices=("ab", "ba", "both"), default="ab")
+    parser.add_argument("--concurrency", choices=(2, 4, 8), type=int, default=8)
     parser.add_argument("--output-tokens", type=int, default=256)
     parser.add_argument("--injection-token", type=int, default=4)
     parser.add_argument("--arrival-gap-sec", type=float, default=1.0)
@@ -728,6 +737,7 @@ def parse_args():
         parser.error("--injection-token must be between 1 and output-tokens - 1")
     if args.loops < 1 or args.max_attempts < 1:
         parser.error("loops and max-attempts must be positive")
+    args.requests_per_model = args.concurrency // 2
     args.prompts_file = str(Path(args.prompts_file).resolve())
     if not Path(args.prompts_file).is_file():
         parser.error(f"prompts file does not exist: {args.prompts_file}")

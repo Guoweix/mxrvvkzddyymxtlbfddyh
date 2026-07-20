@@ -356,6 +356,8 @@ def generate_suite(suite_dir):
         f"- Strategy: `{config.get('strategy', 'unknown')}`",
         f"- Loops: `{config.get('loops', 'unknown')}`",
         f"- Directions: `{config.get('directions', 'ab')}`",
+        f"- Total concurrency: `{config.get('concurrency', 'unknown')}` "
+        f"({config.get('requests_per_model', 'unknown')} requests/server)",
         f"- Output tokens/request: `{config.get('output_tokens', 'unknown')}`",
         f"- Injection milestone: `{config.get('injection_token', 'unknown')}` tokens from every incumbent request",
         f"- Arrival gap: `{config.get('arrival_gap_sec', 'unknown')}s`",
