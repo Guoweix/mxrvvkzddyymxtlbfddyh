@@ -1,18 +1,75 @@
 # Linux sched_ext 与 RVV lazy restore 补丁集
 
-本目录保存 K1 厂商 Linux 6.6 内核使用的两个补丁。补丁从
-`k1-bl-v2.1.y` 分支导出，必须按编号顺序应用。
+本目录保存针对 K1 原厂 Linux 6.6 内核的两个顺序补丁。它们解决两个不同层次
+的问题：
 
-## 补丁内容
+1. `0001` 先让原厂内核具备 sched_ext 内核功能。没有这个补丁，
+   `scx_llm_pin` 等 BPF 调度器无法注册和接管任务。
+2. `0002` 补齐 sched_ext 在该厂商树上的兼容代码，并加入可选的 RISC-V RVV
+   lazy restore 实验功能。
 
-| 文件 | 内容 |
-|------|------|
-| `0001-sched_ext-add-sched_ext-backport-from-v6.6.4-scx2.patch` | 从 `v6.6.4-scx2` 回移 sched_ext 主体和调度类集成，并在 `k1_defconfig` 中启用 sched_ext 与 BTF。 |
-| `0002-riscv-complete-sched_ext-integration-and-add-lazy-ve.patch` | 补齐厂商内核的 sched_ext/cgroup/任务生命周期集成，加入 RVV userspace owner lazy restore、自测，以及 libbpf 和 bcmdhd 构建修复。 |
+这两个补丁从本项目 Linux 分支 `k1-bl-v2.1.y` 导出，必须按编号顺序应用。
+`0002` 依赖 `0001`，不能单独应用。
 
-第二个补丁依赖第一个补丁，不能单独应用。RVV 优化仍保留 eager save，仅在同一
-task 返回同一 CPU 且 owner 状态有效时跳过 `v0-v31` payload restore；Vector CSR
-仍会恢复。
+## 补丁 1：为原厂内核添加 sched_ext
+
+文件：`0001-sched_ext-add-sched_ext-backport-from-v6.6.4-scx2.patch`
+
+### 作用
+
+K1 原厂 Linux 6.6 基线没有本项目所需的完整 sched_ext 实现。该补丁完成以下
+内核能力回移：
+
+- 加入 `SCHED_CLASS_EXT` 调度类及 `sched_ext_ops` BPF struct_ops 接口。
+- 将 sched_ext 接入 `core`、`fair`、`idle`、`deadline`、SysRq 和调度类链接布局。
+- 加入 `include/linux/sched/ext.h` 和 `kernel/sched/ext.c` 核心实现。
+- 在 `k1_defconfig` 中启用 `CONFIG_SCHED_CLASS_EXT` 和
+  `CONFIG_DEBUG_INFO_BTF`，供 CO-RE eBPF 调度器使用。
+
+该补丁只提供内核调度框架，不包含具体 LLM 调度策略。实际策略由
+`experiments/scx_llm_pin/` 中的用户态程序和 BPF struct_ops 调度器加载；未加载
+sched_ext 调度器时，系统仍按默认 Linux 调度路径运行。
+
+### 上游来源
+
+sched_ext 主体来自 sched_ext 项目的 Linux 内核发布仓库：
+
+- 仓库：<https://github.com/sched-ext/scx-kernel-releases>
+- 参考版本：[`v6.6.4-scx2`](https://github.com/sched-ext/scx-kernel-releases/tree/v6.6.4-scx2)
+- tag 对象：`e07b52f8ba172c234edcf45a1fa52735430578f9`
+
+其中 `kernel/sched/ext.c` 和 `include/linux/sched/ext.h` 以该版本为移植源；其余
+调度器文件的修改是把该版本的 sched_ext 接口接入 K1 原厂 6.6 内核时所做的
+适配。因此，`0001` 是面向原厂树的 backport，不应理解为可直接应用到任意
+Linux 6.6 分支的原始上游提交。
+
+### 开源许可证
+
+- Linux 内核整体由源码根目录 `COPYING` 说明为 GPL version 2 only，并带有
+  Linux syscall note 对用户空间接口的例外说明。
+- 上游 `kernel/sched/ext.c` 和 `include/linux/sched/ext.h` 均保留
+  `SPDX-License-Identifier: GPL-2.0`。按照 Linux 内核
+  `LICENSES/preferred/GPL-2.0`，这里表示 GPL-2.0-only。
+- 上述文件保留 Meta Platforms、Tejun Heo 和 David Vernet 等原作者的版权声明。
+- 补丁对其他内核文件的修改不改变这些文件原有的 SPDX 标识或版权声明；使用和
+  分发打补丁后的内核时，应继续遵守内核源码树 `COPYING` 和各文件头部标明的
+  许可证。
+
+## 补丁 2：厂商树集成与 RVV 实验
+
+文件：`0002-riscv-complete-sched_ext-integration-and-add-lazy-ve.patch`
+
+该补丁建立在 `0001` 之上，内容包括：
+
+- 补齐厂商树 cgroup、fork/init task、RT、topology 和调度器内部头文件集成。
+- 增大 sched_ext dispatch loop budget，并补齐独立构建需要的本地调度器头文件。
+- 修复 host libbpf const 类型和 bcmdhd out-of-tree 源码路径问题。
+- 加入可选的 RVV userspace owner lazy restore、debugfs 统计和正确性自测。
+
+RVV 优化仍保留 eager save，仅在同一 task 返回同一 CPU 且 owner 状态有效时
+跳过 `v0-v31` payload restore；`vl`、`vtype`、`vstart` 和 `vcsr` 仍会恢复。
+新增的 RVV owner 内核文件和自测使用 `GPL-2.0-only` SPDX 标识；对既有文件的
+修改继续遵守各文件原许可证。
 
 ## 目标基线
 
