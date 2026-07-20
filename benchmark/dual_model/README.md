@@ -2,6 +2,20 @@
 
 该 harness 在同一块 8 核板卡上启动两个独立的 llama-server，用确定性异步负载测量多模型 CPU 竞争。
 
+以下示例用环境变量表示板端 llama.cpp、实验 runtime、调度器和控制 map 路径：
+
+```bash
+export LLM_PATH="<board-llama-directory>"
+export REMOTE_RUNTIME_DIR="<board-experimental-runtime-directory>"
+export REMOTE_SCHEDULER_BIN="<board-scheduler-binary>"
+export LEASE_HINT_PATH="/sys/fs/bpf/scx_rvv_dirty_lease/workers"
+export MODEL_A_PORT="<model-a-port>"
+export MODEL_B_PORT="<model-b-port>"
+```
+
+调用 `run.sh` 时可通过 `--llm-path "$LLM_PATH"`、`--port-a "$MODEL_A_PORT"` 和
+`--port-b "$MODEL_B_PORT"` 显式传入这些环境配置。
+
 ## Workload
 
 - 每个 server 默认使用 4 个并行 slot。
@@ -65,7 +79,7 @@ stream=true
 
 ```bash
 ./run.sh --strategy external \
-  --external-start-cmd '/tmp/my_scheduler --tgid-a "$MODEL_A_PID" --tgid-b "$MODEL_B_PID"'
+  --external-start-cmd "$REMOTE_SCHEDULER_BIN --tgid-a \"\$MODEL_A_PID\" --tgid-b \"\$MODEL_B_PID\""
 ```
 
 可选的停止命令会收到 `MODEL_A_PID`、`MODEL_B_PID` 和 `SCHEDULER_PID`。未提供时，harness 对启动命令返回的进程发送 `SIGTERM`。
@@ -73,29 +87,29 @@ stream=true
 实验版 server 可以放在独立目录，不必覆盖默认安装。loader 仍来自 `--llm-path`，动态库优先搜索 staged 目录：
 
 ```bash
-./run.sh --runtime-bin-dir /tmp/llama-phase ...
+./run.sh --runtime-bin-dir "$REMOTE_RUNTIME_DIR" ...
 ```
 
 需要 llama.cpp 向 pinned worker map 注册两组 OpenMP worker 时，在两个 server 启动前传入同一路径；客户端会按自身 TGID 选择对应页：
 
 ```bash
 ./run.sh --strategy external \
-  --lease-hint-path /sys/fs/bpf/scx_rvv_dirty_lease/workers \
-  --external-start-cmd '/tmp/scx_llm_pin --tgid "$MODEL_A_PID" --tgid2 "$MODEL_B_PID" \
-    --strategy rvv_dirty --user-control active'
+  --lease-hint-path "$LEASE_HINT_PATH" \
+  --external-start-cmd "$REMOTE_SCHEDULER_BIN --tgid \"\$MODEL_A_PID\" --tgid2 \"\$MODEL_B_PID\" \
+    --strategy rvv_dirty --user-control active"
 ```
 
 保留 dirty lease slice/window，在自然 lease 边界偏向 prefill，并定向抢占同核的另一组 vector worker：
 
 ```bash
 ./run.sh --strategy external \
-  --runtime-bin-dir /tmp/llama-phase \
-  --lease-hint-path /sys/fs/bpf/scx_rvv_dirty_lease/workers \
-  --external-start-cmd '/tmp/scx_llm_pin/scx_llm_pin \
-    --tgid "$MODEL_A_PID" --tgid2 "$MODEL_B_PID" \
+  --runtime-bin-dir "$REMOTE_RUNTIME_DIR" \
+  --lease-hint-path "$LEASE_HINT_PATH" \
+  --external-start-cmd "$REMOTE_SCHEDULER_BIN \
+    --tgid \"\$MODEL_A_PID\" --tgid2 \"\$MODEL_B_PID\" \
     --strategy rvv_dirty --vector-slice-ms 100 \
     --vector-local-window-ms 500 --user-control active \
-    --team-gang prefill-lease --prefill-starvation-ms 1000'
+    --team-gang prefill-lease --prefill-starvation-ms 1000"
 ```
 
 `--scheduler-validation auto` 会从 external 命令识别 lease、gang-observe、gang-active 或 phase-lease。每轮要求调度器在 workload 结束时仍存活，并检查 8+8 worker、phase 命中、对应策略实际生效和 team DSQ 收支；phase-lease 还要求定向 wakeup 抢占实际发生、gang quanta/kick 为零且没有 4s vector-DSQ pending。任一失败会使 attempt 无效。非 `scx_llm_pin` external 命令可用 `--scheduler-validation none`，也可显式选择 validation profile。
@@ -108,12 +122,12 @@ stream=true
 
 ```bash
 ./run.sh --strategy external \
-  --lease-hint-path /sys/fs/bpf/scx_rvv_dirty_lease/workers \
-  --external-start-cmd '/tmp/scx_llm_pin_dual/scx_llm_pin \
-    --tgid "$MODEL_A_PID" --tgid2 "$MODEL_B_PID" \
+  --lease-hint-path "$LEASE_HINT_PATH" \
+  --external-start-cmd "$REMOTE_SCHEDULER_BIN \
+    --tgid \"\$MODEL_A_PID\" --tgid2 \"\$MODEL_B_PID\" \
     --strategy rvv_dirty --vector-slice-ms 100 \
     --vector-local-window-ms 500 --dirty-threshold 2 \
-    --user-control active --user-cpu-map auto'
+    --user-control active --user-cpu-map auto"
 ```
 
 两轮 CFS 为 `2.40695 +/- 0.00140 TPS`，三轮 active-auto 为 `2.86833 +/- 0.00939 TPS`，平均提升 `19.17%`。注入时在线改为 1000ms window 的正式候选为 `2.85866 TPS`，未超过 500ms active-auto，因此默认不变。完整报告见 `docs/rvv_dirty_lease_dual_model_userspace_20260718.md`。
@@ -156,4 +170,5 @@ summary.json
 report.md
 ```
 
-默认使用端口 9090/9091。如果 9090 上已有项目默认服务，harness 只停止该端口对应的 PID，并在 suite 结束后通过 `/mnt/llm/llama/run-server.sh` 恢复服务。
+两个服务端口由 `--port-a` / `--port-b` 指定。如果目标端口已有项目默认服务，harness
+只停止对应端口的 PID，并在 suite 结束后通过 `$LLM_PATH/run-server.sh` 恢复服务。

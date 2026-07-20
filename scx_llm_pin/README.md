@@ -22,10 +22,15 @@ dirty threshold 2。
 要求内核启用 sched_ext 和 BTF，并使用仓库中的 Buildroot RISC-V 工具链：
 
 ```bash
-cd /home/gwx/Workdir/riscv-rvv/experiments/scx_llm_pin
-make fetch-btf       # 首次或板端内核变化后执行
+export EXPERIMENTS_ROOT="$(git rev-parse --show-toplevel)"
+export BOARD_IP="<board-ip>"
+export BOARD_USER="<board-user>"
+export BOARD_PASS="<board-password>"
+
+cd "$EXPERIMENTS_ROOT/scx_llm_pin"
+make fetch-btf BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PASS"
 make
-make deploy BOARD_IP=192.168.3.67
+make deploy BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PASS"
 ```
 
 也可以由 `benchmark/benchmark.sh` 自动部署已编译的二进制。

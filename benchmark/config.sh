@@ -4,10 +4,10 @@
 # ========================================
 # 远程机器配置
 # ========================================
-export REMOTE_IP="192.168.3.67"
-export REMOTE_USER="root"
-export REMOTE_PASS="bianbu"
-export REMOTE_PORT="9090"
+export REMOTE_IP="${REMOTE_IP:-192.168.3.67}"
+export REMOTE_USER="${REMOTE_USER:-root}"
+export REMOTE_PASS="${REMOTE_PASS:-bianbu}"
+export REMOTE_PORT="${REMOTE_PORT:-9090}"
 
 # ========================================
 # LLM配置

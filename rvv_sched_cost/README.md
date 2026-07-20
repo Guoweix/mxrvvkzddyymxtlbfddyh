@@ -57,11 +57,18 @@
 
 ## 构建
 
-默认板卡地址是当前实验地址 `192.168.3.67`，账号密码使用 `root/bianbu`：
+先根据当前环境设置仓库、板卡和远端输出路径：
 
 ```sh
-cd experiments/rvv_sched_cost
-make fetch-btf BOARD_IP=192.168.3.67
+export EXPERIMENTS_ROOT="$(git rev-parse --show-toplevel)"
+export BOARD_IP="<board-ip>"
+export BOARD_USER="<board-user>"
+export BOARD_PASS="<board-password>"
+export RVV_REMOTE_BIN="/tmp/rvv_sched_cost"
+export RVV_RESULT_JSON="/tmp/rvv_sched_cost.json"
+
+cd "$EXPERIMENTS_ROOT/rvv_sched_cost"
+make fetch-btf BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PASS"
 make
 ```
 
@@ -77,53 +84,53 @@ sudo make -C ../../jupiter-buildroot/buildroot \
 ## 部署与运行
 
 ```sh
-make deploy BOARD_IP=192.168.3.63
-sshpass -p bianbu ssh -o StrictHostKeyChecking=no root@192.168.3.63 \
-  '/tmp/rvv_sched_cost --comm llama-server --duration 30 --json /tmp/rvv_sched_cost.json'
+make deploy BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PASS"
+sshpass -p "$BOARD_PASS" ssh -o StrictHostKeyChecking=no "$BOARD_USER@$BOARD_IP" \
+  "$RVV_REMOTE_BIN --comm llama-server --duration 30 --json $RVV_RESULT_JSON"
 ```
 
 也可以显式指定 TGID：
 
 ```sh
-/tmp/rvv_sched_cost --tgid <llama-server-pid> --duration 60 --json /tmp/result.json
+"$RVV_REMOTE_BIN" --tgid <llama-server-pid> --duration 60 --json "$RVV_RESULT_JSON"
 ```
 
 若只想观察调度开销，不读取 `pt_regs.status`，可加：
 
 ```sh
-/tmp/rvv_sched_cost --tgid <pid> --duration 30 --no-vs
+"$RVV_REMOTE_BIN" --tgid <pid> --duration 30 --no-vs
 ```
 
 若需要降低长测观测开销，可关闭 switch-out 侧统计：
 
 ```sh
-/tmp/rvv_sched_cost --tgid <pid> --duration 300 --no-switch-out
+"$RVV_REMOTE_BIN" --tgid <pid> --duration 300 --no-switch-out
 ```
 
 若仍需要 RVV save/restore 候选次数，但不需要切出理由，可关闭 out-state：
 
 ```sh
-/tmp/rvv_sched_cost --tgid <pid> --duration 300 --no-switch-out-state
+"$RVV_REMOTE_BIN" --tgid <pid> --duration 300 --no-switch-out-state
 ```
 
 若需要确认 wakeup storm 是否对应用户态 futex 同步放大，可开启 futex 计数：
 
 ```sh
-/tmp/rvv_sched_cost --tgid <pid> --duration 300 --futex --json /tmp/result.json
+"$RVV_REMOTE_BIN" --tgid <pid> --duration 300 --futex --json "$RVV_RESULT_JSON"
 ```
 
 若只测 futex wait 的真实系统调用耗时，不采集调度事件：
 
 ```sh
-/tmp/rvv_sched_cost --tgid <pid> --duration 300 --futex-only --json /tmp/result.json
+"$RVV_REMOTE_BIN" --tgid <pid> --duration 300 --futex-only --json "$RVV_RESULT_JSON"
 ```
 
 若需要进一步定位 futex 来源，可短时开启用户态调用栈采样，并同时保存目标进程
 `/proc/<pid>/maps`：
 
 ```sh
-cat /proc/<pid>/maps > /tmp/llama_server_maps.txt
-/tmp/rvv_sched_cost --tgid <pid> --duration 30 --futex-stack --json /tmp/result.json
+cat /proc/<pid>/maps > "${RVV_RESULT_JSON%.json}_maps.txt"
+"$RVV_REMOTE_BIN" --tgid <pid> --duration 30 --futex-stack --json "$RVV_RESULT_JSON"
 ```
 
 ## 输出

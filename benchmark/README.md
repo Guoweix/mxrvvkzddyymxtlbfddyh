@@ -37,6 +37,20 @@ experiments/rvv_sched_cost/
 
 ## 环境要求
 
+以下示例使用环境变量表示本机仓库位置和板端配置。请先按实际环境设置：
+
+```bash
+export EXPERIMENTS_ROOT="$(git rev-parse --show-toplevel)"
+export REMOTE_IP="<board-ip>"
+export REMOTE_USER="<board-user>"
+export REMOTE_PASS="<board-password>"
+export REMOTE_PORT="<llama-server-port>"
+export LLM_PATH="<board-llama-directory>"
+```
+
+`EXPERIMENTS_ROOT` 应指向 `experiments` Git 仓库根目录。其余变量与 `config.sh` 中的
+同名配置对应。
+
 ### 本机必需依赖
 
 `verify.sh` 检查的依赖为：
@@ -59,7 +73,7 @@ ping
 检查本机环境：
 
 ```bash
-cd /home/gwx/Workdir/riscv-rvv/experiments/benchmark
+cd "$EXPERIMENTS_ROOT/benchmark"
 ./verify.sh
 ```
 
@@ -67,20 +81,22 @@ cd /home/gwx/Workdir/riscv-rvv/experiments/benchmark
 
 板端需要满足：
 
-1. SSH 可登录，默认配置为 `root@192.168.3.67`，密码和地址可在 `config.sh` 修改。
+1. 可通过 `$REMOTE_USER@$REMOTE_IP` 登录 SSH；账号、密码和地址由环境变量或
+   `config.sh` 提供。
 2. `LLM_PATH` 指向包含 `run-server.sh` 的 llama 运行目录。
 3. `run-server.sh` 能启动目标 CPU llama-server 和配置的 GGUF 模型。
 4. llama-server 提供健康检查和 completion HTTP 接口。
 5. 板端有 8 个可用 CPU；默认调度 CPU 范围为 `0-7`。
 6. 板端内核启用了当前 `scx_llm_pin` 所需的 sched_ext/BPF 支持。
 
-默认配置：
+关键环境配置：
 
 ```bash
-REMOTE_IP=192.168.3.67
-REMOTE_USER=root
-REMOTE_PORT=9090
-LLM_PATH=/mnt/llm/llama
+REMOTE_IP="<board-ip>"
+REMOTE_USER="<board-user>"
+REMOTE_PASS="<board-password>"
+REMOTE_PORT="<llama-server-port>"
+LLM_PATH="<board-llama-directory>"
 LLM_THREADS=8
 LLM_THREADS_BATCH=       # 留空时跟随 LLM_THREADS
 LLM_PARALLEL=4
@@ -118,7 +134,7 @@ kbuild/llama.cpp/build-riscv-hint/bin/libggml-cpu.so.0.13.0
 运行默认 CFS 套件：
 
 ```bash
-cd /home/gwx/Workdir/riscv-rvv/experiments/benchmark
+cd "$EXPERIMENTS_ROOT/benchmark"
 ./benchmark.sh --strategy cfs
 ```
 
@@ -343,17 +359,17 @@ results/YYYYMMDD_HHMMSS_<strategy>_suite/
 ## 故障排查
 
 ```bash
-ping 192.168.3.67
-sshpass -p bianbu ssh root@192.168.3.67 "echo ok"
-sshpass -p bianbu ssh root@192.168.3.67 \
+ping "$REMOTE_IP"
+sshpass -p "$REMOTE_PASS" ssh "$REMOTE_USER@$REMOTE_IP" "echo ok"
+sshpass -p "$REMOTE_PASS" ssh "$REMOTE_USER@$REMOTE_IP" \
   "ps w | grep -E 'llama-server|scx_llm_pin|rvv_sched_cost' | grep -v grep || true"
-sshpass -p bianbu ssh root@192.168.3.67 "dmesg | tail -80"
+sshpass -p "$REMOTE_PASS" ssh "$REMOTE_USER@$REMOTE_IP" "dmesg | tail -80"
 ```
 
 如果 dmesg 出现 sched_ext watchdog、scheduler error、runnable task stall 或 OOM，
 该轮不应进入性能均值。检查服务日志：
 
 ```bash
-sshpass -p bianbu ssh root@192.168.3.67 \
+sshpass -p "$REMOTE_PASS" ssh "$REMOTE_USER@$REMOTE_IP" \
   "tail -100 /tmp/llama-server.log"
 ```
