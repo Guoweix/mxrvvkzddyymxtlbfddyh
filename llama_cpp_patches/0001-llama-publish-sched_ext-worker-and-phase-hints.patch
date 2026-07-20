@@ -1,0 +1,1188 @@
+From 258b608123e7489d1dde2a2d56f5a7800e16f2bd Mon Sep 17 00:00:00 2001
+From: Build <build@local>
+Date: Mon, 20 Jul 2026 15:58:17 +0800
+Subject: [PATCH] llama: publish sched_ext worker and phase hints
+
+Add optional mmap clients for OpenMP worker/barrier state and the RVV dirty-lease control ABI. Expose one-shot prefill, decode, and mixed phase hints through llama_context, classify server batches, and forward each graph phase to the CPU backend. Missing or incompatible BPF maps remain a no-op.
+---
+ ggml/src/ggml-cpu/CMakeLists.txt            |   4 +
+ ggml/src/ggml-cpu/ggml-cpu.c                |  90 ++++
+ ggml/src/ggml-cpu/ggml-cpu.cpp              |  32 +-
+ ggml/src/ggml-cpu/scx-barrier-hint-client.c | 463 ++++++++++++++++++++
+ ggml/src/ggml-cpu/scx-barrier-hint-client.h |  45 ++
+ ggml/src/ggml-cpu/scx-rvv-barrier-hint.h    |  65 +++
+ ggml/src/ggml-cpu/scx-rvv-lease-control.h   |  98 +++++
+ include/llama.h                             |  21 +
+ src/llama-context.cpp                       |  55 ++-
+ src/llama-context.h                         |  16 +-
+ tools/server/server-context.cpp             |  13 +
+ 11 files changed, 897 insertions(+), 5 deletions(-)
+ create mode 100644 ggml/src/ggml-cpu/scx-barrier-hint-client.c
+ create mode 100644 ggml/src/ggml-cpu/scx-barrier-hint-client.h
+ create mode 100644 ggml/src/ggml-cpu/scx-rvv-barrier-hint.h
+ create mode 100644 ggml/src/ggml-cpu/scx-rvv-lease-control.h
+
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index 8c735a0..f566b77 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -29,6 +29,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+     list (APPEND GGML_CPU_SOURCES
+         ggml-cpu/ggml-cpu.c
+         ggml-cpu/ggml-cpu.cpp
++        ggml-cpu/scx-barrier-hint-client.c
++        ggml-cpu/scx-barrier-hint-client.h
++        ggml-cpu/scx-rvv-barrier-hint.h
++        ggml-cpu/scx-rvv-lease-control.h
+         ggml-cpu/repack.cpp
+         ggml-cpu/repack.h
+         ggml-cpu/hbm.cpp
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index cd5c61a..654375b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -14,6 +14,12 @@
+ #include "ops.h"
+ #include "ggml.h"
+ #include "common.h"
++#include "scx-barrier-hint-client.h"
++
++#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
++#include "scx-rvv-barrier-hint.h"
++#include <sys/syscall.h>
++#endif
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ #include <malloc.h> // using malloc.h with MSC/MINGW
+@@ -492,6 +498,10 @@ struct ggml_threadpool {
+     uint32_t     poll;        // Polling level (0 - no polling)
+ 
+     enum ggml_status ec;
++
++#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
++    uint64_t barrier_hint_graph_epoch;
++#endif
+ };
+ 
+ // Per-thread state
+@@ -504,6 +514,12 @@ struct ggml_compute_state {
+     bool cpumask[GGML_MAX_N_THREADS];
+     struct ggml_threadpool * threadpool;
+     int ith;
++
++#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
++    uint32_t barrier_hint_tid;
++    uint32_t barrier_hint_node_index;
++    uint64_t barrier_hint_epoch;
++#endif
+ };
+ 
+ // Helpers for polling loops
+@@ -570,7 +586,35 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+     }
+ 
+ #ifdef GGML_USE_OPENMP
++#if defined(__gnu_linux__)
++    struct ggml_compute_state * hint_worker = NULL;
++    if (tp->barrier_hint_graph_epoch) {
++        const int ith = omp_get_thread_num();
++        hint_worker = &tp->workers[ith];
++        hint_worker->barrier_hint_epoch++;
++        ggml_scx_barrier_hint_update(
++                hint_worker->barrier_hint_tid,
++                ith,
++                n_threads,
++                BARRIER_GANG_PHASE_WAITING,
++                tp->barrier_hint_graph_epoch,
++                hint_worker->barrier_hint_epoch,
++                hint_worker->barrier_hint_node_index);
++    }
++#endif
+     #pragma omp barrier
++#if defined(__gnu_linux__)
++    if (hint_worker != NULL) {
++        ggml_scx_barrier_hint_update(
++                hint_worker->barrier_hint_tid,
++                hint_worker->ith,
++                n_threads,
++                BARRIER_GANG_PHASE_COMPUTE,
++                tp->barrier_hint_graph_epoch,
++                hint_worker->barrier_hint_epoch,
++                hint_worker->barrier_hint_node_index);
++    }
++#endif
+ #else
+     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
+ 
+@@ -3050,6 +3094,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
++        state->barrier_hint_node_index = (uint32_t) node_n;
++#endif
++
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+@@ -3076,6 +3124,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+ #endif
+ 
++#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
++    state->barrier_hint_node_index = (uint32_t) cgraph->n_nodes;
++#endif
+     ggml_barrier(state->threadpool);
+ 
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+@@ -3329,6 +3380,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     }
+ 
+ #ifdef GGML_USE_OPENMP
++#if defined(__gnu_linux__)
++    ggml_scx_lease_hint_graph_begin(n_threads);
++    threadpool->barrier_hint_graph_epoch =
++            ggml_scx_barrier_hint_graph_begin(n_threads);
++#endif
+     if (n_threads > 1) {
+         #pragma omp parallel num_threads(n_threads)
+         {
+@@ -3342,16 +3398,50 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+             // Apply thread CPU mask and priority
+             int ith = omp_get_thread_num();
+ 
++#if defined(__gnu_linux__)
++            struct ggml_compute_state * hint_worker = &threadpool->workers[ith];
++            if (!hint_worker->barrier_hint_tid) {
++                hint_worker->barrier_hint_tid = (uint32_t) syscall(SYS_gettid);
++            }
++            ggml_scx_lease_hint_register(
++                    hint_worker->barrier_hint_tid,
++                    ith,
++                    n_threads);
++            hint_worker->barrier_hint_epoch = 0;
++            hint_worker->barrier_hint_node_index = 0;
++            ggml_scx_barrier_hint_update(
++                    hint_worker->barrier_hint_tid,
++                    ith,
++                    n_threads,
++                    BARRIER_GANG_PHASE_COMPUTE,
++                    threadpool->barrier_hint_graph_epoch,
++                    0,
++                    0);
++#endif
++
+             ggml_thread_apply_priority(threadpool->prio);
+             if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+                 ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
+             }
+             ggml_graph_compute_thread(&threadpool->workers[ith]);
++#if defined(__gnu_linux__)
++            ggml_scx_barrier_hint_update(
++                    hint_worker->barrier_hint_tid,
++                    ith,
++                    n_threads,
++                    BARRIER_GANG_PHASE_IDLE,
++                    threadpool->barrier_hint_graph_epoch,
++                    hint_worker->barrier_hint_epoch,
++                    hint_worker->barrier_hint_node_index);
++#endif
+         }
+     } else {
+         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+         ggml_graph_compute_thread(&threadpool->workers[0]);
+     }
++#if defined(__gnu_linux__)
++    threadpool->barrier_hint_graph_epoch = 0;
++#endif
+ #else
+     if (n_threads > threadpool->n_threads) {
+         GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 128883b..f0f9467 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -5,6 +5,7 @@
+ #include "traits.h"
+ #include "ggml-impl.h"
+ #include "amx/amx.h"
++#include "scx-barrier-hint-client.h"
+ 
+ #include <cctype>
+ #include <string>
+@@ -107,6 +108,9 @@ struct ggml_backend_cpu_context {
+     void *              abort_callback_data;
+ 
+     bool                use_ref;  // use reference implementation
++    uint32_t            sched_phase;
++    uint32_t            sched_prompt_tokens;
++    uint32_t            sched_decode_tokens;
+ };
+ 
+ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
+@@ -187,7 +191,14 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
+     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
+     cplan.use_ref             = cpu_ctx->use_ref;
+ 
+-    return ggml_graph_compute(cgraph, &cplan);
++    ggml_scx_lease_hint_phase_begin(
++            cpu_ctx->sched_phase,
++            cpu_ctx->sched_prompt_tokens,
++            cpu_ctx->sched_decode_tokens,
++            (uint32_t) cpu_ctx->n_threads);
++    const enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
++    ggml_scx_lease_hint_phase_end();
++    return status;
+ }
+ 
+ static const struct ggml_backend_i ggml_backend_cpu_i = {
+@@ -230,6 +241,9 @@ ggml_backend_t ggml_backend_cpu_init(void) {
+     ctx->abort_callback      = NULL;
+     ctx->abort_callback_data = NULL;
+     ctx->use_ref             = false;
++    ctx->sched_phase         = 0;
++    ctx->sched_prompt_tokens = 0;
++    ctx->sched_decode_tokens = 0;
+ 
+     ggml_backend_t cpu_backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_cpu_guid(),
+@@ -269,6 +283,19 @@ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool
+     ctx->threadpool = threadpool;
+ }
+ 
++static void ggml_backend_cpu_set_sched_hint(
++        ggml_backend_t backend_cpu,
++        uint32_t phase,
++        uint32_t prompt_tokens,
++        uint32_t decode_tokens) {
++    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
++
++    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *) backend_cpu->context;
++    ctx->sched_phase = phase;
++    ctx->sched_prompt_tokens = prompt_tokens;
++    ctx->sched_decode_tokens = decode_tokens;
++}
++
+ void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
+     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+ 
+@@ -674,6 +701,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
+         return (void *)ggml_backend_cpu_set_threadpool;
+     }
++    if (strcmp(name, "ggml_backend_cpu_set_sched_hint") == 0) {
++        return (void *)ggml_backend_cpu_set_sched_hint;
++    }
+ 
+     return NULL;
+ 
+diff --git a/ggml/src/ggml-cpu/scx-barrier-hint-client.c b/ggml/src/ggml-cpu/scx-barrier-hint-client.c
+new file mode 100644
+index 0000000..1802fb0
+--- /dev/null
++++ b/ggml/src/ggml-cpu/scx-barrier-hint-client.c
+@@ -0,0 +1,463 @@
++// SPDX-License-Identifier: MIT
++#include "scx-barrier-hint-client.h"
++
++#if defined(__linux__) && defined(GGML_USE_OPENMP)
++
++#include "scx-rvv-barrier-hint.h"
++#include "scx-rvv-lease-control.h"
++
++#include <errno.h>
++#include <linux/bpf.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <unistd.h>
++
++struct ggml_scx_hint_client {
++    struct barrier_gang_hint_page * page;
++    size_t mapping_size;
++    uint64_t next_graph_epoch;
++    uint64_t retry_after_ns;
++    uint64_t connected_session_id;
++    uint32_t tgid;
++    bool configured;
++    char path[256];
++};
++
++static struct ggml_scx_hint_client g_hint_client;
++
++struct ggml_scx_lease_client {
++    void * mapping;
++    struct rvv_lease_worker_page * page;
++    size_t mapping_size;
++    uint64_t retry_after_ns;
++    uint64_t connected_session_id;
++    uint64_t next_phase_epoch;
++    uint32_t tgid;
++    bool configured;
++    char path[256];
++};
++
++static struct ggml_scx_lease_client g_lease_client;
++
++static uint64_t monotonic_ns(void) {
++    struct timespec ts;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++        return 0;
++    }
++    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
++}
++
++static int bpf_obj_get_raw(const char * path) {
++    union bpf_attr attr;
++
++    memset(&attr, 0, sizeof(attr));
++    attr.pathname = (uint64_t) (uintptr_t) path;
++    return (int) syscall(__NR_bpf, BPF_OBJ_GET, &attr, sizeof(attr));
++}
++
++static int bpf_map_info_raw(int fd, struct bpf_map_info * info) {
++    union bpf_attr attr;
++    uint32_t length = sizeof(*info);
++
++    memset(info, 0, sizeof(*info));
++    memset(&attr, 0, sizeof(attr));
++    attr.info.bpf_fd = (uint32_t) fd;
++    attr.info.info_len = length;
++    attr.info.info = (uint64_t) (uintptr_t) info;
++    return (int) syscall(__NR_bpf, BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr));
++}
++
++static void disconnect_hint_map(void) {
++    if (g_hint_client.page != NULL) {
++        munmap(g_hint_client.page, g_hint_client.mapping_size);
++    }
++    g_hint_client.page = NULL;
++    g_hint_client.mapping_size = 0;
++}
++
++static void configure_hint_path(void) {
++    const char * path;
++
++    if (g_hint_client.configured) {
++        return;
++    }
++    g_hint_client.configured = true;
++    path = getenv("GGML_SCX_GANG_HINT_PATH");
++    if (path == NULL || path[0] == '\0') {
++        return;
++    }
++    snprintf(g_hint_client.path, sizeof(g_hint_client.path), "%s", path);
++}
++
++static bool connect_hint_map(void) {
++    struct bpf_map_info info;
++    struct barrier_gang_hint_page * page;
++    long page_size;
++    size_t mapping_size;
++    uint64_t now;
++    int fd;
++
++    configure_hint_path();
++    if (g_hint_client.path[0] == '\0') {
++        return false;
++    }
++    if (g_hint_client.page != NULL) {
++        if (__atomic_load_n(&g_hint_client.page->header.active, __ATOMIC_ACQUIRE) &&
++                g_hint_client.page->header.target_tgid == g_hint_client.tgid) {
++            return true;
++        }
++        disconnect_hint_map();
++    }
++
++    now = monotonic_ns();
++    if (now && now < g_hint_client.retry_after_ns) {
++        return false;
++    }
++    g_hint_client.retry_after_ns = now + 1000000000ULL;
++    if (!g_hint_client.tgid) {
++        g_hint_client.tgid = (uint32_t) getpid();
++    }
++    fd = bpf_obj_get_raw(g_hint_client.path);
++    if (fd < 0) {
++        return false;
++    }
++    if (bpf_map_info_raw(fd, &info) != 0 ||
++            info.type != BPF_MAP_TYPE_ARRAY || info.max_entries != 1 ||
++            info.value_size != sizeof(struct barrier_gang_hint_page) ||
++            !(info.map_flags & BPF_F_MMAPABLE)) {
++        close(fd);
++        return false;
++    }
++    page_size = sysconf(_SC_PAGESIZE);
++    if (page_size <= 0) {
++        close(fd);
++        return false;
++    }
++    mapping_size = (info.value_size + (size_t) page_size - 1) &
++            ~((size_t) page_size - 1);
++    page = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    close(fd);
++    if (page == MAP_FAILED) {
++        return false;
++    }
++    if (page->header.magic != BARRIER_GANG_HINT_MAGIC ||
++            page->header.abi_version != BARRIER_GANG_HINT_ABI_VERSION ||
++            !page->header.active || page->header.target_tgid != g_hint_client.tgid ||
++            page->header.max_workers < BARRIER_GANG_HINT_POLICY_WORKERS ||
++            !page->header.session_id) {
++        munmap(page, mapping_size);
++        return false;
++    }
++    g_hint_client.page = page;
++    g_hint_client.mapping_size = mapping_size;
++    if (g_hint_client.connected_session_id != page->header.session_id) {
++        fprintf(stderr, "GGML_SCX_GANG_HINT connected path=%s session=%llu\n",
++                g_hint_client.path,
++                (unsigned long long) page->header.session_id);
++        fflush(stderr);
++        g_hint_client.connected_session_id = page->header.session_id;
++    }
++    return true;
++}
++
++static void disconnect_lease_map(void) {
++    if (g_lease_client.mapping != NULL) {
++        munmap(g_lease_client.mapping, g_lease_client.mapping_size);
++    }
++    g_lease_client.mapping = NULL;
++    g_lease_client.page = NULL;
++    g_lease_client.mapping_size = 0;
++}
++
++static void configure_lease_path(void) {
++    const char * path;
++
++    if (g_lease_client.configured) {
++        return;
++    }
++    g_lease_client.configured = true;
++    path = getenv("GGML_SCX_LEASE_HINT_PATH");
++    if (path == NULL || path[0] == '\0') {
++        return;
++    }
++    snprintf(g_lease_client.path, sizeof(g_lease_client.path), "%s", path);
++}
++
++static bool connect_lease_map(void) {
++    struct bpf_map_info info;
++    struct rvv_lease_worker_page * page = NULL;
++    void * mapping;
++    long page_size;
++    size_t mapping_size;
++    uint64_t now;
++    int fd;
++
++    configure_lease_path();
++    if (g_lease_client.path[0] == '\0') {
++        return false;
++    }
++    if (g_lease_client.page != NULL) {
++        if (__atomic_load_n(&g_lease_client.page->header.active, __ATOMIC_ACQUIRE) &&
++                g_lease_client.page->header.target_tgid == g_lease_client.tgid) {
++            return true;
++        }
++        disconnect_lease_map();
++    }
++
++    now = monotonic_ns();
++    if (now && now < g_lease_client.retry_after_ns) {
++        return false;
++    }
++    g_lease_client.retry_after_ns = now + 1000000000ULL;
++    if (!g_lease_client.tgid) {
++        g_lease_client.tgid = (uint32_t) getpid();
++    }
++    fd = bpf_obj_get_raw(g_lease_client.path);
++    if (fd < 0) {
++        return false;
++    }
++    if (bpf_map_info_raw(fd, &info) != 0 ||
++            info.type != BPF_MAP_TYPE_ARRAY || info.max_entries < 1 ||
++            info.max_entries > RVV_LEASE_CONTROL_TEAMS ||
++            info.value_size != sizeof(struct rvv_lease_worker_page) ||
++            !(info.map_flags & BPF_F_MMAPABLE)) {
++        close(fd);
++        return false;
++    }
++    page_size = sysconf(_SC_PAGESIZE);
++    if (page_size <= 0) {
++        close(fd);
++        return false;
++    }
++    mapping_size = ((size_t) info.value_size * info.max_entries +
++            (size_t) page_size - 1) &
++            ~((size_t) page_size - 1);
++    mapping = mmap(NULL, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    close(fd);
++    if (mapping == MAP_FAILED) {
++        return false;
++    }
++    for (uint32_t team = 0; team < info.max_entries; team++) {
++        struct rvv_lease_worker_page * candidate =
++                (struct rvv_lease_worker_page *) ((char *) mapping +
++                        (size_t) team * info.value_size);
++
++        if (candidate->header.magic == RVV_LEASE_CONTROL_MAGIC &&
++                candidate->header.abi_version == RVV_LEASE_CONTROL_ABI_VERSION &&
++                __atomic_load_n(&candidate->header.active, __ATOMIC_ACQUIRE) &&
++                candidate->header.team_id == team &&
++                candidate->header.target_tgid == g_lease_client.tgid &&
++                candidate->header.max_workers == RVV_LEASE_CONTROL_WORKERS &&
++                candidate->header.session_id) {
++            page = candidate;
++            break;
++        }
++    }
++    if (page == NULL) {
++        munmap(mapping, mapping_size);
++        return false;
++    }
++    g_lease_client.mapping = mapping;
++    g_lease_client.page = page;
++    g_lease_client.mapping_size = mapping_size;
++    if (g_lease_client.connected_session_id != page->header.session_id) {
++        fprintf(stderr, "GGML_SCX_LEASE_HINT connected path=%s team=%u session=%llu\n",
++                g_lease_client.path,
++                page->header.team_id,
++                (unsigned long long) page->header.session_id);
++        fflush(stderr);
++        g_lease_client.connected_session_id = page->header.session_id;
++    }
++    return true;
++}
++
++void ggml_scx_lease_hint_graph_begin(int n_threads) {
++    if (n_threads == (int) RVV_LEASE_CONTROL_WORKERS) {
++        connect_lease_map();
++    }
++}
++
++void ggml_scx_lease_hint_register(uint32_t tid, int ith, int n_threads) {
++    struct rvv_lease_worker_page * page = g_lease_client.page;
++    struct rvv_lease_worker_slot * slot;
++    uint32_t sequence;
++
++    if (page == NULL || !tid || n_threads != (int) RVV_LEASE_CONTROL_WORKERS ||
++            ith < 0 || ith >= n_threads ||
++            !__atomic_load_n(&page->header.active, __ATOMIC_ACQUIRE)) {
++        return;
++    }
++    slot = &page->workers[ith];
++    sequence = __atomic_load_n(&slot->sequence, __ATOMIC_ACQUIRE);
++    if (!(sequence & 1U) && slot->tid == tid &&
++            slot->tgid == g_lease_client.tgid && slot->ith == (uint32_t) ith &&
++            slot->n_threads == (uint32_t) n_threads &&
++            slot->session_id == page->header.session_id) {
++        return;
++    }
++    if (sequence & 1U) {
++        sequence++;
++    }
++    __atomic_store_n(&slot->sequence, sequence + 1, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    slot->tid = tid;
++    slot->tgid = g_lease_client.tgid;
++    slot->ith = (uint32_t) ith;
++    slot->n_threads = (uint32_t) n_threads;
++    slot->flags = 0;
++    slot->session_id = page->header.session_id;
++    __atomic_store_n(&slot->sequence, sequence + 2, __ATOMIC_RELEASE);
++}
++
++static void publish_lease_phase(
++        uint32_t phase,
++        uint32_t prompt_tokens,
++        uint32_t decode_tokens,
++        uint32_t active_workers) {
++    struct rvv_lease_worker_page * page = g_lease_client.page;
++    struct rvv_lease_team_hint * hint;
++    uint32_t sequence;
++    uint64_t now;
++
++    if (page == NULL || phase > RVV_LEASE_PHASE_MIXED ||
++            !__atomic_load_n(&page->header.active, __ATOMIC_ACQUIRE)) {
++        return;
++    }
++    hint = &page->team_hint;
++    sequence = __atomic_load_n(&hint->sequence, __ATOMIC_RELAXED);
++    if (sequence & 1U) {
++        sequence++;
++    }
++    now = monotonic_ns();
++    __atomic_store_n(&hint->sequence, sequence + 1, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    hint->phase = phase;
++    hint->active_workers = active_workers;
++    hint->flags = phase == RVV_LEASE_PHASE_PREFILL || phase == RVV_LEASE_PHASE_MIXED ?
++            RVV_LEASE_MODEL_LATENCY_SENSITIVE : 0;
++    hint->prompt_tokens = prompt_tokens;
++    hint->decode_tokens = decode_tokens;
++    hint->phase_epoch = __atomic_add_fetch(
++            &g_lease_client.next_phase_epoch, 1, __ATOMIC_RELAXED);
++    hint->begin_ns = now;
++    hint->expires_ns = phase == RVV_LEASE_PHASE_IDLE || !now ? 0 :
++            now + 300000000000ULL;
++    hint->session_id = page->header.session_id;
++    __atomic_store_n(&hint->sequence, sequence + 2, __ATOMIC_RELEASE);
++}
++
++void ggml_scx_lease_hint_phase_begin(
++        uint32_t phase,
++        uint32_t prompt_tokens,
++        uint32_t decode_tokens,
++        uint32_t active_workers) {
++    if (!connect_lease_map()) {
++        return;
++    }
++    publish_lease_phase(
++            phase, prompt_tokens, decode_tokens, active_workers);
++}
++
++void ggml_scx_lease_hint_phase_end(void) {
++    publish_lease_phase(RVV_LEASE_PHASE_IDLE, 0, 0, 0);
++}
++
++uint64_t ggml_scx_barrier_hint_graph_begin(int n_threads) {
++    if (n_threads != (int) BARRIER_GANG_HINT_POLICY_WORKERS ||
++            !connect_hint_map()) {
++        return 0;
++    }
++    return __atomic_add_fetch(&g_hint_client.next_graph_epoch, 1, __ATOMIC_RELAXED);
++}
++
++void ggml_scx_barrier_hint_update(
++        uint32_t tid,
++        int ith,
++        int n_threads,
++        uint32_t phase,
++        uint64_t graph_epoch,
++        uint64_t barrier_epoch,
++        uint32_t node_index) {
++    struct barrier_gang_hint_page * page = g_hint_client.page;
++    struct barrier_gang_hint_slot * slot;
++    uint32_t sequence;
++
++    if (page == NULL || !graph_epoch || !tid || ith < 0 ||
++            ith >= n_threads || n_threads > (int) BARRIER_GANG_HINT_POLICY_WORKERS ||
++            !__atomic_load_n(&page->header.active, __ATOMIC_ACQUIRE)) {
++        return;
++    }
++    slot = &page->workers[ith];
++    sequence = __atomic_load_n(&slot->sequence, __ATOMIC_RELAXED);
++    if (sequence & 1U) {
++        sequence++;
++    }
++    __atomic_store_n(&slot->sequence, sequence + 1, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    slot->tid = tid;
++    slot->tgid = g_hint_client.tgid;
++    slot->ith = (uint32_t) ith;
++    slot->n_threads = (uint32_t) n_threads;
++    slot->phase = phase;
++    slot->node_index = node_index;
++    slot->graph_epoch = graph_epoch;
++    slot->barrier_epoch = barrier_epoch;
++    slot->session_id = page->header.session_id;
++    __atomic_store_n(&slot->sequence, sequence + 2, __ATOMIC_RELEASE);
++}
++
++#else
++
++void ggml_scx_lease_hint_graph_begin(int n_threads) {
++    (void) n_threads;
++}
++
++void ggml_scx_lease_hint_register(uint32_t tid, int ith, int n_threads) {
++    (void) tid;
++    (void) ith;
++    (void) n_threads;
++}
++
++void ggml_scx_lease_hint_phase_begin(
++        uint32_t phase,
++        uint32_t prompt_tokens,
++        uint32_t decode_tokens,
++        uint32_t active_workers) {
++    (void) phase;
++    (void) prompt_tokens;
++    (void) decode_tokens;
++    (void) active_workers;
++}
++
++void ggml_scx_lease_hint_phase_end(void) {
++}
++
++uint64_t ggml_scx_barrier_hint_graph_begin(int n_threads) {
++    (void) n_threads;
++    return 0;
++}
++
++void ggml_scx_barrier_hint_update(
++        uint32_t tid,
++        int ith,
++        int n_threads,
++        uint32_t phase,
++        uint64_t graph_epoch,
++        uint64_t barrier_epoch,
++        uint32_t node_index) {
++    (void) tid;
++    (void) ith;
++    (void) n_threads;
++    (void) phase;
++    (void) graph_epoch;
++    (void) barrier_epoch;
++    (void) node_index;
++}
++
++#endif
+diff --git a/ggml/src/ggml-cpu/scx-barrier-hint-client.h b/ggml/src/ggml-cpu/scx-barrier-hint-client.h
+new file mode 100644
+index 0000000..d64bd6b
+--- /dev/null
++++ b/ggml/src/ggml-cpu/scx-barrier-hint-client.h
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: MIT
++#ifndef GGML_SCX_BARRIER_HINT_CLIENT_H
++#define GGML_SCX_BARRIER_HINT_CLIENT_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if defined(__GNUC__) || defined(__clang__)
++#define GGML_SCX_HINT_PRIVATE __attribute__((visibility("hidden")))
++#else
++#define GGML_SCX_HINT_PRIVATE
++#endif
++
++GGML_SCX_HINT_PRIVATE uint64_t ggml_scx_barrier_hint_graph_begin(int n_threads);
++GGML_SCX_HINT_PRIVATE void ggml_scx_lease_hint_graph_begin(int n_threads);
++GGML_SCX_HINT_PRIVATE void ggml_scx_lease_hint_register(
++        uint32_t tid,
++        int ith,
++        int n_threads);
++GGML_SCX_HINT_PRIVATE void ggml_scx_lease_hint_phase_begin(
++        uint32_t phase,
++        uint32_t prompt_tokens,
++        uint32_t decode_tokens,
++        uint32_t active_workers);
++GGML_SCX_HINT_PRIVATE void ggml_scx_lease_hint_phase_end(void);
++GGML_SCX_HINT_PRIVATE void ggml_scx_barrier_hint_update(
++        uint32_t tid,
++        int ith,
++        int n_threads,
++        uint32_t phase,
++        uint64_t graph_epoch,
++        uint64_t barrier_epoch,
++        uint32_t node_index);
++
++#ifdef __cplusplus
++}
++#endif
++
++#undef GGML_SCX_HINT_PRIVATE
++
++#endif /* GGML_SCX_BARRIER_HINT_CLIENT_H */
+diff --git a/ggml/src/ggml-cpu/scx-rvv-barrier-hint.h b/ggml/src/ggml-cpu/scx-rvv-barrier-hint.h
+new file mode 100644
+index 0000000..af8e071
+--- /dev/null
++++ b/ggml/src/ggml-cpu/scx-rvv-barrier-hint.h
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++#ifndef __SCX_RVV_BARRIER_HINT_H
++#define __SCX_RVV_BARRIER_HINT_H
++
++#include <linux/types.h>
++
++#define BARRIER_GANG_HINT_MAGIC          0x42474854U
++#define BARRIER_GANG_HINT_ABI_VERSION    1U
++#define BARRIER_GANG_HINT_MAX_WORKERS    16U
++#define BARRIER_GANG_HINT_POLICY_WORKERS 8U
++#define BARRIER_GANG_HINT_DEFAULT_PATH   "/sys/fs/bpf/scx_rvv_barrier_gang/hints"
++
++enum barrier_gang_hint_mode {
++    BARRIER_GANG_HINT_OFF = 0,
++    BARRIER_GANG_HINT_OBSERVE = 1,
++    BARRIER_GANG_HINT_ACTIVE = 2,
++};
++
++enum barrier_gang_hint_phase {
++    BARRIER_GANG_PHASE_UNUSED = 0,
++    BARRIER_GANG_PHASE_IDLE = 1,
++    BARRIER_GANG_PHASE_COMPUTE = 2,
++    BARRIER_GANG_PHASE_WAITING = 3,
++};
++
++struct barrier_gang_hint_header {
++    __u32 magic;
++    __u32 abi_version;
++    __u32 active;
++    __u32 target_tgid;
++    __u32 max_workers;
++    __u32 loader_pid;
++    __u32 reserved32[2];
++    __u64 session_id;
++    __u64 reserved64[3];
++} __attribute__((aligned(64)));
++
++struct barrier_gang_hint_slot {
++    __u32 sequence;
++    __u32 tid;
++    __u32 tgid;
++    __u32 ith;
++    __u32 n_threads;
++    __u32 phase;
++    __u32 node_index;
++    __u32 reserved32;
++    __u64 graph_epoch;
++    __u64 barrier_epoch;
++    __u64 session_id;
++    __u64 reserved64;
++} __attribute__((aligned(64)));
++
++struct barrier_gang_hint_page {
++    struct barrier_gang_hint_header header;
++    struct barrier_gang_hint_slot workers[BARRIER_GANG_HINT_MAX_WORKERS];
++};
++
++_Static_assert(sizeof(struct barrier_gang_hint_header) == 64,
++        "barrier gang hint header must occupy one cache line");
++_Static_assert(sizeof(struct barrier_gang_hint_slot) == 64,
++        "barrier gang worker slot must occupy one cache line");
++_Static_assert(sizeof(struct barrier_gang_hint_page) <= 4096,
++        "barrier gang hint page must fit in one page");
++
++#endif /* __SCX_RVV_BARRIER_HINT_H */
+diff --git a/ggml/src/ggml-cpu/scx-rvv-lease-control.h b/ggml/src/ggml-cpu/scx-rvv-lease-control.h
+new file mode 100644
+index 0000000..acc5c3c
+--- /dev/null
++++ b/ggml/src/ggml-cpu/scx-rvv-lease-control.h
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++#ifndef __SCX_RVV_LEASE_CONTROL_H
++#define __SCX_RVV_LEASE_CONTROL_H
++
++#ifndef __VMLINUX_H__
++#include <linux/types.h>
++#endif
++
++#define RVV_LEASE_CONTROL_MAGIC       0x524c4354U
++#define RVV_LEASE_CONTROL_ABI_VERSION 3U
++#define RVV_LEASE_CONTROL_WORKERS     8U
++#define RVV_LEASE_CONTROL_TEAMS       2U
++#define RVV_LEASE_WORKER_PAGE_SIZE    4096U
++#define RVV_LEASE_CONTROL_DEFAULT_DIR "/sys/fs/bpf/scx_rvv_dirty_lease"
++#define RVV_LEASE_CONFIG_MAP_NAME     "config"
++#define RVV_LEASE_WORKER_MAP_NAME     "workers"
++
++enum rvv_lease_control_mode {
++	RVV_LEASE_CONTROL_OFF = 0,
++	RVV_LEASE_CONTROL_OBSERVE = 1,
++	RVV_LEASE_CONTROL_ACTIVE = 2,
++};
++
++enum rvv_lease_model_hint_flags {
++	RVV_LEASE_MODEL_ACTIVE = 1U << 0,
++	RVV_LEASE_MODEL_LATENCY_SENSITIVE = 1U << 1,
++};
++
++enum rvv_lease_phase {
++	RVV_LEASE_PHASE_IDLE = 0,
++	RVV_LEASE_PHASE_PREFILL = 1,
++	RVV_LEASE_PHASE_DECODE = 2,
++	RVV_LEASE_PHASE_MIXED = 3,
++};
++
++struct rvv_lease_worker_header {
++	__u32 magic;
++	__u32 abi_version;
++	__u32 active;
++	__u32 target_tgid;
++	__u32 max_workers;
++	__u32 loader_pid;
++	__u32 team_id;
++	__u32 hint_flags;
++	__u64 session_id;
++	__u64 policy_epoch;
++	__u64 hint_epoch;
++	__u64 reserved64;
++} __attribute__((aligned(64)));
++
++struct rvv_lease_worker_slot {
++	__u32 sequence;
++	__u32 tid;
++	__u32 tgid;
++	__u32 ith;
++	__u32 n_threads;
++	__u32 flags;
++	__u64 session_id;
++	__u64 reserved64[4];
++} __attribute__((aligned(64)));
++
++struct rvv_lease_team_hint {
++	__u32 sequence;
++	__u32 phase;
++	__u32 active_workers;
++	__u32 flags;
++	__u32 prompt_tokens;
++	__u32 decode_tokens;
++	__u32 reserved32[2];
++	__u64 phase_epoch;
++	__u64 begin_ns;
++	__u64 expires_ns;
++	__u64 session_id;
++} __attribute__((aligned(64)));
++
++struct rvv_lease_worker_page {
++	struct rvv_lease_worker_header header;
++	struct rvv_lease_team_hint team_hint;
++	struct rvv_lease_worker_slot workers[RVV_LEASE_CONTROL_WORKERS];
++	__u8 reserved[RVV_LEASE_WORKER_PAGE_SIZE -
++			      sizeof(struct rvv_lease_worker_header) -
++			      sizeof(struct rvv_lease_team_hint) -
++			      sizeof(struct rvv_lease_worker_slot) *
++		      RVV_LEASE_CONTROL_WORKERS];
++};
++
++#ifndef __VMLINUX_H__
++_Static_assert(sizeof(struct rvv_lease_worker_header) == 64,
++	       "lease worker header must occupy one cache line");
++_Static_assert(sizeof(struct rvv_lease_worker_slot) == 64,
++		       "lease worker slot must occupy one cache line");
++_Static_assert(sizeof(struct rvv_lease_team_hint) == 64,
++		       "lease team hint must occupy one cache line");
++_Static_assert(sizeof(struct rvv_lease_worker_page) == RVV_LEASE_WORKER_PAGE_SIZE,
++	       "lease worker page must occupy one page");
++#endif
++
++#endif /* __SCX_RVV_LEASE_CONTROL_H */
+diff --git a/include/llama.h b/include/llama.h
+index e8374c5..1d6348b 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -203,6 +203,21 @@ extern "C" {
+         LLAMA_CONTEXT_TYPE_MTP     = 1,
+     };
+ 
++    enum llama_sched_phase {
++        LLAMA_SCHED_PHASE_AUTO = 0,
++        LLAMA_SCHED_PHASE_IDLE,
++        LLAMA_SCHED_PHASE_PREFILL,
++        LLAMA_SCHED_PHASE_DECODE,
++        LLAMA_SCHED_PHASE_MIXED,
++    };
++
++    struct llama_sched_hint {
++        uint32_t struct_size;
++        enum llama_sched_phase phase;
++        uint32_t prompt_tokens;
++        uint32_t decode_tokens;
++    };
++
+     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
+     typedef struct llama_token_data {
+         llama_token id; // token id
+@@ -954,6 +969,12 @@ extern "C" {
+             struct llama_context * ctx,
+               struct llama_batch   batch);
+ 
++    // Set a one-shot scheduling hint for the next llama_decode() call.
++    // The hint is ignored when no compatible sched_ext mmap endpoint is present.
++    LLAMA_API void llama_set_sched_hint(
++            struct llama_context          * ctx,
++            const struct llama_sched_hint * hint);
++
+     // Set the number of threads used for decoding
+     // n_threads is the number of threads used for generation (single token)
+     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ad36c06..d203dd4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1130,6 +1130,20 @@ void llama_context::set_warmup(bool value) {
+     //sched_need_reserve = true;
+ }
+ 
++void llama_context::set_sched_hint(const llama_sched_hint & hint) {
++    sched_hint = hint;
++    sched_hint.struct_size = sizeof(sched_hint);
++}
++
++void llama_context::clear_sched_hint() {
++    sched_hint = {
++        /* .struct_size   = */ sizeof(sched_hint),
++        /* .phase         = */ LLAMA_SCHED_PHASE_AUTO,
++        /* .prompt_tokens = */ 0,
++        /* .decode_tokens = */ 0,
++    };
++}
++
+ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+     if (!sampler && sampling.samplers.count(seq_id) == 0) {
+         return true;
+@@ -1306,7 +1320,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
+-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    enum llama_sched_phase phase = sched_hint.phase;
++    uint32_t prompt_tokens = sched_hint.prompt_tokens;
++    uint32_t decode_tokens = sched_hint.decode_tokens;
++
++    if (phase == LLAMA_SCHED_PHASE_AUTO) {
++        phase = ubatch.n_seq_tokens > 1 ? LLAMA_SCHED_PHASE_PREFILL : LLAMA_SCHED_PHASE_DECODE;
++        prompt_tokens = phase == LLAMA_SCHED_PHASE_PREFILL ? ubatch.n_tokens : 0;
++        decode_tokens = phase == LLAMA_SCHED_PHASE_DECODE ? ubatch.n_tokens : 0;
++    }
++
++    const auto status = graph_compute(
++            res->get_gf(), ubatch.n_tokens > 1, phase, prompt_tokens, decode_tokens);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
+@@ -2305,8 +2330,11 @@ llm_graph_params llama_context::graph_params(
+ }
+ 
+ ggml_status llama_context::graph_compute(
+-            ggml_cgraph * gf,
+-                   bool   batched) {
++            ggml_cgraph          * gf,
++            bool                   batched,
++            enum llama_sched_phase phase,
++            uint32_t               prompt_tokens,
++            uint32_t               decode_tokens) {
+     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
+     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+ 
+@@ -2316,6 +2344,12 @@ ggml_status llama_context::graph_compute(
+         if (set_threadpool_fn) {
+             set_threadpool_fn(backend_cpu, tp);
+         }
++        using set_sched_hint_fn_t = void (*)(ggml_backend_t, uint32_t, uint32_t, uint32_t);
++        auto * set_sched_hint_fn = (set_sched_hint_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_sched_hint");
++        if (set_sched_hint_fn) {
++            const uint32_t backend_phase = phase == LLAMA_SCHED_PHASE_AUTO ? 0 : (uint32_t) phase - 1;
++            set_sched_hint_fn(backend_cpu, backend_phase, prompt_tokens, decode_tokens);
++        }
+     }
+ 
+     // set the number of threads for all the backends
+@@ -3926,6 +3960,7 @@ int32_t llama_decode(
+         llama_context * ctx,
+           llama_batch   batch) {
+     const int ret = ctx->decode(batch);
++    ctx->clear_sched_hint();
+     if (ret != 0 && ret != 1) {
+         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+     }
+@@ -3933,6 +3968,20 @@ int32_t llama_decode(
+     return ret;
+ }
+ 
++void llama_set_sched_hint(
++        llama_context          * ctx,
++        const llama_sched_hint * hint) {
++    if (ctx == nullptr) {
++        return;
++    }
++    if (hint == nullptr || hint->struct_size < sizeof(llama_sched_hint) ||
++            hint->phase < LLAMA_SCHED_PHASE_AUTO || hint->phase > LLAMA_SCHED_PHASE_MIXED) {
++        ctx->clear_sched_hint();
++        return;
++    }
++    ctx->set_sched_hint(*hint);
++}
++
+ //
+ // perf
+ //
+diff --git a/src/llama-context.h b/src/llama-context.h
+index d03f681..d1905a4 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -113,6 +113,8 @@ struct llama_context {
+     void set_embeddings_pre_norm(bool value, bool masked);
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
++    void set_sched_hint(const llama_sched_hint & hint);
++    void clear_sched_hint();
+ 
+     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+ 
+@@ -236,7 +238,12 @@ public:
+     llm_graph_result * get_gf_res_reserve() const;
+ 
+     // returns the result of ggml_backend_sched_graph_compute_async execution
+-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
++    ggml_status graph_compute(
++            ggml_cgraph          * gf,
++            bool                   batched,
++            enum llama_sched_phase phase = LLAMA_SCHED_PHASE_AUTO,
++            uint32_t               prompt_tokens = 0,
++            uint32_t               decode_tokens = 0);
+ 
+     // reserve a graph with a dummy ubatch of the specified size
+     ggml_cgraph * graph_reserve(
+@@ -268,6 +275,13 @@ private:
+ 
+     llama_cparams cparams;
+ 
++    llama_sched_hint sched_hint = {
++        /* .struct_size   = */ sizeof(llama_sched_hint),
++        /* .phase         = */ LLAMA_SCHED_PHASE_AUTO,
++        /* .prompt_tokens = */ 0,
++        /* .decode_tokens = */ 0,
++    };
++
+     llama_adapter_cvec_ptr  cvec;
+     llama_adapter_loras_ptr loras;
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index ae9e0bf..b0cef7f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2524,6 +2524,7 @@ private:
+ 
+             slot.update_batch(batch);
+         }
++        const int32_t n_decode_tokens_in_batch = batch.n_tokens;
+ 
+         // process in chunks of params.n_batch
+         int32_t n_batch  = llama_n_batch(ctx_tgt);
+@@ -3108,6 +3109,18 @@ private:
+                 batch.logits   + i,
+             };
+ 
++            const int32_t n_decode_tokens = std::max(
++                    0, std::min(i + n_tokens, n_decode_tokens_in_batch) - i);
++            const int32_t n_prompt_tokens = n_tokens - n_decode_tokens;
++            const llama_sched_hint sched_hint = {
++                /* .struct_size   = */ sizeof(llama_sched_hint),
++                /* .phase         = */ n_prompt_tokens > 0 && n_decode_tokens > 0 ? LLAMA_SCHED_PHASE_MIXED :
++                                       n_prompt_tokens > 0 ? LLAMA_SCHED_PHASE_PREFILL : LLAMA_SCHED_PHASE_DECODE,
++                /* .prompt_tokens = */ (uint32_t) n_prompt_tokens,
++                /* .decode_tokens = */ (uint32_t) n_decode_tokens,
++            };
++            llama_set_sched_hint(ctx_tgt, &sched_hint);
++
+             const int ret = llama_decode(ctx_tgt, batch_view);
+ 
+             metrics.on_decoded(slots);
+-- 
+2.54.0
+
