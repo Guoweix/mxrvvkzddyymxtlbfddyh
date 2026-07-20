@@ -54,9 +54,6 @@
 - histogram 使用 log2 微秒桶：bucket 0 表示 `<1us`，bucket N 表示
   `[2^(N-1), 2^N-1] us`。
 
-注意：本工具不能直接统计真实 V save/restore 指令路径耗时。它用于验证采集框架、
-目标线程过滤、调度频率、off-CPU / wake-to-run 延迟和 V 状态候选事件频率。若需要
-真实 V save/restore 耗时，需要第二阶段内核 tracepoint。
 
 ## 构建
 

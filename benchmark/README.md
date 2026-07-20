@@ -27,7 +27,6 @@ experiments/benchmark/
 
 ```text
 experiments/scx_llm_pin/
-experiments/scx_rvv_exclusive/
 experiments/rvv_sched_cost/
 experiments/ggml_barrier_count/
 ```
@@ -213,9 +212,6 @@ PHASE_GATE_MAX_RETRIES=5 PHASE_GATE_TOKENS=1
 | `rvv_dirty_lease_user_active` | dirty lease 快路径不变；默认沿用自然唯一分配，可运行时更新 lease 参数并按需启用 `ith -> CPU` 映射 |
 | `rvv_dirty_local_all` | RVV Dirty vector 长时间片 + LLM 辅助线程本地 DSQ |
 | `rvv_dirty_6_2` | CPU0-5 激进计算核心，CPU6-7 普通/回退核心 |
-| `rvv_exclusive_6_2` | CPU2-7 RVV 专用核心，CPU0-1 普通核心 |
-| `rvv_lpedf_all` | 全核心 RVV Dirty + Limited-Preemption EDF vtime DSQ |
-| `rvv_barrier_gang_active` | llama.cpp 发布 barrier epoch/worker 状态，sched_ext 对 7/8 laggard 和 8/8 release 做有界 boost |
 
 `rvv_dirty_lease_all` 的唯一 CPU 分配不是普通 affinity 对照。线程达到 RVV dirty 阈值后，会原子占用一个尚未分配的 CPU，并在后续 wakeup 中继续选择该 CPU。旧 lease 只保留 `prev_cpu`，偶尔会把两个 OpenMP worker 留在同一核；此时 barrier 的 7 个等待者会频繁耗尽自旋并进入 futex，形成百万级 wakeup/dispatch storm。当前所有启用 vector-local window 的 lease 都强制使用唯一 CPU 分配，不再提供旧行为入口。
 
@@ -243,11 +239,6 @@ PHASE_GATE_MAX_RETRIES=5 PHASE_GATE_TOKENS=1
 | `SCX_VECTOR_SLICE_MS` | `0` | RVV dirty vector 时间片，策略 preset 可覆盖 |
 | `SCX_VECTOR_LOCAL_WINDOW_MS` | `500` | vector DSQ 放行后 V 线程继续走 local DSQ 的窗口；旧版 `rvv_dirty_all` preset 设为 `0` |
 | `SCX_DIRTY_THRESHOLD` | `2` | RVV dirty 命中阈值，策略 preset 可覆盖 |
-| `SCX_LPEDF_SEGMENT_MS` | `50` | LP-EDF vector limited-preemption segment |
-| `SCX_LPEDF_PERIOD_MS` | `50` | LP-EDF vector virtual release period |
-| `SCX_LPEDF_DEADLINE_MS` | `50` | LP-EDF vector relative deadline |
-| `SCX_GANG_HINT_BOOST_US` | `250` | active barrier hint 的短时 local-head boost |
-| `SCX_GANG_HINT_LAGGARD_WAITERS` | `7` | 触发最后一个 worker laggard 检查的 barrier 到达数 |
 | `SCX_LEASE_CONTROL_MODE` | `off` | dirty lease 用户控制模式；策略 preset 设为 observe/active |
 | `SCX_LEASE_CONTROL_DIR` | `/sys/fs/bpf/scx_rvv_dirty_lease` | pinned config 和 worker map 目录 |
 | `SCX_LEASE_USER_CPU_MAP` | `auto` | `auto` 保留 dirty lease 自然唯一分配；也可传 8 个唯一 CPU，显式指定 OpenMP `ith=0..7` 的 home CPU |
@@ -264,8 +255,6 @@ PHASE_GATE_MAX_RETRIES=5 PHASE_GATE_TOKENS=1
 
 ```bash
 SCX_LOCAL_BIN=../scx_llm_pin/scx_llm_pin
-SCX_EXCLUSIVE_LOCAL_BIN=../scx_rvv_exclusive/scx_rvv_exclusive
-SCX_LPEDF_LOCAL_BIN=../scx_rvv_lpedf/scx_rvv_lpedf
 RVV_LOCAL_BIN=../rvv_sched_cost/rvv_sched_cost
 RVV_LOCAL_LIBELF=../../jupiter-buildroot/output/k1_v2/target/usr/lib/libelf-0.186.so
 ```
@@ -385,7 +374,7 @@ RVV_TRACE=1 RVV_TRACE_SWITCH_REASON=0 ./benchmark.sh --strategy rvv_dirty_all
 
 `benchmark/barrier_c4/run_compare.sh` 是独立的 barrier 对照测试。它固定
 `-np 4`、并发 4、`-t 8 -tb 8`，使用 32-token 短 prompt 和较长流式输出，比较
-CFS、稳定版 `rvv_dirty_lease` 或当前 `rvv_barrier_gang` 的 OpenMP 主导 futex
+CFS 或稳定版 `rvv_dirty_lease` 的 OpenMP 主导 futex
 blocked time。该脚本使用
 `rvv_sched_cost --futex-only` 的 syscall enter/exit 配对，不使用会在当前内核触发
 `SIGILL` 的 barrier uprobe。完整口径和命令见 `benchmark/barrier_c4/README.md`。
@@ -421,7 +410,7 @@ sshpass -p bianbu ssh root@192.168.3.67 "dmesg | tail -80"
 
 ```bash
 sshpass -p bianbu ssh root@192.168.3.67 \
-  "ps w | grep -E 'scx_llm_pin|scx_rvv_exclusive|rvv_sched_cost' | grep -v grep || true"
+  "ps w | grep -E 'scx_llm_pin|rvv_sched_cost' | grep -v grep || true"
 ```
 
 如果出现 `sched_ext: BPF scheduler ... errored, disabling`，该轮结果需要标记为被 watchdog 污染，不能作为完整策略结果。

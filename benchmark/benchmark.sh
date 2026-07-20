@@ -124,25 +124,9 @@ RESULTS_DIR=$(resolve_local_path "$RESULTS_DIR")
 LOG_DIR=$(resolve_local_path "$LOG_DIR")
 SCX_LOCAL_BIN=$(resolve_local_path "$SCX_LOCAL_BIN")
 SCX_LEASE_CTL_LOCAL_BIN=$(resolve_local_path "$SCX_LEASE_CTL_LOCAL_BIN")
-SCX_EXCLUSIVE_LOCAL_BIN=$(resolve_local_path "$SCX_EXCLUSIVE_LOCAL_BIN")
-SCX_LPEDF_LOCAL_BIN=$(resolve_local_path "$SCX_LPEDF_LOCAL_BIN")
-SCX_GANG_LOCAL_BIN=$(resolve_local_path "$SCX_GANG_LOCAL_BIN")
-SCX_GANG_HINT_LOCAL_LIB=$(resolve_local_path "$SCX_GANG_HINT_LOCAL_LIB")
 SCX_LEASE_HINT_LOCAL_LIB=$(resolve_local_path "$SCX_LEASE_HINT_LOCAL_LIB")
 RVV_LOCAL_BIN=$(resolve_local_path "$RVV_LOCAL_BIN")
 RVV_LOCAL_LIBELF=$(resolve_local_path "$RVV_LOCAL_LIBELF")
-
-is_rvv_exclusive_scheduler() {
-    [ "${SCX_LOADER_STRATEGY:-}" = "rvv_exclusive" ]
-}
-
-is_rvv_lpedf_scheduler() {
-    [ "${SCX_LOADER_STRATEGY:-}" = "rvv_lpedf" ]
-}
-
-is_rvv_barrier_gang_scheduler() {
-    [ "${BENCHMARK_STRATEGY:-}" = "rvv_barrier_gang_active" ]
-}
 
 is_user_controlled_lease_scheduler() {
     [ "${BENCHMARK_STRATEGY:-}" = "rvv_dirty_lease_user_observe" ] ||
@@ -382,49 +366,9 @@ apply_strategy_preset() {
             SCX_SWITCH_ALL="1"
             SCX_WORKER_ONLY="0"
             ;;
-        rvv_exclusive_6_2)
-            SCX_LOADER_STRATEGY="rvv_exclusive"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-1"
-            SCX_VECTOR_CPUS="2-7"
-            SCX_ORDINARY_CPUS="0-1"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_VECTOR_SLICE_MS="1000"
-            SCX_ORDINARY_VECTOR_SLICE_MS="0"
-            SCX_DIRTY_THRESHOLD="2"
-            SCX_FALLBACK_EVERY="4"
-            SCX_SWITCH_ALL="1"
-            SCX_WORKER_ONLY="0"
-            ;;
-        rvv_lpedf_all)
-            SCX_LOADER_STRATEGY="rvv_lpedf"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_VECTOR_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_DIRTY_THRESHOLD="2"
-            SCX_LPEDF_SEGMENT_MS="50"
-            SCX_LPEDF_PERIOD_MS="50"
-            SCX_LPEDF_DEADLINE_MS="50"
-            SCX_SWITCH_ALL="1"
-            SCX_WORKER_ONLY="0"
-            ;;
-        rvv_barrier_gang_active)
-            SCX_LOADER_STRATEGY="rvv_dirty"
-            SCX_LLM_CPUS="0-7"
-            SCX_SYSTEM_CPUS="0-7"
-            SCX_VECTOR_CPUS="0-7"
-            SCX_SLICE_MS="0"
-            SCX_SYSTEM_SLICE_MS="0"
-            SCX_DIRTY_THRESHOLD="2"
-            SCX_SWITCH_ALL="1"
-            SCX_WORKER_ONLY="0"
-            ;;
         *)
             log_error "未知策略: $BENCHMARK_STRATEGY"
-			echo "可选策略: cfs, linux_affinity, scx_global, pin_all, pin_0_3_iso_4_7, pin_4_7_iso_0_3, long_slice, local_dsq, local_dsq_50ms, local_dsq_100ms, long_slice_isolated, llm_only_pin, llm_only_local_dsq, llm_only_local_dsq_50ms, llm_workers_pin, llm_workers_local_dsq, rvv_dirty_all, rvv_dirty_bind_all, rvv_dirty_lease_all, rvv_dirty_lease_unique_all, rvv_dirty_lease_user_observe, rvv_dirty_lease_user_active, rvv_dirty_local_all, rvv_dirty_6_2, rvv_exclusive_6_2, rvv_lpedf_all, rvv_barrier_gang_active"
+            echo "可选策略: cfs, linux_affinity, scx_global, pin_all, pin_0_3_iso_4_7, pin_4_7_iso_0_3, long_slice, local_dsq, local_dsq_50ms, local_dsq_100ms, long_slice_isolated, llm_only_pin, llm_only_local_dsq, llm_only_local_dsq_50ms, llm_workers_pin, llm_workers_local_dsq, rvv_dirty_all, rvv_dirty_bind_all, rvv_dirty_lease_all, rvv_dirty_lease_unique_all, rvv_dirty_lease_user_observe, rvv_dirty_lease_user_active, rvv_dirty_local_all, rvv_dirty_6_2"
             exit 1
             ;;
     esac
@@ -457,9 +401,6 @@ list_strategies() {
   rvv_dirty_lease_user_active   dirty lease + 用户CPU映射和运行时参数控制
   rvv_dirty_local_all    RVV Dirty vector 长时间片 + LLM 辅助线程本地 DSQ
   rvv_dirty_6_2          CPU0-5 激进计算核心，CPU6-7 普通/回退核心
-  rvv_exclusive_6_2      CPU2-7 RVV专用核心，vector 使用长时间片、本地DSQ；CPU0-1 普通核心
-  rvv_lpedf_all          全核心 RVV Dirty + Limited-Preemption EDF vtime DSQ
-  rvv_barrier_gang_active 用户态 barrier hint 指导的 bounded gang boost
 EOF
 }
 
@@ -515,18 +456,14 @@ start_llm_server() {
         # 启动服务器
         log_info "启动llama-server..."
         local gomp_env=""
-        local gang_hint_env=""
         local lease_hint_env=""
         if [ -n "${GOMP_SPINCOUNT:-}" ]; then
             gomp_env="GOMP_SPINCOUNT=$GOMP_SPINCOUNT"
         fi
-        if is_rvv_barrier_gang_scheduler && [ "${GANG_HINT_RUNTIME_PREPARED:-0}" -eq 1 ]; then
-            gang_hint_env="GGML_SCX_GANG_HINT_PATH=$SCX_GANG_HINT_MAP"
-        fi
         if is_user_controlled_lease_scheduler && [ "${LEASE_HINT_RUNTIME_PREPARED:-0}" -eq 1 ]; then
             lease_hint_env="GGML_SCX_LEASE_HINT_PATH=$SCX_LEASE_CONTROL_DIR/workers"
         fi
-        ssh_exec "cd '$LLM_PATH' && $gang_hint_env $lease_hint_env $gomp_env THREADS=$LLM_THREADS THREADS_BATCH=$LLM_THREADS_BATCH PARALLEL=$LLM_PARALLEL CTX=$LLM_CONTEXT nohup ./run-server.sh > /tmp/llama-server.log 2>&1 &"
+        ssh_exec "cd '$LLM_PATH' && $lease_hint_env $gomp_env THREADS=$LLM_THREADS THREADS_BATCH=$LLM_THREADS_BATCH PARALLEL=$LLM_PARALLEL CTX=$LLM_CONTEXT nohup ./run-server.sh > /tmp/llama-server.log 2>&1 &"
     else
         log_info "复用现有llama-server（RESTART_LLM=0）..."
     fi
@@ -774,10 +711,6 @@ SCX_ACTIVE=0
 SCX_ACTIVE_LOG=""
 SCX_ACTIVE_PATTERN="scx_llm_pin"
 CURRENT_RESULT_DIR=""
-GANG_HINT_RUNTIME_PREPARED=0
-GANG_HINT_BPFFS_MOUNTED=0
-GANG_HINT_REMOTE_BACKUP=""
-GANG_HINT_ORIGINAL_SHA=""
 LEASE_HINT_RUNTIME_PREPARED=0
 LEASE_HINT_BPFFS_MOUNTED=0
 LEASE_HINT_REMOTE_BACKUP=""
@@ -789,27 +722,10 @@ deploy_scheduler() {
     local remote_bin
     local build_target
 
-    if is_rvv_exclusive_scheduler; then
-        local_bin="$SCX_EXCLUSIVE_LOCAL_BIN"
-        remote_dir="$SCX_EXCLUSIVE_REMOTE_DIR"
-        remote_bin="scx_rvv_exclusive"
-        build_target="experiments/scx_rvv_exclusive"
-    elif is_rvv_lpedf_scheduler; then
-        local_bin="$SCX_LPEDF_LOCAL_BIN"
-        remote_dir="$SCX_LPEDF_REMOTE_DIR"
-        remote_bin="scx_rvv_lpedf"
-        build_target="experiments/scx_rvv_lpedf"
-    elif is_rvv_barrier_gang_scheduler; then
-        local_bin="$SCX_GANG_LOCAL_BIN"
-        remote_dir="$SCX_GANG_REMOTE_DIR"
-        remote_bin="scx_rvv_barrier_gang"
-        build_target="experiments/scx_rvv_barrier_gang"
-    else
-        local_bin="$SCX_LOCAL_BIN"
-        remote_dir="$SCX_REMOTE_DIR"
-        remote_bin="scx_llm_pin"
-        build_target="experiments/scx_llm_pin"
-    fi
+    local_bin="$SCX_LOCAL_BIN"
+    remote_dir="$SCX_REMOTE_DIR"
+    remote_bin="scx_llm_pin"
+    build_target="experiments/scx_llm_pin"
 
     if [ ! -x "$local_bin" ]; then
         log_error "找不到可执行调度器: $local_bin"
@@ -935,91 +851,12 @@ start_scheduler() {
         exit 1
     fi
 
-    if is_rvv_exclusive_scheduler; then
-        scheduler_dir="$SCX_EXCLUSIVE_REMOTE_DIR"
-        scheduler_bin="scx_rvv_exclusive"
-        scheduler_pattern="scx_rvv_exclusive"
-    elif is_rvv_lpedf_scheduler; then
-        scheduler_dir="$SCX_LPEDF_REMOTE_DIR"
-        scheduler_bin="scx_rvv_lpedf"
-        scheduler_pattern="scx_rvv_lpedf"
-    elif is_rvv_barrier_gang_scheduler; then
-        scheduler_dir="$SCX_GANG_REMOTE_DIR"
-        scheduler_bin="scx_rvv_barrier_gang"
-        scheduler_pattern="scx_rvv_barrier_gang"
-    fi
-
     SCX_ACTIVE_PATTERN="$scheduler_pattern"
     SCX_ACTIVE_LOG="/tmp/${scheduler_bin}_${BENCHMARK_STRATEGY}_$(date +%s).log"
 
     log_info "清理已有 sched_ext 调度器..."
     remote_kill_by_pattern "scx_llm_pin" "-TERM"
-    remote_kill_by_pattern "scx_rvv_exclusive" "-TERM"
-    remote_kill_by_pattern "scx_rvv_lpedf" "-TERM"
-    remote_kill_by_pattern "scx_rvv_barrier_gang" "-TERM"
     sleep 1
-
-    if is_rvv_exclusive_scheduler; then
-        local switch_all_arg=""
-        if [ "${SCX_SWITCH_ALL:-1}" = "0" ]; then
-            switch_all_arg="--no-switch-all"
-        fi
-
-        log_info "启动策略: loader=$SCX_LOADER_STRATEGY, tgid=$llm_pid, compute_cpus=$SCX_VECTOR_CPUS, ordinary_cpus=$SCX_ORDINARY_CPUS, compute_slice=${SCX_VECTOR_SLICE_MS}ms, ordinary_vector_slice=${SCX_ORDINARY_VECTOR_SLICE_MS}ms, dirty_threshold=${SCX_DIRTY_THRESHOLD}, ordinary_every=${SCX_FALLBACK_EVERY}, switch_all=${SCX_SWITCH_ALL}"
-        ssh_exec "cd '$scheduler_dir' && nohup ./$scheduler_bin --tgid '$llm_pid' --compute-cpus '$SCX_VECTOR_CPUS' --ordinary-cpus '$SCX_ORDINARY_CPUS' --compute-slice-ms '$SCX_VECTOR_SLICE_MS' --ordinary-vector-slice-ms '$SCX_ORDINARY_VECTOR_SLICE_MS' --system-slice-ms '$SCX_SYSTEM_SLICE_MS' --dirty-threshold '$SCX_DIRTY_THRESHOLD' --ordinary-every '$SCX_FALLBACK_EVERY' $switch_all_arg > '$SCX_ACTIVE_LOG' 2>&1 &"
-        sleep 3
-
-        if [ -n "$(remote_pid_by_pattern "$scheduler_pattern")" ]; then
-            SCX_ACTIVE=1
-            log_info "✓ sched_ext策略已启动"
-            ssh_exec "cat /sys/kernel/sched_ext/state 2>/dev/null || true" > "$result_dir/sched_ext_state_start.txt"
-        else
-            log_error "sched_ext策略启动失败，远端日志如下："
-            ssh_exec "cat '$SCX_ACTIVE_LOG' 2>/dev/null || true"
-            exit 1
-        fi
-        return 0
-    fi
-
-    if is_rvv_lpedf_scheduler; then
-        local switch_all_arg=""
-        if [ "${SCX_SWITCH_ALL:-1}" = "0" ]; then
-            switch_all_arg="--llm-only"
-        fi
-
-        log_info "启动策略: loader=$SCX_LOADER_STRATEGY, tgid=$llm_pid, llm_cpus=$SCX_LLM_CPUS, system_cpus=$SCX_SYSTEM_CPUS, vector_cpus=$SCX_VECTOR_CPUS, segment=${SCX_LPEDF_SEGMENT_MS}ms, period=${SCX_LPEDF_PERIOD_MS}ms, deadline=${SCX_LPEDF_DEADLINE_MS}ms, dirty_threshold=${SCX_DIRTY_THRESHOLD}, switch_all=${SCX_SWITCH_ALL}"
-        ssh_exec "cd '$scheduler_dir' && nohup ./$scheduler_bin --tgid '$llm_pid' --llm-cpus '$SCX_LLM_CPUS' --system-cpus '$SCX_SYSTEM_CPUS' --vector-cpus '$SCX_VECTOR_CPUS' --slice-ms '$SCX_SLICE_MS' --system-slice-ms '$SCX_SYSTEM_SLICE_MS' --segment-ms '$SCX_LPEDF_SEGMENT_MS' --period-ms '$SCX_LPEDF_PERIOD_MS' --deadline-ms '$SCX_LPEDF_DEADLINE_MS' --dirty-threshold '$SCX_DIRTY_THRESHOLD' $switch_all_arg > '$SCX_ACTIVE_LOG' 2>&1 &"
-        sleep 3
-
-        if [ -n "$(remote_pid_by_pattern "$scheduler_pattern")" ]; then
-            SCX_ACTIVE=1
-            log_info "✓ sched_ext策略已启动"
-            ssh_exec "cat /sys/kernel/sched_ext/state 2>/dev/null || true" > "$result_dir/sched_ext_state_start.txt"
-        else
-            log_error "sched_ext策略启动失败，远端日志如下："
-            ssh_exec "cat '$SCX_ACTIVE_LOG' 2>/dev/null || true"
-            exit 1
-        fi
-        return 0
-    fi
-
-    if is_rvv_barrier_gang_scheduler; then
-        log_info "启动 active barrier gang: tgid=$llm_pid, dirty_threshold=$SCX_DIRTY_THRESHOLD, hint_waiters=$SCX_GANG_HINT_LAGGARD_WAITERS, hint_boost=${SCX_GANG_HINT_BOOST_US}us"
-        ssh_exec "cd '$scheduler_dir' && nohup ./$scheduler_bin --tgid '$llm_pid' --strategy rvv_dirty --llm-cpus '$SCX_LLM_CPUS' --system-cpus '$SCX_SYSTEM_CPUS' --vector-cpus '$SCX_VECTOR_CPUS' --slice-ms '$SCX_SLICE_MS' --system-slice-ms '$SCX_SYSTEM_SLICE_MS' --dirty-threshold '$SCX_DIRTY_THRESHOLD' --wakeup-window-us '$SCX_GANG_WAKEUP_WINDOW_US' --gang-min-wakeups '$SCX_GANG_MIN_WAKEUPS' --gang-boost-us '$SCX_GANG_BOOST_US' --gang-cooldown-us '$SCX_GANG_COOLDOWN_US' --service-window-us '$SCX_GANG_SERVICE_WINDOW_US' --laggard-threshold-us '$SCX_GANG_LAGGARD_THRESHOLD_US' --hint-mode '$SCX_GANG_HINT_MODE' --hint-map '$SCX_GANG_HINT_MAP' --hint-boost-us '$SCX_GANG_HINT_BOOST_US' --hint-laggard-waiters '$SCX_GANG_HINT_LAGGARD_WAITERS' > '$SCX_ACTIVE_LOG' 2>&1 &"
-        sleep 3
-
-        if [ -n "$(remote_pid_by_pattern "$scheduler_pattern")" ] && \
-           ssh_exec "grep -q 'scx_rvv_barrier_gang attached successfully' '$SCX_ACTIVE_LOG'"; then
-            SCX_ACTIVE=1
-            log_info "✓ active barrier gang 已启动"
-            ssh_exec "cat /sys/kernel/sched_ext/state 2>/dev/null || cat /sys/kernel/debug/sched/ext 2>/dev/null || true" > "$result_dir/sched_ext_state_start.txt"
-        else
-            log_error "active barrier gang 启动失败，远端日志如下："
-            ssh_exec "cat '$SCX_ACTIVE_LOG' 2>/dev/null || true"
-            exit 1
-        fi
-        return 0
-    fi
 
     local llm_only_arg=""
     local tid_list_arg=""
@@ -1077,69 +914,6 @@ stop_scheduler() {
     fi
 
     SCX_ACTIVE=0
-}
-
-prepare_barrier_gang_runtime() {
-    if ! is_rvv_barrier_gang_scheduler || [ "$GANG_HINT_RUNTIME_PREPARED" -eq 1 ]; then
-        return 0
-    fi
-    if [ ! -f "$SCX_GANG_HINT_LOCAL_LIB" ]; then
-        log_error "找不到 userspace hint 版 libggml-cpu: $SCX_GANG_HINT_LOCAL_LIB"
-        exit 1
-    fi
-
-    log_header "准备 barrier gang userspace hint runtime"
-    stop_llm_server
-    ssh_exec "mkdir -p '/sys/fs/bpf' '$SCX_GANG_REMOTE_DIR/runtime'"
-    if ! ssh_exec "awk '\$2 == \"/sys/fs/bpf\" && \$3 == \"bpf\" { found=1 } END { exit !found }' /proc/mounts"; then
-        ssh_exec "mount -t bpf bpf /sys/fs/bpf"
-        GANG_HINT_BPFFS_MOUNTED=1
-    fi
-
-    GANG_HINT_REMOTE_BACKUP="$SCX_GANG_REMOTE_DIR/runtime/libggml-cpu.so.0.13.0.original.$$"
-    ssh_exec "test -f '$SCX_GANG_HINT_REMOTE_LIB' && cp -f '$SCX_GANG_HINT_REMOTE_LIB' '$GANG_HINT_REMOTE_BACKUP'"
-    GANG_HINT_ORIGINAL_SHA=$(ssh_exec "sha256sum '$GANG_HINT_REMOTE_BACKUP' | awk '{print \$1}'")
-    GANG_HINT_RUNTIME_PREPARED=1
-    scp_upload "$SCX_GANG_HINT_LOCAL_LIB" "$SCX_GANG_REMOTE_DIR/runtime/libggml-cpu.so.0.13.0.hint"
-    ssh_exec "cp -f '$SCX_GANG_REMOTE_DIR/runtime/libggml-cpu.so.0.13.0.hint' '$SCX_GANG_HINT_REMOTE_LIB'; sync"
-
-    local expected_sha
-    local deployed_sha
-    expected_sha=$(sha256sum "$SCX_GANG_HINT_LOCAL_LIB" | awk '{print $1}')
-    deployed_sha=$(ssh_exec "sha256sum '$SCX_GANG_HINT_REMOTE_LIB' | awk '{print \$1}'")
-    if [ "$deployed_sha" != "$expected_sha" ]; then
-        log_error "userspace hint libggml-cpu 部署哈希不匹配"
-        exit 1
-    fi
-    log_info "✓ userspace hint runtime 已部署: $deployed_sha"
-}
-
-restore_barrier_gang_runtime() {
-    if [ "$GANG_HINT_RUNTIME_PREPARED" -ne 1 ]; then
-        return 0
-    fi
-
-    log_header "恢复默认 llama.cpp runtime"
-    stop_llm_server
-    ssh_exec "rm -f '$SCX_GANG_HINT_MAP'; rmdir '${SCX_GANG_HINT_MAP%/*}' 2>/dev/null || true"
-    ssh_exec "cp -f '$GANG_HINT_REMOTE_BACKUP' '$SCX_GANG_HINT_REMOTE_LIB'; sync"
-    local restored_sha
-    restored_sha=$(ssh_exec "sha256sum '$SCX_GANG_HINT_REMOTE_LIB' | awk '{print \$1}'")
-    if [ "$restored_sha" != "$GANG_HINT_ORIGINAL_SHA" ]; then
-        log_error "恢复原始 libggml-cpu 后哈希不匹配"
-        return 1
-    fi
-    ssh_exec "rm -f '$GANG_HINT_REMOTE_BACKUP'"
-    if [ "$GANG_HINT_BPFFS_MOUNTED" -eq 1 ]; then
-        ssh_exec "umount /sys/fs/bpf"
-        GANG_HINT_BPFFS_MOUNTED=0
-    fi
-    GANG_HINT_RUNTIME_PREPARED=0
-    if ! start_llm_server; then
-        log_error "原始 libggml-cpu 已恢复，但默认 llama-server 重启失败"
-        return 1
-    fi
-    log_info "✓ 已恢复原始 libggml-cpu 和默认服务"
 }
 
 prepare_lease_hint_runtime() {
@@ -1246,35 +1020,6 @@ validate_user_controlled_lease_ready() {
     echo "status=failed" > "$result_dir/lease_control_qualification.txt"
     log_error "dirty lease userspace control qualification 失败"
     ssh_exec "tail -160 '$SCX_ACTIVE_LOG' 2>/dev/null || true"
-    exit 1
-}
-
-validate_barrier_gang_ready() {
-    local result_dir=$1
-    if ! is_rvv_barrier_gang_scheduler; then
-        return 0
-    fi
-
-    local attempt
-    for attempt in $(seq 1 40); do
-        local checks=""
-        local ith
-        for ith in $(seq 0 7); do
-            checks="$checks grep -q 'hint ith=$ith ' '$SCX_ACTIVE_LOG' &&"
-        done
-        if ssh_exec "${checks%&&}" >/dev/null 2>&1 && \
-           ssh_exec "grep -Eq 'RVV vector threads:[[:space:]]+8' '$SCX_ACTIVE_LOG'"; then
-            echo "status=ready" > "$result_dir/barrier_gang_qualification.txt"
-            echo "attempt=$attempt" >> "$result_dir/barrier_gang_qualification.txt"
-            log_info "✓ active hints 已发布 ith=0..7，且识别 8 个 RVV worker"
-            return 0
-        fi
-        sleep 0.25
-    done
-
-    echo "status=failed" > "$result_dir/barrier_gang_qualification.txt"
-    log_error "active barrier gang qualification 失败"
-    ssh_exec "tail -120 '$SCX_ACTIVE_LOG' 2>/dev/null || true"
     exit 1
 }
 
@@ -1713,19 +1458,6 @@ SCX Ordinary Vector Slice ms: $SCX_ORDINARY_VECTOR_SLICE_MS
 SCX Vector Local Window ms: $SCX_VECTOR_LOCAL_WINDOW_MS
 SCX Dirty Threshold: $SCX_DIRTY_THRESHOLD
 SCX Fallback Every: $SCX_FALLBACK_EVERY
-SCX LPEDF Segment ms: $SCX_LPEDF_SEGMENT_MS
-SCX LPEDF Period ms: $SCX_LPEDF_PERIOD_MS
-SCX LPEDF Deadline ms: $SCX_LPEDF_DEADLINE_MS
-SCX Gang Wakeup Window us: $SCX_GANG_WAKEUP_WINDOW_US
-SCX Gang Min Wakeups: $SCX_GANG_MIN_WAKEUPS
-SCX Gang Boost us: $SCX_GANG_BOOST_US
-SCX Gang Cooldown us: $SCX_GANG_COOLDOWN_US
-SCX Gang Service Window us: $SCX_GANG_SERVICE_WINDOW_US
-SCX Gang Laggard Threshold us: $SCX_GANG_LAGGARD_THRESHOLD_US
-SCX Gang Hint Mode: $SCX_GANG_HINT_MODE
-SCX Gang Hint Map: $SCX_GANG_HINT_MAP
-SCX Gang Hint Boost us: $SCX_GANG_HINT_BOOST_US
-SCX Gang Hint Laggard Waiters: $SCX_GANG_HINT_LAGGARD_WAITERS
 SCX Lease Control Mode: $SCX_LEASE_CONTROL_MODE
 SCX Lease Control Dir: $SCX_LEASE_CONTROL_DIR
 SCX Lease User CPU Map: $SCX_LEASE_USER_CPU_MAP
@@ -1766,7 +1498,6 @@ EOF
 
     # 只有首 token 相位通过门禁后，才开始正式计时和 RVV tracing。
     run_phase_gate "$result_dir"
-    validate_barrier_gang_ready "$result_dir"
     validate_user_controlled_lease_ready "$result_dir"
 
     # 启动调度观测，覆盖正式benchmark窗口和请求收尾阶段
@@ -1848,7 +1579,7 @@ PY
 
     log_info "✓ 所有任务已完成"
 
-    if is_rvv_barrier_gang_scheduler || is_user_controlled_lease_scheduler; then
+    if is_user_controlled_lease_scheduler; then
         if [ -z "$(remote_pid_by_pattern "$SCX_ACTIVE_PATTERN")" ]; then
             echo "status=failed" > "$result_dir/scheduler_alive_end.txt"
             log_error "$BENCHMARK_STRATEGY 在正式请求结束前退出"
@@ -2036,12 +1767,6 @@ generate_report() {
         echo "SCX Vector Local Window: ${SCX_VECTOR_LOCAL_WINDOW_MS}ms"
         echo "SCX Dirty Threshold: $SCX_DIRTY_THRESHOLD"
         echo "SCX Fallback Every: $SCX_FALLBACK_EVERY"
-        echo "SCX LPEDF Segment: ${SCX_LPEDF_SEGMENT_MS}ms"
-        echo "SCX LPEDF Period: ${SCX_LPEDF_PERIOD_MS}ms"
-        echo "SCX LPEDF Deadline: ${SCX_LPEDF_DEADLINE_MS}ms"
-        echo "SCX Gang Hint Mode: $SCX_GANG_HINT_MODE"
-        echo "SCX Gang Hint Boost: ${SCX_GANG_HINT_BOOST_US}us"
-        echo "SCX Gang Hint Laggard Waiters: $SCX_GANG_HINT_LAGGARD_WAITERS"
         echo "SCX Lease Control Mode: $SCX_LEASE_CONTROL_MODE"
         echo "SCX Lease Control Dir: $SCX_LEASE_CONTROL_DIR"
         echo "SCX Lease User CPU Map: $SCX_LEASE_USER_CPU_MAP"
@@ -2335,9 +2060,6 @@ RVV Trace Futex Stack: $RVV_TRACE_FUTEX_STACK
 Affinity Pin Workers: $AFFINITY_PIN_WORKERS
 Affinity Worker CPUs: $AFFINITY_WORKER_CPUS
 Affinity Worker Count: $AFFINITY_WORKER_COUNT
-SCX Gang Hint Mode: $SCX_GANG_HINT_MODE
-SCX Gang Hint Boost us: $SCX_GANG_HINT_BOOST_US
-SCX Gang Hint Laggard Waiters: $SCX_GANG_HINT_LAGGARD_WAITERS
 SCX Lease Control Mode: $SCX_LEASE_CONTROL_MODE
 SCX Lease Control Dir: $SCX_LEASE_CONTROL_DIR
 SCX Lease User CPU Map: $SCX_LEASE_USER_CPU_MAP
@@ -2395,7 +2117,6 @@ cleanup() {
     stop_scheduler "$CURRENT_RESULT_DIR"
     # 停止所有后台任务
     jobs -p | xargs -r kill 2>/dev/null || true
-    restore_barrier_gang_runtime || restore_status=$?
     restore_lease_hint_runtime || restore_status=$?
     if [ "$exit_status" -eq 0 ] && [ "$restore_status" -ne 0 ]; then
         exit_status=$restore_status
@@ -2591,23 +2312,6 @@ main() {
     require_positive_int "PHASE_GATE_MAX_RETRIES" "${PHASE_GATE_MAX_RETRIES:-5}"
     require_positive_int "PHASE_GATE_TOKENS" "${PHASE_GATE_TOKENS:-1}"
     require_positive_int "PHASE_GATE_TIMEOUT_SEC" "${PHASE_GATE_TIMEOUT_SEC:-60}"
-    require_positive_int "SCX_GANG_WAKEUP_WINDOW_US" "$SCX_GANG_WAKEUP_WINDOW_US"
-    require_positive_int "SCX_GANG_MIN_WAKEUPS" "$SCX_GANG_MIN_WAKEUPS"
-    require_positive_int "SCX_GANG_BOOST_US" "$SCX_GANG_BOOST_US"
-    require_positive_int "SCX_GANG_COOLDOWN_US" "$SCX_GANG_COOLDOWN_US"
-    require_positive_int "SCX_GANG_SERVICE_WINDOW_US" "$SCX_GANG_SERVICE_WINDOW_US"
-    require_positive_int "SCX_GANG_LAGGARD_THRESHOLD_US" "$SCX_GANG_LAGGARD_THRESHOLD_US"
-    require_positive_int "SCX_GANG_HINT_BOOST_US" "$SCX_GANG_HINT_BOOST_US"
-    require_positive_int "SCX_GANG_HINT_LAGGARD_WAITERS" "$SCX_GANG_HINT_LAGGARD_WAITERS"
-    if [ "$SCX_GANG_MIN_WAKEUPS" -gt 8 ] || [ "$SCX_GANG_HINT_LAGGARD_WAITERS" -gt 7 ]; then
-        log_error "barrier gang worker 阈值超出 8-worker 策略范围"
-        exit 1
-    fi
-    if is_rvv_barrier_gang_scheduler && [ "$SCX_GANG_HINT_MODE" != "active" ]; then
-        log_error "当前 benchmark 策略 rvv_barrier_gang_active 要求 SCX_GANG_HINT_MODE=active"
-        exit 1
-    fi
-
     apply_strategy_preset
     if [ -n "$SCX_VECTOR_SLICE_OVERRIDE_MS" ]; then
         if ! [[ "$SCX_VECTOR_SLICE_OVERRIDE_MS" =~ ^[0-9]+$ ]]; then
@@ -2633,7 +2337,6 @@ main() {
 
     # 执行测试流程
     check_requirements
-    prepare_barrier_gang_runtime
     prepare_lease_hint_runtime
     run_benchmark_suite
 
