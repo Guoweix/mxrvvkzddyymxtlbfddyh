@@ -1,0 +1,36 @@
+flowchart TB
+    subgraph USER[User space]
+        LLAMA["patched llama-server<br/>OpenMP worker registration<br/>PREFILL / DECODE / MIXED phase"]
+        LOADER["scx_llm_pin loader<br/>load CO-RE BPF<br/>initialize maps<br/>attach struct_ops"]
+        CTL["rvv_lease_ctl<br/>status: read config/workers<br/>set/reset: update config"]
+    end
+
+    subgraph KERNEL[Linux kernel]
+        subgraph MAPS["Pinned BPF maps in bpffs"]
+            WORKERS["workers map<br/>TID / TGID / ith<br/>team phase / epoch"]
+            CONFIG["config map<br/>slice / vector window / threshold<br/>CPU map / control mode"]
+        end
+
+        TASK["task_struct + RISC-V Vector state<br/>cpus_ptr / task state / VS Dirty"]
+        BPF["sched_ext eBPF scheduler<br/>RVV dirty identification<br/>CPU assignment + phase-aware DSQ"]
+        CORE["Linux sched_ext core<br/>callbacks + DSQ/runqueue<br/>CPU scheduling and context switch"]
+    end
+
+    LLAMA -->|"BPF_OBJ_GET + mmap<br/>publish workers and phase"| WORKERS
+    LLAMA -->|"OpenMP threads"| TASK
+    LOADER -->|"create, initialize and pin"| MAPS
+    LOADER -->|"libbpf load + struct_ops attach"| BPF
+    CTL -->|"BPF_MAP_LOOKUP_ELEM"| WORKERS
+    CTL -->|"LOOKUP / UPDATE"| CONFIG
+    WORKERS -->|"map lookup"| BPF
+    CONFIG -->|"map lookup"| BPF
+    TASK -->|"BPF CO-RE read"| BPF
+    CORE -->|"select_cpu / enqueue / dispatch<br/>running / stopping"| BPF
+    BPF -->|"scx_bpf_dispatch / consume / kick_cpu"| CORE
+
+    classDef userspace fill:#ffffff,stroke:#2f6feb,stroke-width:2px,color:#1f2328;
+    classDef map fill:#fff8e6,stroke:#b45309,stroke-width:2px,color:#1f2328;
+    classDef kernel fill:#ffffff,stroke:#238636,stroke-width:2px,color:#1f2328;
+    class LLAMA,LOADER,CTL userspace;
+    class WORKERS,CONFIG map;
+    class TASK,BPF,CORE kernel;

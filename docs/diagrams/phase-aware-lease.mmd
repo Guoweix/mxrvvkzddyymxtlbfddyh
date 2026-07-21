@@ -1,0 +1,45 @@
+flowchart RL
+    CPU["CPU i<br/>run local DSQ head<br/>100ms vector slice"]
+    LOCAL["LOCAL DSQ (CPU i)<br/>only execution queue"]
+
+    subgraph SOURCES[Runnable sources for CPU i]
+        direction TB
+        GLOBAL["SCX_DSQ_GLOBAL<br/>ordinary / helper / kernel tasks<br/>kernel consumes first"]
+        subgraph VECTOR["VECTOR DSQs (one visual group)"]
+            direction TB
+            PHASE["phase hint chooses preferred team<br/>1s pending safety"]
+            VQ["VDSQ(A,i): A_i workers<br/>VDSQ(B,i): B_i workers<br/>two independent FIFO lanes"]
+        end
+    end
+
+    NORMAL["ordinary / helper / kernel task"]
+    A["A_i vector worker"]
+    B["B_i vector worker"]
+    FAST["direct-local exceptions<br/>startup identification<br/>preferred wakeup preempt"]
+
+    NORMAL -->|normal enqueue| GLOBAL
+    A -->|normal enqueue and wakeup| VQ
+    B -->|normal enqueue and wakeup| VQ
+    PHASE -.-> VQ
+
+    GLOBAL -->|kernel transfer| LOCAL
+    VQ -->|preferred / fallback consume| LOCAL
+    LOCAL -->|pick head| CPU
+
+    A -.-> FAST
+    B -.-> FAST
+    FAST -.->|SCX_DSQ_LOCAL + optional PREEMPT| LOCAL
+
+    classDef cpu fill:#ffffff,stroke:#1f2328,stroke-width:3px,color:#1f2328;
+    classDef local fill:#eef9fb,stroke:#087ea4,stroke-width:2px,color:#1f2328;
+    classDef global fill:#f6f8fa,stroke:#57606a,stroke-width:2px,color:#1f2328;
+    classDef teamA fill:#eefbf2,stroke:#238636,stroke-width:2px,color:#1f2328;
+    classDef teamB fill:#eef5ff,stroke:#2f6feb,stroke-width:2px,color:#1f2328;
+    classDef control fill:#fff8e6,stroke:#b45309,stroke-width:2px,color:#1f2328;
+    class CPU cpu;
+    class LOCAL,FAST local;
+    class GLOBAL,NORMAL global;
+    class A teamA;
+    class B teamB;
+    class VQ local;
+    class PHASE control;
