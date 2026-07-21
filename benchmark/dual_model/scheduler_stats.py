@@ -9,6 +9,9 @@ KEY_VALUE = re.compile(r"([a-zA-Z0-9_]+)=([0-9]+)")
 GANG_MODE = re.compile(
     r"--team-gang(?:=|\s+)(off|observe|always|prefill-lease)(?:\s|$)"
 )
+PHASE_WAKEUP_PREEMPT = re.compile(
+    r"--phase-wakeup-preempt(?:=|\s+)(on|off)(?:\s|$)"
+)
 
 
 def parse_values(line):
@@ -44,6 +47,9 @@ def detect_profile(strategy, command, requested="auto"):
     if mode == "observe":
         return "gang-observe"
     if mode == "prefill-lease":
+        preempt_match = PHASE_WAKEUP_PREEMPT.search(command)
+        if preempt_match and preempt_match.group(1) == "off":
+            return "phase-lease-no-preempt"
         return "phase-lease"
     if mode == "always":
         return "gang-active"
@@ -77,7 +83,12 @@ def validate_scheduler_log(path, profile):
         and stats.get("dsq_dispatches_team1") == stats.get("dsq_consumes_team1")
     )
 
-    if profile in {"gang-observe", "gang-active", "phase-lease"}:
+    if profile in {
+        "gang-observe",
+        "gang-active",
+        "phase-lease",
+        "phase-lease-no-preempt",
+    }:
         checks["phase_hints_seen"] = (
             stats.get("phase_valid", 0) > 0
             and stats.get("phase_prefill", 0) > 0
@@ -91,7 +102,7 @@ def validate_scheduler_log(path, profile):
             and stats.get("gang_quanta", 0) > 0
             and stats.get("gang_enqueues", 0) > 0
         )
-    if profile == "phase-lease":
+    if profile in {"phase-lease", "phase-lease-no-preempt"}:
         checks["phase_lease_engaged"] = (
             stats.get("phase_lease_engagements", 0) > 0
             and stats.get("phase_lease_preferred", 0) > 0
@@ -106,10 +117,15 @@ def validate_scheduler_log(path, profile):
             "phase_lease_pending_max_ns" in stats
             and stats.get("phase_lease_pending_ge_4s", 0) == 0
         )
-        checks["wakeup_preemption_active"] = (
-            stats.get("phase_lease_wakeup_candidates", 0) > 0
-            and stats.get("phase_lease_wakeup_preempts", 0) > 0
-        )
+        if profile == "phase-lease":
+            checks["wakeup_preemption_active"] = (
+                stats.get("phase_lease_wakeup_candidates", 0) > 0
+                and stats.get("phase_lease_wakeup_preempts", 0) > 0
+            )
+        else:
+            checks["wakeup_preemption_disabled"] = (
+                stats.get("phase_lease_wakeup_preempts", 0) == 0
+            )
     if samples.get("interval_us", 0):
         checks["sampler_healthy"] = (
             samples.get("samples", 0) > 0 and samples.get("read_errors", 0) == 0

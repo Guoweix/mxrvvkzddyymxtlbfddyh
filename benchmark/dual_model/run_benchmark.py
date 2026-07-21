@@ -169,8 +169,9 @@ class SuiteRunner:
         self.args = args
         self.remote = Remote(args.host, args.user, args.password)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        scenario_slug = "_symmetric" if args.scenario == "symmetric" else ""
         self.suite_dir = Path(args.results_dir) / (
-            f"{timestamp}_c{args.concurrency}_{args.strategy}_dual_suite"
+            f"{timestamp}_c{args.concurrency}_{args.strategy}{scenario_slug}_dual_suite"
         )
         self.suite_dir.mkdir(parents=True)
         self.remote_dir = f"/tmp/dual_model_benchmark_{os.getpid()}"
@@ -478,6 +479,8 @@ class SuiteRunner:
         command = [
             sys.executable,
             str(SCRIPT_DIR / "workload.py"),
+            "--scenario",
+            self.args.scenario,
             "--incumbent-url",
             f"http://{self.args.host}:{inc_port}",
             "--injected-url",
@@ -500,6 +503,10 @@ class SuiteRunner:
             str(self.args.injection_token),
             "--arrival-gap-sec",
             str(self.args.arrival_gap_sec),
+            "--lead-sec",
+            str(self.args.lead_sec),
+            "--max-start-skew-ms",
+            str(self.args.max_start_skew_ms),
             "--seed",
             str(self.args.seed),
             "--request-timeout",
@@ -567,6 +574,7 @@ class SuiteRunner:
             "attempt": attempt,
             "selected": False,
             "strategy": self.args.strategy,
+            "scenario": self.args.scenario,
         }
         (run_dir / "run.json").write_text(json.dumps(metadata, indent=2) + "\n")
         print(f"[INFO] starting {run_tag}")
@@ -680,12 +688,17 @@ class SuiteRunner:
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--strategy", choices=("cfs-shared", "cfs-split", "external"), default="cfs-shared")
+    parser.add_argument(
+        "--scenario", choices=("asynchronous", "symmetric"), default="asynchronous"
+    )
     parser.add_argument("--loops", type=int, default=1)
     parser.add_argument("--directions", choices=("ab", "ba", "both"), default="ab")
     parser.add_argument("--concurrency", choices=(2, 4, 8), type=int, default=8)
     parser.add_argument("--output-tokens", type=int, default=256)
     parser.add_argument("--injection-token", type=int, default=4)
-    parser.add_argument("--arrival-gap-sec", type=float, default=1.0)
+    parser.add_argument("--arrival-gap-sec", type=float)
+    parser.add_argument("--lead-sec", type=float)
+    parser.add_argument("--max-start-skew-ms", type=float, default=25.0)
     parser.add_argument(
         "--metrics", choices=("standard", "rvv", "rvv-barrier"), default="standard"
     )
@@ -716,7 +729,15 @@ def parse_args():
     parser.add_argument("--external-stop-cmd", default="")
     parser.add_argument(
         "--scheduler-validation",
-        choices=("auto", "none", "lease", "gang-observe", "gang-active", "phase-lease"),
+        choices=(
+            "auto",
+            "none",
+            "lease",
+            "gang-observe",
+            "gang-active",
+            "phase-lease",
+            "phase-lease-no-preempt",
+        ),
         default="auto",
     )
     parser.add_argument("--lease-hint-path", default="")
@@ -731,10 +752,21 @@ def parse_args():
     parser.add_argument("--smoke", action="store_true")
     parser.set_defaults(preserve_default_server=True)
     args = parser.parse_args()
+    if args.arrival_gap_sec is None:
+        args.arrival_gap_sec = 0.0 if args.scenario == "symmetric" else 1.0
+    if args.lead_sec is None:
+        args.lead_sec = 2.0 if args.scenario == "symmetric" else 1.0
     if args.strategy == "external" and not args.external_start_cmd:
         parser.error("--strategy external requires --external-start-cmd")
-    if args.injection_token <= 0 or args.injection_token >= args.output_tokens:
+    if (
+        args.scenario == "asynchronous"
+        and (args.injection_token <= 0 or args.injection_token >= args.output_tokens)
+    ):
         parser.error("--injection-token must be between 1 and output-tokens - 1")
+    if args.scenario == "symmetric" and args.injection_hook:
+        parser.error("--injection-hook is only valid for the asynchronous scenario")
+    if args.arrival_gap_sec < 0 or args.lead_sec <= 0 or args.max_start_skew_ms <= 0:
+        parser.error("arrival gap must be non-negative; lead and skew limit must be positive")
     if args.loops < 1 or args.max_attempts < 1:
         parser.error("loops and max-attempts must be positive")
     args.requests_per_model = args.concurrency // 2

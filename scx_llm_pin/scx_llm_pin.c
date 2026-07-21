@@ -125,6 +125,44 @@ static int parse_team_gang_mode(const char *str, __u32 *mode)
 	return 0;
 }
 
+static int parse_vector_local_wakeup_mode(const char *str, __u32 *mode)
+{
+	if (!strcmp(str, "team"))
+		*mode = LLM_VECTOR_LOCAL_WAKEUP_TEAM;
+	else if (!strcmp(str, "off"))
+		*mode = LLM_VECTOR_LOCAL_WAKEUP_OFF;
+	else if (!strcmp(str, "exclusive"))
+		*mode = LLM_VECTOR_LOCAL_WAKEUP_EXCLUSIVE;
+	else
+		return -EINVAL;
+	return 0;
+}
+
+static const char *vector_local_wakeup_mode_name(__u32 mode)
+{
+	switch (mode) {
+	case LLM_VECTOR_LOCAL_WAKEUP_TEAM:
+		return "team";
+	case LLM_VECTOR_LOCAL_WAKEUP_OFF:
+		return "off";
+	case LLM_VECTOR_LOCAL_WAKEUP_EXCLUSIVE:
+		return "exclusive";
+	default:
+		return "unknown";
+	}
+}
+
+static int parse_on_off(const char *str, __u32 *enabled)
+{
+	if (!strcmp(str, "on"))
+		*enabled = 1;
+	else if (!strcmp(str, "off"))
+		*enabled = 0;
+	else
+		return -EINVAL;
+	return 0;
+}
+
 static const char *phase_name(__u32 phase)
 {
 	switch (phase) {
@@ -398,6 +436,9 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	       stats.rvv_vector_dsq_consumes_team1);
 	printf("RVV vector local dispatches: %llu\n", stats.rvv_vector_local_dispatches);
 	printf("RVV vector window starts:    %llu\n", stats.rvv_vector_window_starts);
+	printf("RVV exclusive lease handoffs/denials: %llu/%llu\n",
+	       stats.vector_exclusive_lease_handoffs,
+	       stats.vector_exclusive_lease_denials);
 	printf("RVV vector slice clamps:     %llu\n", stats.rvv_vector_slice_clamps);
 	printf("RVV vector identify barrier dispatches: %llu\n",
 	       stats.rvv_vector_identify_barrier_dispatches);
@@ -456,7 +497,7 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	printf("Phase lease wakeup candidates/preempts:  %llu/%llu\n",
 	       stats.phase_lease_wakeup_candidates,
 	       stats.phase_lease_wakeup_preempts);
-	printf("SCX_GANG_STATS rvv_team0=%llu rvv_team1=%llu hint_valid_workers=%llu hint_active_workers=%llu hint_fallbacks=%llu hint_deferred=%llu hint_excluded=%llu hint_demotions=%llu phase_reads=%llu phase_valid=%llu phase_invalid=%llu phase_idle=%llu phase_prefill=%llu phase_decode=%llu phase_mixed=%llu gang_engagements=%llu gang_quanta=%llu gang_switches=%llu gang_kicks=%llu gang_enqueues=%llu gang_selected=%llu gang_empty=%llu gang_fallback=%llu gang_runs=%llu gang_active_runs=%llu gang_wrong_runs=%llu phase_lease_engagements=%llu phase_lease_preferred=%llu phase_lease_empty=%llu phase_lease_fallback=%llu phase_lease_safety_forced=%llu phase_lease_safety_misses=%llu phase_lease_pending_stale=%llu phase_lease_pending_max_ns=%llu phase_lease_pending_ge_4s=%llu phase_lease_runs=%llu phase_lease_preferred_runs=%llu phase_lease_other_runs=%llu phase_lease_wakeup_candidates=%llu phase_lease_wakeup_preempts=%llu dsq_dispatches=%llu dsq_consumes=%llu dsq_dispatches_team0=%llu dsq_dispatches_team1=%llu dsq_consumes_team0=%llu dsq_consumes_team1=%llu\n",
+	printf("SCX_GANG_STATS rvv_team0=%llu rvv_team1=%llu hint_valid_workers=%llu hint_active_workers=%llu hint_fallbacks=%llu hint_deferred=%llu hint_excluded=%llu hint_demotions=%llu phase_reads=%llu phase_valid=%llu phase_invalid=%llu phase_idle=%llu phase_prefill=%llu phase_decode=%llu phase_mixed=%llu gang_engagements=%llu gang_quanta=%llu gang_switches=%llu gang_kicks=%llu gang_enqueues=%llu gang_selected=%llu gang_empty=%llu gang_fallback=%llu gang_runs=%llu gang_active_runs=%llu gang_wrong_runs=%llu phase_lease_engagements=%llu phase_lease_preferred=%llu phase_lease_empty=%llu phase_lease_fallback=%llu phase_lease_safety_forced=%llu phase_lease_safety_misses=%llu phase_lease_pending_stale=%llu phase_lease_pending_max_ns=%llu phase_lease_pending_ge_4s=%llu phase_lease_runs=%llu phase_lease_preferred_runs=%llu phase_lease_other_runs=%llu phase_lease_wakeup_candidates=%llu phase_lease_wakeup_preempts=%llu vector_local_dispatches=%llu vector_window_starts=%llu exclusive_handoffs=%llu exclusive_denials=%llu dsq_dispatches=%llu dsq_consumes=%llu dsq_dispatches_team0=%llu dsq_dispatches_team1=%llu dsq_consumes_team0=%llu dsq_consumes_team1=%llu\n",
 	       stats.rvv_vector_threads_team0, stats.rvv_vector_threads_team1,
 	       stats.user_hint_valid_workers, stats.user_hint_active_workers,
 	       stats.user_hint_fallbacks, stats.user_hint_deferred_tasks,
@@ -485,6 +526,10 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	       stats.phase_lease_other_runs,
 	       stats.phase_lease_wakeup_candidates,
 	       stats.phase_lease_wakeup_preempts,
+	       stats.rvv_vector_local_dispatches,
+	       stats.rvv_vector_window_starts,
+	       stats.vector_exclusive_lease_handoffs,
+	       stats.vector_exclusive_lease_denials,
 	       stats.rvv_vector_dsq_dispatches,
 	       stats.rvv_vector_dsq_consumes,
 	       stats.rvv_vector_dsq_dispatches_team0,
@@ -645,6 +690,8 @@ enum {
 	OPT_PHASE_HINT_TIMEOUT_MS,
 	OPT_PREFILL_STARVATION_MS,
 	OPT_GANG_SAMPLE_US,
+	OPT_VECTOR_LOCAL_WAKEUP,
+	OPT_PHASE_WAKEUP_PREEMPT,
 };
 
 static void usage(const char *prog)
@@ -658,6 +705,7 @@ static void usage(const char *prog)
 		"  --strategy <name>      global|rvv_dirty|rvv_dirty_local (default: global)\n"
 		"  --vector-slice-ms <ms> RVV vector worker slice (default: 100)\n"
 		"  --vector-local-window-ms <ms> RVV local fast-path window after vector DSQ consume (default: 500)\n"
+		"  --vector-local-wakeup <mode> team|off|exclusive (default: team)\n"
 		"  --dirty-threshold <n>  Dirty samples before marking vector thread (default: 2)\n"
 		"  --user-control <mode>  off|observe|active (default: off)\n"
 		"  --control-dir <path>   Pin config/worker maps under this bpffs directory\n"
@@ -666,6 +714,7 @@ static void usage(const char *prog)
 		"  --gang-quantum-us <us> Shared team gang quantum (default: 5000)\n"
 		"  --phase-hint-timeout-ms <ms> Reject stale phase hints (default: 300000)\n"
 		"  --prefill-starvation-ms <ms> V DSQ safety wait for prefill-lease (default: 1000)\n"
+		"  --phase-wakeup-preempt <on|off> Preferred wakeup targeted preemption (default: on)\n"
 		"  --gang-sample-us <us> Sample running teams for diagnostics (0=off, min=1000)\n"
 		"  --duration <sec>       Run duration in seconds (0 = infinite, default: 0)\n"
 		"  -h, --help             Show this help\n"
@@ -694,6 +743,8 @@ int main(int argc, char **argv)
 	config.strategy = LLM_STRATEGY_GLOBAL;
 	config.dirty_threshold = 2;
 	config.vector_local_window_ns = 500 * NSEC_PER_MSEC;
+	config.vector_local_wakeup_mode = LLM_VECTOR_LOCAL_WAKEUP_TEAM;
+	config.phase_wakeup_preempt_enabled = 1;
 	config.team_gang_mode = LLM_TEAM_GANG_OFF;
 	config.gang_quantum_ns = 5000 * NSEC_PER_USEC;
 	config.phase_hint_timeout_ns = 300000 * NSEC_PER_MSEC;
@@ -707,6 +758,7 @@ int main(int argc, char **argv)
 		{"strategy",    required_argument, 0, 'p'},
 		{"vector-slice-ms", required_argument, 0, 'M'},
 		{"vector-local-window-ms", required_argument, 0, 'W'},
+		{"vector-local-wakeup", required_argument, 0, OPT_VECTOR_LOCAL_WAKEUP},
 		{"dirty-threshold", required_argument, 0, 'D'},
 		{"user-control", required_argument, 0, OPT_USER_CONTROL},
 		{"control-dir", required_argument, 0, OPT_CONTROL_DIR},
@@ -715,6 +767,7 @@ int main(int argc, char **argv)
 		{"gang-quantum-us", required_argument, 0, OPT_GANG_QUANTUM_US},
 		{"phase-hint-timeout-ms", required_argument, 0, OPT_PHASE_HINT_TIMEOUT_MS},
 		{"prefill-starvation-ms", required_argument, 0, OPT_PREFILL_STARVATION_MS},
+		{"phase-wakeup-preempt", required_argument, 0, OPT_PHASE_WAKEUP_PREEMPT},
 		{"gang-sample-us", required_argument, 0, OPT_GANG_SAMPLE_US},
 		{"duration",    required_argument, 0, 'd'},
 		{"help",        no_argument,       0, 'h'},
@@ -746,6 +799,13 @@ int main(int argc, char **argv)
 			break;
 		case 'W':
 			config.vector_local_window_ns = strtoull(optarg, NULL, 10) * NSEC_PER_MSEC;
+			break;
+		case OPT_VECTOR_LOCAL_WAKEUP:
+			if (parse_vector_local_wakeup_mode(
+					optarg, &config.vector_local_wakeup_mode)) {
+				fprintf(stderr, "Error: --vector-local-wakeup requires team|off|exclusive\n");
+				return 1;
+			}
 			break;
 		case 'D':
 			config.dirty_threshold = strtoul(optarg, NULL, 10);
@@ -780,6 +840,13 @@ int main(int argc, char **argv)
 			break;
 		case OPT_PREFILL_STARVATION_MS:
 			config.prefill_starvation_ns = strtoull(optarg, NULL, 10) * NSEC_PER_MSEC;
+			break;
+		case OPT_PHASE_WAKEUP_PREEMPT:
+			if (parse_on_off(optarg,
+					 &config.phase_wakeup_preempt_enabled)) {
+				fprintf(stderr, "Error: --phase-wakeup-preempt requires on|off\n");
+				return 1;
+			}
 			break;
 		case OPT_GANG_SAMPLE_US:
 			gang_sample_us = strtoull(optarg, NULL, 10);
@@ -837,6 +904,11 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Error: --prefill-starvation-ms must be in 100..4000\n");
 		return 1;
 	}
+	if (config.vector_local_wakeup_mode >
+	    LLM_VECTOR_LOCAL_WAKEUP_EXCLUSIVE) {
+		fprintf(stderr, "Error: invalid vector local wakeup mode\n");
+		return 1;
+	}
 	if (gang_sample_us && (gang_sample_us < 1000 || gang_sample_us > 1000000)) {
 		fprintf(stderr, "Error: --gang-sample-us must be 0 or in 1000..1000000\n");
 		return 1;
@@ -875,6 +947,8 @@ int main(int argc, char **argv)
 	       (unsigned long long)(config.vector_slice_ns / NSEC_PER_MSEC));
 	printf("  Vector local window: %llums\n",
 	       (unsigned long long)(config.vector_local_window_ns / NSEC_PER_MSEC));
+	printf("  Vector local wakeup: %s\n",
+	       vector_local_wakeup_mode_name(config.vector_local_wakeup_mode));
 	printf("  Dirty threshold: %u\n", config.dirty_threshold);
 	printf("  User control:    %s\n", control_mode_name(config.user_control_mode));
 	printf("  User preference: off\n");
@@ -885,6 +959,8 @@ int main(int argc, char **argv)
 	       (unsigned long long)(config.phase_hint_timeout_ns / NSEC_PER_MSEC));
 	printf("  Prefill starvation guard: %llums\n",
 	       (unsigned long long)(config.prefill_starvation_ns / NSEC_PER_MSEC));
+	printf("  Phase wakeup preempt: %s\n",
+	       config.phase_wakeup_preempt_enabled ? "on" : "off");
 	printf("  Gang sampler:    %lluus\n",
 	       (unsigned long long)gang_sample_us);
 	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF) {

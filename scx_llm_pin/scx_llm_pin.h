@@ -19,6 +19,12 @@ enum llm_team_gang_mode {
 	LLM_TEAM_GANG_PREFILL_LEASE = 4,
 };
 
+enum llm_vector_local_wakeup_mode {
+	LLM_VECTOR_LOCAL_WAKEUP_TEAM = 0,
+	LLM_VECTOR_LOCAL_WAKEUP_OFF = 1,
+	LLM_VECTOR_LOCAL_WAKEUP_EXCLUSIVE = 2,
+};
+
 #define RVV_SR_VS		0x00000600UL
 #define RVV_SR_VS_OFF		0x00000000UL
 #define RVV_SR_VS_INITIAL	0x00000200UL
@@ -37,13 +43,13 @@ struct llm_pin_config {
 	__u32 user_control_mode; // enum rvv_lease_control_mode
 	__u32 user_cpu_map_enabled; // 1=显式 ith->CPU；0=保留 lease 自然唯一分配
 	__u32 user_preferred_team_plus1; // 0=禁用；1/2=team 0/1
-	__u32 user_preference_flags; // 预留给后续模型级策略
+	__u32 phase_wakeup_preempt_enabled; // preferred wakeup 是否定向抢占
 	__u32 user_cpu_map[RVV_LEASE_CONTROL_WORKERS]; // OpenMP ith -> CPU
 	__u64 user_preferred_until_ns; // CLOCK_MONOTONIC 绝对过期时间
 	__u64 user_session_id;
 	__u64 user_policy_epoch;
 	__u32 team_gang_mode; // enum llm_team_gang_mode
-	__u32 reserved_policy32;
+	__u32 vector_local_wakeup_mode; // enum llm_vector_local_wakeup_mode
 	__u64 gang_quantum_ns;
 	__u64 phase_hint_timeout_ns;
 	__u64 prefill_starvation_ns; // Max runnable wait before one safety slice
@@ -122,6 +128,8 @@ struct llm_pin_stats {
 	__u64 phase_lease_other_runs;
 	__u64 phase_lease_wakeup_candidates;
 	__u64 phase_lease_wakeup_preempts;
+	__u64 vector_exclusive_lease_handoffs;
+	__u64 vector_exclusive_lease_denials;
 };
 
 struct rvv_task_class {

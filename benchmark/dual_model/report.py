@@ -113,6 +113,12 @@ def analyze_run(run_dir):
     scheduler = metrics.get("scheduler", {})
     incumbent_scheduler = scheduler.get(metrics.get("incumbent_model"), {}).get("overlap", {})
     injected_scheduler = scheduler.get(metrics.get("injected_model"), {}).get("overlap", {})
+    model_a_total = scheduler.get("A", {}).get("total", {})
+    model_b_total = scheduler.get("B", {}).get("total", {})
+    llm_cpu_runtime_sec = (
+        model_a_total.get("runtime_ns", 0) + model_b_total.get("runtime_ns", 0)
+    ) / 1e9
+    makespan_sec = metrics.get("makespan_sec") or 0
     metrics.update(
         {
             "cpu_service_jain": scheduler.get("cpu_service_jain_post_injection"),
@@ -125,10 +131,26 @@ def analyze_run(run_dir):
             + incumbent_scheduler.get("nonvoluntary_ctxt", 0),
             "injected_context_switches": injected_scheduler.get("voluntary_ctxt", 0)
             + injected_scheduler.get("nonvoluntary_ctxt", 0),
+            "model_a_cpu_runtime_sec": model_a_total.get("runtime_ns", 0) / 1e9,
+            "model_b_cpu_runtime_sec": model_b_total.get("runtime_ns", 0) / 1e9,
+            "model_a_runqueue_wait_sec": model_a_total.get("runqueue_wait_ns", 0) / 1e9,
+            "model_b_runqueue_wait_sec": model_b_total.get("runqueue_wait_ns", 0) / 1e9,
+            "model_a_context_switches": model_a_total.get("voluntary_ctxt", 0)
+            + model_a_total.get("nonvoluntary_ctxt", 0),
+            "model_b_context_switches": model_b_total.get("voluntary_ctxt", 0)
+            + model_b_total.get("nonvoluntary_ctxt", 0),
+            "llm_cpu_runtime_sec": llm_cpu_runtime_sec,
+            "llm_cpu_utilization_percent": (
+                llm_cpu_runtime_sec / (makespan_sec * 8) * 100.0
+                if makespan_sec > 0
+                else None
+            ),
         }
     )
     metrics["context_switches_total"] = (
-        metrics["incumbent_context_switches"] + metrics["injected_context_switches"]
+        metrics["model_a_context_switches"] + metrics["model_b_context_switches"]
+        if metrics.get("scenario") == "symmetric"
+        else metrics["incumbent_context_switches"] + metrics["injected_context_switches"]
     )
 
     dmesg_delta = (run_dir / "dmesg_delta.log").read_text(errors="replace") if (run_dir / "dmesg_delta.log").exists() else ""
@@ -239,8 +261,30 @@ def generate_suite(suite_dir):
         run_path.write_text(json.dumps(run, indent=2) + "\n")
 
     valid_runs = [run for run in selected if run["valid"]]
+    scenario = (
+        valid_runs[0].get("scenario", "asynchronous")
+        if valid_runs
+        else "asynchronous"
+    )
     keys = (
         "aggregate_tps",
+        "model_a_e2e_tps",
+        "model_b_e2e_tps",
+        "model_e2e_tps_jain",
+        "model_a_ttft_mean_ms",
+        "model_b_ttft_mean_ms",
+        "model_completion_skew_ms",
+        "model_completion_skew_percent",
+        "pair_start_skew_max_ms",
+        "release_alignment_spread_ms",
+        "pair_completion_skew_max_ms",
+        "overlap_fraction_percent",
+        "llm_cpu_runtime_sec",
+        "llm_cpu_utilization_percent",
+        "model_a_runqueue_wait_sec",
+        "model_b_runqueue_wait_sec",
+        "model_a_context_switches",
+        "model_b_context_switches",
         "injected_ttft_mean_ms",
         "injected_ttft_max_ms",
         "incumbent_pre_itl_p50_ms",
@@ -280,6 +324,7 @@ def generate_suite(suite_dir):
 
     summary = {
         "suite": suite_dir.name,
+        "scenario": scenario,
         "selected_runs": len(selected),
         "valid_runs": len(valid_runs),
         "invalid_runs": [run["run_name"] for run in selected if not run["valid"]],
@@ -299,6 +344,23 @@ def generate_suite(suite_dir):
             "selected",
             "valid",
             "aggregate_tps",
+            "model_a_e2e_tps",
+            "model_b_e2e_tps",
+            "model_e2e_tps_jain",
+            "model_a_ttft_mean_ms",
+            "model_b_ttft_mean_ms",
+            "model_completion_skew_ms",
+            "model_completion_skew_percent",
+            "pair_start_skew_max_ms",
+            "release_alignment_spread_ms",
+            "pair_completion_skew_max_ms",
+            "overlap_fraction_percent",
+            "llm_cpu_runtime_sec",
+            "llm_cpu_utilization_percent",
+            "model_a_runqueue_wait_sec",
+            "model_b_runqueue_wait_sec",
+            "model_a_context_switches",
+            "model_b_context_switches",
             "injected_ttft_mean_ms",
             "injected_ttft_max_ms",
             "incumbent_pre_itl_p50_ms",
@@ -348,30 +410,68 @@ def generate_suite(suite_dir):
     config = {}
     if (suite_dir / "config.json").exists():
         config = json.loads((suite_dir / "config.json").read_text())
-    lines = [
-        "# Dual-Model Asynchronous Benchmark",
+    scenario = config.get("scenario", scenario)
+    symmetric = scenario == "symmetric"
+    configuration_lines = [
+        "# Dual-Model Symmetric Benchmark" if symmetric else "# Dual-Model Asynchronous Benchmark",
         "",
         "## Configuration",
         "",
+        f"- Scenario: `{scenario}`",
         f"- Strategy: `{config.get('strategy', 'unknown')}`",
         f"- Loops: `{config.get('loops', 'unknown')}`",
-        f"- Directions: `{config.get('directions', 'ab')}`",
+        f"- Startup order: `{config.get('directions', 'ab')}`"
+        if symmetric
+        else f"- Directions: `{config.get('directions', 'ab')}`",
         f"- Total concurrency: `{config.get('concurrency', 'unknown')}` "
         f"({config.get('requests_per_model', 'unknown')} requests/server)",
         f"- Output tokens/request: `{config.get('output_tokens', 'unknown')}`",
-        f"- Injection milestone: `{config.get('injection_token', 'unknown')}` tokens from every incumbent request",
-        f"- Arrival gap: `{config.get('arrival_gap_sec', 'unknown')}s`",
-        f"- Metrics profile: `{config.get('metrics', 'unknown')}`",
-        "",
-        "## Summary",
-        "",
-        f"Valid selected runs: **{len(valid_runs)}/{len(selected)}**",
-        "",
-        "| Metric | Mean | Sample SD | CV |",
-        "| --- | ---: | ---: | ---: |",
     ]
+    if symmetric:
+        configuration_lines.extend(
+            [
+                "- Paired release: matching A/B requests use the same absolute release time",
+                f"- Maximum start skew: `{config.get('max_start_skew_ms', 'unknown')}ms`",
+            ]
+        )
+    else:
+        configuration_lines.append(
+            f"- Injection milestone: `{config.get('injection_token', 'unknown')}` "
+            "tokens from every incumbent request"
+        )
+    configuration_lines.extend(
+        [
+            f"- Arrival gap: `{config.get('arrival_gap_sec', 'unknown')}s`",
+            f"- Metrics profile: `{config.get('metrics', 'unknown')}`",
+            "",
+            "## Summary",
+            "",
+            f"Valid selected runs: **{len(valid_runs)}/{len(selected)}**",
+            "",
+            "| Metric | Mean | Sample SD | CV |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    lines = configuration_lines
     labels = {
         "aggregate_tps": "Aggregate TPS",
+        "model_a_e2e_tps": "Model A E2E TPS",
+        "model_b_e2e_tps": "Model B E2E TPS",
+        "model_e2e_tps_jain": "Model E2E TPS Jain fairness",
+        "model_a_ttft_mean_ms": "Model A mean TTFT (ms)",
+        "model_b_ttft_mean_ms": "Model B mean TTFT (ms)",
+        "model_completion_skew_ms": "A/B completion skew (ms)",
+        "model_completion_skew_percent": "A/B completion skew / makespan (%)",
+        "pair_start_skew_max_ms": "Maximum paired start skew (ms)",
+        "release_alignment_spread_ms": "Release alignment spread (ms)",
+        "pair_completion_skew_max_ms": "Maximum paired completion skew (ms)",
+        "overlap_fraction_percent": "Both-model overlap / makespan (%)",
+        "llm_cpu_runtime_sec": "Combined LLM CPU runtime (s)",
+        "llm_cpu_utilization_percent": "LLM CPU utilization across 8 cores (%)",
+        "model_a_runqueue_wait_sec": "Model A total runqueue wait (s)",
+        "model_b_runqueue_wait_sec": "Model B total runqueue wait (s)",
+        "model_a_context_switches": "Model A context switches",
+        "model_b_context_switches": "Model B context switches",
         "injected_ttft_mean_ms": "Injected mean TTFT (ms)",
         "injected_ttft_max_ms": "Injected max TTFT (ms)",
         "incumbent_pre_itl_p50_ms": "Incumbent pre-injection p50 ITL (ms)",
@@ -405,28 +505,78 @@ def generate_suite(suite_dir):
         "phase_lease_wakeup_candidates": "Phase-lease preferred wakeup candidates",
         "phase_lease_wakeup_preempts": "Phase-lease targeted wakeup preempts",
     }
-    for key in keys:
+    symmetric_display_keys = (
+        "aggregate_tps",
+        "model_a_e2e_tps",
+        "model_b_e2e_tps",
+        "model_e2e_tps_jain",
+        "model_a_ttft_mean_ms",
+        "model_b_ttft_mean_ms",
+        "model_completion_skew_ms",
+        "model_completion_skew_percent",
+        "pair_start_skew_max_ms",
+        "release_alignment_spread_ms",
+        "pair_completion_skew_max_ms",
+        "overlap_fraction_percent",
+        "llm_cpu_utilization_percent",
+        "cpu_service_jain",
+        "model_a_runqueue_wait_sec",
+        "model_b_runqueue_wait_sec",
+        "model_a_context_switches",
+        "model_b_context_switches",
+        "context_switches_total",
+        "phase_lease_run_match_percent",
+        "phase_lease_pending_max_ns",
+        "phase_lease_pending_ge_4s",
+        "phase_lease_wakeup_preempts",
+    )
+    asynchronous_display_keys = ("aggregate_tps",) + keys[
+        keys.index("injected_ttft_mean_ms") :
+    ]
+    display_keys = symmetric_display_keys if symmetric else asynchronous_display_keys
+    for key in display_keys:
         item = statistics[key]
         lines.append(
             f"| {labels[key]} | {fmt(item['mean'])} | {fmt(item['sd'])} | {fmt(item['cv_percent'], 2)}% |"
         )
-    lines.extend(
-        [
-            "",
-            f"Pooled injected-request p95 TTFT: **{fmt(statistics['injected_ttft_pooled_p95_ms'])} ms**",
-            "",
-            "## Runs",
-            "",
-            "| Run | Direction | Valid | Aggregate TPS | Injected TTFT | Incumbent ITL change | Jain |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: |",
-        ]
-    )
-    for run in selected:
-        lines.append(
-            f"| {run['run_name']} | {run.get('direction')} | {run['valid']} | "
-            f"{fmt(run.get('aggregate_tps'))} | {fmt(run.get('injected_ttft_mean_ms'))} ms | "
-            f"{fmt(run.get('incumbent_itl_degradation_percent'))}% | {fmt(run.get('token_rate_jain'))} |"
+    if symmetric:
+        lines.extend(
+            [
+                "",
+                "## Runs",
+                "",
+                "| Run | Startup order | Valid | Aggregate TPS | A TPS | B TPS | Completion skew | Overlap | CPU util | Jain |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
         )
+        for run in selected:
+            lines.append(
+                f"| {run['run_name']} | {run.get('direction')} | {run['valid']} | "
+                f"{fmt(run.get('aggregate_tps'))} | {fmt(run.get('model_a_e2e_tps'))} | "
+                f"{fmt(run.get('model_b_e2e_tps'))} | "
+                f"{fmt(run.get('model_completion_skew_ms'))} ms | "
+                f"{fmt(run.get('overlap_fraction_percent'))}% | "
+                f"{fmt(run.get('llm_cpu_utilization_percent'))}% | "
+                f"{fmt(run.get('model_e2e_tps_jain'))} |"
+            )
+    else:
+        lines.extend(
+            [
+                "",
+                f"Pooled injected-request p95 TTFT: **{fmt(statistics['injected_ttft_pooled_p95_ms'])} ms**",
+                "",
+                "## Runs",
+                "",
+                "| Run | Direction | Valid | Aggregate TPS | Injected TTFT | Incumbent ITL change | Jain |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for run in selected:
+            lines.append(
+                f"| {run['run_name']} | {run.get('direction')} | {run['valid']} | "
+                f"{fmt(run.get('aggregate_tps'))} | {fmt(run.get('injected_ttft_mean_ms'))} ms | "
+                f"{fmt(run.get('incumbent_itl_degradation_percent'))}% | {fmt(run.get('token_rate_jain'))} |"
+            )
     if summary["invalid_runs"]:
         lines.extend(["", "Invalid runs: " + ", ".join(f"`{name}`" for name in summary["invalid_runs"])])
     if hash_mismatches:

@@ -97,6 +97,20 @@ struct {
 	__type(value, __u64);
 } vector_local_until_ns SEC(".maps");
 
+struct vector_cpu_local_lease {
+	struct bpf_spin_lock lock;
+	__u32 owner_team_plus1;
+	__u64 until_ns;
+};
+
+// Exclusive mode allows at most one team to use the local wakeup path per CPU.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 8);
+	__type(key, __u32);
+	__type(value, struct vector_cpu_local_lease);
+} vector_cpu_local_lease_map SEC(".maps");
+
 // 每个 CPU 下次优先消费的 team，用于双模型 work-conserving 轮转。
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -545,6 +559,86 @@ static __always_inline __u32 team_cpu_key(__u32 team, s32 cpu)
 	return team * 8 + (__u32)cpu;
 }
 
+static __always_inline void start_vector_local_lease(
+	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
+	__u32 team, s32 cpu, __u64 now, bool count_start)
+{
+	struct vector_cpu_local_lease *lease;
+	__u32 old_owner = 0;
+	__u32 key;
+	__u64 *local_until;
+
+	if (!cfg || !cfg->vector_local_window_ns ||
+	    cfg->vector_local_wakeup_mode == LLM_VECTOR_LOCAL_WAKEUP_OFF ||
+	    team >= RVV_LEASE_CONTROL_TEAMS || cpu < 0 || cpu >= 8)
+		return;
+
+	if (cfg->vector_local_wakeup_mode ==
+	    LLM_VECTOR_LOCAL_WAKEUP_EXCLUSIVE) {
+		key = (__u32)cpu;
+		lease = bpf_map_lookup_elem(&vector_cpu_local_lease_map, &key);
+		if (!lease)
+			return;
+		bpf_spin_lock(&lease->lock);
+		old_owner = lease->owner_team_plus1;
+		lease->owner_team_plus1 = team + 1;
+		lease->until_ns = now + cfg->vector_local_window_ns;
+		bpf_spin_unlock(&lease->lock);
+		if (stats && old_owner && old_owner != team + 1)
+			__sync_fetch_and_add(
+				&stats->vector_exclusive_lease_handoffs, 1);
+	} else {
+		key = team_cpu_key(team, cpu);
+		local_until = bpf_map_lookup_elem(&vector_local_until_ns, &key);
+		if (!local_until)
+			return;
+		*local_until = now + cfg->vector_local_window_ns;
+	}
+
+	if (stats && count_start)
+		__sync_fetch_and_add(&stats->rvv_vector_window_starts, 1);
+}
+
+static __always_inline __u64 vector_local_wakeup_deadline(
+	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
+	__u32 team, s32 cpu, __u64 now)
+{
+	struct vector_cpu_local_lease *lease;
+	__u32 owner_team_plus1 = 0;
+	__u32 key;
+	__u64 until_ns = 0;
+	__u64 *local_until;
+
+	if (!cfg || !cfg->vector_local_window_ns ||
+	    cfg->vector_local_wakeup_mode == LLM_VECTOR_LOCAL_WAKEUP_OFF ||
+	    team >= RVV_LEASE_CONTROL_TEAMS || cpu < 0 || cpu >= 8)
+		return 0;
+
+	if (cfg->vector_local_wakeup_mode ==
+	    LLM_VECTOR_LOCAL_WAKEUP_EXCLUSIVE) {
+		key = (__u32)cpu;
+		lease = bpf_map_lookup_elem(&vector_cpu_local_lease_map, &key);
+		if (!lease)
+			return 0;
+		bpf_spin_lock(&lease->lock);
+		owner_team_plus1 = lease->owner_team_plus1;
+		until_ns = lease->until_ns;
+		bpf_spin_unlock(&lease->lock);
+		if (until_ns > now && owner_team_plus1 != team + 1) {
+			if (stats)
+				__sync_fetch_and_add(
+					&stats->vector_exclusive_lease_denials, 1);
+			return 0;
+		}
+		return owner_team_plus1 == team + 1 && until_ns > now ?
+			until_ns : 0;
+	}
+
+	key = team_cpu_key(team, cpu);
+	local_until = bpf_map_lookup_elem(&vector_local_until_ns, &key);
+	return local_until && *local_until > now ? *local_until : 0;
+}
+
 static __always_inline u64 vector_dsq_id(__u32 team, s32 cpu)
 {
 	return VECTOR_DSQ_BASE + (u64)team_cpu_key(team, cpu);
@@ -780,7 +874,8 @@ static __always_inline bool try_phase_lease_wakeup_preempt(
 	__u32 *running_team;
 	__u32 cpu_key;
 
-	if (!(enq_flags & SCX_ENQ_WAKEUP) || !is_phase_lease_mode(cfg) ||
+	if (!cfg->phase_wakeup_preempt_enabled ||
+	    !(enq_flags & SCX_ENQ_WAKEUP) || !is_phase_lease_mode(cfg) ||
 	    task_team >= RVV_LEASE_CONTROL_TEAMS || cpu < 0 || cpu >= 8)
 		return false;
 	if (!resolve_phase_lease_team(cfg, stats, cpu, now, &preferred_team) ||
@@ -1147,9 +1242,7 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 		    classify_rvv_vector_task(p, cfg, stats, (__u32)team)) {
 				s32 selected_cpu = remembered_selected_cpu(p);
 				u64 dsq_id;
-				__u32 cpu_key;
 				__u32 gang_team = 0;
-				__u64 *local_until;
 				__u64 now;
 				bool gang_kick = false;
 				bool gang_engaged = false;
@@ -1169,12 +1262,9 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 			if (cfg->vector_local_window_ns && stats &&
 			    vector_threads_for_team(stats, (__u32)team) <
 				    vector_unique_target()) {
-				cpu_key = team_cpu_key((__u32)team, selected_cpu);
-				local_until = bpf_map_lookup_elem(
-					&vector_local_until_ns, &cpu_key);
-				if (local_until)
-					*local_until = now +
-						       cfg->vector_local_window_ns;
+				start_vector_local_lease(
+					cfg, stats, (__u32)team, selected_cpu,
+					now, false);
 				__sync_fetch_and_add(&stats->rvv_vector_identify_barrier_dispatches,
 						     1);
 				scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
@@ -1208,11 +1298,12 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 				return;
 
 			if (cfg->vector_local_window_ns && !gang_engaged) {
-				cpu_key = team_cpu_key((__u32)team, selected_cpu);
-				local_until = bpf_map_lookup_elem(&vector_local_until_ns,
-								  &cpu_key);
-				if (local_until && *local_until > now) {
-					slice = clamp_slice(slice, *local_until - now,
+				__u64 local_deadline;
+
+				local_deadline = vector_local_wakeup_deadline(
+					cfg, stats, (__u32)team, selected_cpu, now);
+				if (local_deadline) {
+					slice = clamp_slice(slice, local_deadline - now,
 							    stats);
 					if (stats)
 						__sync_fetch_and_add(&stats->rvv_vector_local_dispatches, 1);
@@ -1264,8 +1355,6 @@ static __always_inline bool consume_vector_team(
 	s32 cpu, __u32 team, const struct llm_pin_config *cfg,
 	struct llm_pin_stats *stats, bool start_local_lease)
 {
-	__u32 cpu_key;
-	__u64 *local_until;
 	__u64 now;
 
 	if (team >= RVV_LEASE_CONTROL_TEAMS ||
@@ -1274,14 +1363,8 @@ static __always_inline bool consume_vector_team(
 
 	now = bpf_ktime_get_ns();
 	clear_vector_pending(team, cpu, now, stats, false);
-	cpu_key = team_cpu_key(team, cpu);
 	if (start_local_lease && cfg && cfg->vector_local_window_ns) {
-		local_until = bpf_map_lookup_elem(&vector_local_until_ns, &cpu_key);
-		if (local_until) {
-			*local_until = now + cfg->vector_local_window_ns;
-			if (stats)
-				__sync_fetch_and_add(&stats->rvv_vector_window_starts, 1);
-		}
+		start_vector_local_lease(cfg, stats, team, cpu, now, true);
 	}
 	if (stats) {
 		__sync_fetch_and_add(&stats->rvv_vector_dsq_consumes, 1);

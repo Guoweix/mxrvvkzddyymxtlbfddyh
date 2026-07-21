@@ -1,6 +1,7 @@
-# Dual-Model Asynchronous Benchmark
+# Dual-Model Benchmark
 
-该 harness 在同一块 8 核板卡上启动两个独立的 llama-server，用确定性异步负载测量多模型 CPU 竞争。
+该 harness 在同一块 8 核板卡上启动两个独立的 llama-server，支持确定性异步注入
+和同步对称负载。
 
 以下示例用环境变量表示板端 llama.cpp、实验 runtime、调度器和控制 map 路径：
 
@@ -16,7 +17,7 @@ export MODEL_B_PORT="<model-b-port>"
 调用 `run.sh` 时可通过 `--llm-path "$LLM_PATH"`、`--port-a "$MODEL_A_PORT"` 和
 `--port-b "$MODEL_B_PORT"` 显式传入这些环境配置。
 
-## Workload
+## Asynchronous Workload
 
 - 每个 server 默认使用 4 个并行 slot。
 - `--concurrency` 可设置总并发为 2、4、8；两个 server 分别使用 1、2、4 个 slot 和请求。
@@ -41,6 +42,22 @@ ignore_eos=true
 cache_prompt=false
 stream=true
 ```
+
+## Symmetric Workload
+
+`--scenario symmetric` 同时释放 A/B 的匹配请求，默认把全部请求放在同一个绝对
+monotonic release point。两侧使用完全相同的 prompt、seed 和输出 token 数；启动
+偏差进入有效性门禁，完成偏差只作为调度公平性结果记录。
+
+专用入口和完整指标说明见 [`symmetric/`](symmetric/README.md)：
+
+```bash
+cd symmetric
+./run.sh --strategy cfs-split --concurrency 8 --loops 3 --output-tokens 256
+```
+
+该场景用于测试两个服务全程重叠时的稳态效率。默认异步场景继续用于测量 prefill
+注入、TTFT 和非对称尾部，二者结果不应直接混合平均。
 
 脚本会严格检查每个请求的 token 数和注入顺序。输出 token ID 哈希仍会保存并汇总，但自然文本哈希不一致只作为诊断信息，不会使性能轮失效。请求不完整、server 退出或内核日志出现调度 stall 时，该 attempt 不进入有效结果。
 
@@ -99,7 +116,8 @@ stream=true
     --strategy rvv_dirty --user-control active"
 ```
 
-保留 dirty lease slice/window，在自然 lease 边界偏向 prefill，并定向抢占同核的另一组 vector worker：
+当前 phase-aware dirty lease 让普通 vector wakeup 回到 VDSQ，在 CPU 需要补充 local
+DSQ 时偏向 prefill，并定向抢占同核的另一组 vector worker：
 
 ```bash
 ./run.sh --strategy external \
@@ -109,6 +127,7 @@ stream=true
     --tgid \"\$MODEL_A_PID\" --tgid2 \"\$MODEL_B_PID\" \
     --strategy rvv_dirty --vector-slice-ms 100 \
     --vector-local-window-ms 500 --user-control active \
+    --vector-local-wakeup off --phase-wakeup-preempt on \
     --team-gang prefill-lease --prefill-starvation-ms 1000"
 ```
 
@@ -118,7 +137,7 @@ stream=true
 
 `--injection-hook` 会在 incumbent 四个请求都达到注入 token、injected 请求尚未发送时执行。hook 环境提供 `INCUMBENT_MODEL`、`INJECTED_MODEL`、`INCUMBENT_TEAM` 和 `INJECTED_TEAM`；非零退出或超时会使该 attempt 无效。
 
-当前已验收的双模型 dirty lease 命令为：
+当前推荐的双模型 phase-aware dirty lease 命令为：
 
 ```bash
 ./run.sh --strategy external \
@@ -127,12 +146,16 @@ stream=true
     --tgid \"\$MODEL_A_PID\" --tgid2 \"\$MODEL_B_PID\" \
     --strategy rvv_dirty --vector-slice-ms 100 \
     --vector-local-window-ms 500 --dirty-threshold 2 \
-    --user-control active --user-cpu-map auto"
+    --vector-local-wakeup off --phase-wakeup-preempt on \
+    --user-control active --user-cpu-map auto \
+    --team-gang prefill-lease --prefill-starvation-ms 1000"
 ```
 
-两轮 CFS 为 `2.40695 +/- 0.00140 TPS`，三轮 active-auto 为 `2.86833 +/- 0.00939 TPS`，平均提升 `19.17%`。注入时在线改为 1000ms window 的正式候选为 `2.85866 TPS`，未超过 500ms active-auto，因此默认不变。完整报告见 `docs/rvv_dirty_lease_dual_model_userspace_20260718.md`。
-
-使用相同 `rvv-barrier` trace 配置重新完成的三轮 CFS/三轮 active-auto 对比为 `2.35419 +/- 0.00634` 和 `2.80468 +/- 0.03187 TPS`，lease 提升 `19.14%`。lease 将通用上下文切换和 RVV save+restore 候选都降低约 90%，但 top-futex summed worker blocked time 增加 34.44%，因此不能把吞吐收益简单归因为 barrier 累计等待减少。详细逐任务 TTFT/TPS 与原始轮次见 `docs/cfs_vs_rvv_dirty_lease_traced_dual_20260718.md`。
+c=4 消融中，关闭 local-wakeup fast path 后 TPS 与原 phase-aware 路径持平，
+injected mean TTFT 从 `10.856s` 降为 `9.169s`，preferred-team run match 从
+`51.18%` 提升到 `61.69%`。该结果目前是单轮机制验证；正式方差复测完成前不应
+把小幅差异视为稳定收益。报告见
+[`phase-aware-dirty-lease-c4-ablation.md`](../../docs/reports/phase-aware-dirty-lease-c4-ablation.md)。
 
 ## Metrics
 

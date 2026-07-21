@@ -51,6 +51,11 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(detect_profile("external", command), "gang-active")
         lease_command = "/tmp/scx_llm_pin --team-gang prefill-lease --user-control active"
         self.assertEqual(detect_profile("external", lease_command), "phase-lease")
+        no_preempt_command = lease_command + " --phase-wakeup-preempt off"
+        self.assertEqual(
+            detect_profile("external", no_preempt_command),
+            "phase-lease-no-preempt",
+        )
         self.assertEqual(detect_profile("cfs-shared", ""), "none")
 
     def test_scheduler_phase_lease_diagnostics(self):
@@ -72,6 +77,18 @@ class MetricsTest(unittest.TestCase):
             self.assertTrue(result["valid"])
             self.assertEqual(result["phase_lease_run_match_percent"], 90.0)
             self.assertTrue(result["checks"]["wakeup_preemption_active"])
+
+            result = validate_scheduler_log(path, "phase-lease-no-preempt")
+            self.assertFalse(result["valid"])
+            self.assertFalse(result["checks"]["wakeup_preemption_disabled"])
+
+            path.write_text(path.read_text().replace(
+                "phase_lease_wakeup_preempts=12",
+                "phase_lease_wakeup_preempts=0",
+            ))
+            result = validate_scheduler_log(path, "phase-lease-no-preempt")
+            self.assertTrue(result["valid"])
+            self.assertTrue(result["checks"]["wakeup_preemption_disabled"])
 
     def test_percentile_uses_nearest_rank(self):
         self.assertEqual(percentile([1, 2, 3, 4], 0.95), 4)
@@ -104,6 +121,43 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(metrics["incumbent_overlap_itl_p50_ms"], 2000.0)
         self.assertEqual(metrics["incumbent_itl_degradation_percent"], 100.0)
         self.assertAlmostEqual(metrics["token_rate_jain"], 1.0)
+
+    def test_symmetric_metrics_report_alignment_and_completion_skew(self):
+        second = 1_000_000_000
+        workload = {
+            "scenario": "symmetric",
+            "valid": True,
+            "complete": True,
+            "milestone_order_ok": True,
+            "within_run_deterministic": True,
+            "incumbent_model": "A",
+            "injected_model": "B",
+            "injection_ns": 0,
+            "max_pair_start_skew_ms": 10.0,
+            "release_alignment_spread_ms": 10.0,
+            "max_pair_completion_skew_ms": 200.0,
+            "model_completion_skew_ms": 200.0,
+            "start_alignment_ok": True,
+            "symmetric_input_ok": True,
+            "requests": [
+                request("incumbent-short", "incumbent", "A", 0, [second, 4 * second]),
+                request(
+                    "injected-short",
+                    "injected",
+                    "B",
+                    10_000_000,
+                    [1_100_000_000, 4_200_000_000],
+                ),
+            ],
+        }
+
+        metrics = calculate_run_metrics(workload)
+
+        self.assertEqual(metrics["scenario"], "symmetric")
+        self.assertEqual(metrics["pair_start_skew_max_ms"], 10.0)
+        self.assertEqual(metrics["model_completion_skew_ms"], 200.0)
+        self.assertAlmostEqual(metrics["overlap_fraction_percent"], 4 / 4.2 * 100)
+        self.assertGreater(metrics["model_e2e_tps_jain"], 0.99)
 
     def test_sampler_aligns_with_wall_clock(self):
         second = 1_000_000_000

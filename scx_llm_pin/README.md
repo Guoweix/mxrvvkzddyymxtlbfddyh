@@ -13,9 +13,10 @@
 | `rvv_dirty` | 根据 `sstatus.VS=Dirty` 识别 vector worker，使用全 8 核唯一 CPU 分配和 per-team/per-CPU vector DSQ |
 | `rvv_dirty_local` | vector worker 与 `rvv_dirty` 相同；目标 LLM 的非 vector 辅助线程进入 local DSQ |
 
-`vector-local-window-ms=0` 对应旧 RVV dirty 行为；非零窗口启用 dirty lease。当前
-benchmark 的 dirty lease 默认参数是 100 ms vector slice、500 ms local window 和
-dirty threshold 2。
+当前推荐的 phase-aware 路径使用 100ms vector slice、500ms window 上限、dirty
+threshold 2，并显式设置 `--vector-local-wakeup off`。完成启动识别后，普通 vector
+wakeup 重新进入对应 VDSQ，不使用 team-local fast path；500ms 参数仍作为可在线
+控制的窗口上限保留。`team` 和 `exclusive` 用于 local-wakeup 消融实验。
 
 ## 编译和部署
 
@@ -45,13 +46,15 @@ make deploy BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PAS
 ./scx_llm_pin --tgid "$LLM_PID" --strategy rvv_dirty \
   --vector-slice-ms 100 --vector-local-window-ms 0 --dirty-threshold 2
 
-# RVV dirty lease
+# RVV dirty，普通 vector wakeup 回到 VDSQ
 ./scx_llm_pin --tgid "$LLM_PID" --strategy rvv_dirty \
-  --vector-slice-ms 100 --vector-local-window-ms 500 --dirty-threshold 2
+  --vector-slice-ms 100 --vector-local-window-ms 500 \
+  --vector-local-wakeup off --dirty-threshold 2
 
-# RVV dirty lease，辅助线程走 local DSQ
+# 同一路径，目标 LLM 的非 vector 辅助线程走 local DSQ
 ./scx_llm_pin --tgid "$LLM_PID" --strategy rvv_dirty_local \
-  --vector-slice-ms 100 --vector-local-window-ms 500 --dirty-threshold 2
+  --vector-slice-ms 100 --vector-local-window-ms 500 \
+  --vector-local-wakeup off --dirty-threshold 2
 ```
 
 主要参数：
@@ -62,7 +65,9 @@ make deploy BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PAS
 --strategy global|rvv_dirty|rvv_dirty_local
 --vector-slice-ms MS
 --vector-local-window-ms MS
+--vector-local-wakeup team|off|exclusive
 --dirty-threshold N
+--phase-wakeup-preempt on|off
 --duration SEC
 ```
 
@@ -76,10 +81,12 @@ make deploy BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PAS
 ```bash
 ./scx_llm_pin --tgid "$LLM_PID" --strategy rvv_dirty \
   --vector-slice-ms 100 --vector-local-window-ms 500 \
+  --vector-local-wakeup off \
   --user-control observe
 
 ./scx_llm_pin --tgid "$LLM_PID" --strategy rvv_dirty \
   --vector-slice-ms 100 --vector-local-window-ms 500 \
+  --vector-local-wakeup off \
   --user-control active --user-cpu-map auto
 ```
 
@@ -109,9 +116,10 @@ make deploy BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PAS
 --team-gang prefill-lease
 ```
 
-`prefill-lease` 保留 dirty lease 的 vector slice 和 local window，只在 vector DSQ
-选择时偏向 PREFILL/MIXED team，并允许 wakeup 的 prefill worker 抢占同核另一组
-vector worker。它不抢占普通任务、kworker 或内核线程。
+`prefill-lease` 根据 phase hint 在两组 per-team/per-CPU VDSQ 之间优先消费
+PREFILL/MIXED team。当前推荐模式关闭 local-wakeup fast path，使普通 vector
+wakeup 重新经过 VDSQ 和 phase 选择；preferred worker 唤醒时仍可定向抢占同核
+另一组 vector worker。它不抢占普通任务、kworker 或内核线程。
 
 示例：
 
@@ -119,6 +127,7 @@ vector worker。它不抢占普通任务、kworker 或内核线程。
 ./scx_llm_pin --tgid "$MODEL_A_PID" --tgid2 "$MODEL_B_PID" \
   --strategy rvv_dirty --vector-slice-ms 100 \
   --vector-local-window-ms 500 --dirty-threshold 2 \
+  --vector-local-wakeup off --phase-wakeup-preempt on \
   --user-control active --team-gang prefill-lease \
   --prefill-starvation-ms 1000
 ```

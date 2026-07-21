@@ -116,6 +116,7 @@ def group_metrics(requests):
 
 
 def calculate_run_metrics(workload):
+    scenario = workload.get("scenario", "asynchronous")
     requests = workload.get("requests") or []
     request_rows = [request_metrics(request) for request in requests]
     injection_ns = workload.get("injection_ns")
@@ -172,6 +173,51 @@ def calculate_run_metrics(workload):
         incumbent_overlap_tokens / overlap_sec if overlap_sec > 0 else 0.0,
         injected_overlap_tokens / overlap_sec if overlap_sec > 0 else 0.0,
     ]
+    model_groups = {
+        model: group_metrics(
+            [request for request in requests if request.get("model") == model]
+        )
+        for model in ("A", "B")
+    }
+    model_ttft_means = {
+        model: mean(
+            [
+                row["ttft_ms"]
+                for row in request_rows
+                if row["model"] == model and row["ttft_ms"] is not None
+            ]
+        )
+        for model in ("A", "B")
+    }
+    model_ends = {
+        model: max(
+            (
+                request["last_token_ns"]
+                for request in requests
+                if request.get("model") == model
+                and request.get("last_token_ns") is not None
+            ),
+            default=None,
+        )
+        for model in ("A", "B")
+    }
+    completion_skew_ms = workload.get("model_completion_skew_ms")
+    if completion_skew_ms is None and all(value is not None for value in model_ends.values()):
+        completion_skew_ms = abs(model_ends["A"] - model_ends["B"]) / 1_000_000.0
+    overlap_fraction_percent = (
+        overlap_sec / makespan_sec * 100.0 if makespan_sec > 0 else None
+    )
+    completion_skew_percent = (
+        completion_skew_ms / 1000.0 / makespan_sec * 100.0
+        if completion_skew_ms is not None and makespan_sec > 0
+        else None
+    )
+    model_e2e_rates = [model_groups[model]["e2e_tps"] for model in ("A", "B")]
+    model_e2e_tps_jain = (
+        jain_fairness(model_e2e_rates)
+        if all(value is not None for value in model_e2e_rates)
+        else None
+    )
 
     injected_ttfts = [
         row["ttft_ms"]
@@ -187,6 +233,7 @@ def calculate_run_metrics(workload):
     )
 
     return {
+        "scenario": scenario,
         "valid": bool(workload.get("valid")),
         "complete": bool(workload.get("complete")),
         "milestone_order_ok": bool(workload.get("milestone_order_ok")),
@@ -209,12 +256,20 @@ def calculate_run_metrics(workload):
         "incumbent_overlap_tps": overlap_rates[0],
         "injected_overlap_tps": overlap_rates[1],
         "token_rate_jain": jain_fairness(overlap_rates),
-        "models": {
-            model: group_metrics(
-                [request for request in requests if request.get("model") == model]
-            )
-            for model in ("A", "B")
-        },
+        "models": model_groups,
+        "model_a_e2e_tps": model_groups["A"]["e2e_tps"],
+        "model_b_e2e_tps": model_groups["B"]["e2e_tps"],
+        "model_e2e_tps_jain": model_e2e_tps_jain,
+        "model_a_ttft_mean_ms": model_ttft_means["A"],
+        "model_b_ttft_mean_ms": model_ttft_means["B"],
+        "model_completion_skew_ms": completion_skew_ms,
+        "model_completion_skew_percent": completion_skew_percent,
+        "pair_start_skew_max_ms": workload.get("max_pair_start_skew_ms"),
+        "release_alignment_spread_ms": workload.get("release_alignment_spread_ms"),
+        "pair_completion_skew_max_ms": workload.get("max_pair_completion_skew_ms"),
+        "overlap_fraction_percent": overlap_fraction_percent,
+        "start_alignment_ok": workload.get("start_alignment_ok"),
+        "symmetric_input_ok": workload.get("symmetric_input_ok"),
         "roles": {
             "incumbent": group_metrics(incumbent),
             "injected": group_metrics(injected),
