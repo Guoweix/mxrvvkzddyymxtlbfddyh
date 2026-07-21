@@ -2,7 +2,7 @@
 
 本项目面向 Milk-V Jupiter / SpacemiT K1 八核 RISC-V 平台，研究 Linux
 `sched_ext` 对 llama.cpp CPU 推理工作负载的调度优化。项目使用 eBPF 调度器识别
-执行 RVV 向量计算的 worker，并结合 CPU 分配、vector DSQ、local lease 以及
+执行 RVV 向量计算的 worker，并结合 CPU 分配、vector DSQ、长时间片以及
 llama.cpp 提供的 prefill/decode 阶段提示，改善多线程和多模型竞争时的调度行为。
 
 仓库提供一套可复现的实验环境，包括 K1 Linux 6.6 的 sched_ext 补丁、llama.cpp
@@ -14,8 +14,9 @@ llama.cpp 提供的 prefill/decode 阶段提示，改善多线程和多模型竞
   的调度器、cgroup、BTF、libbpf 和驱动构建兼容代码。
 - **RVV worker 识别**：根据任务的 RISC-V Vector 上下文状态和可配置 dirty 命中
   阈值识别向量计算线程。
-- **Dirty lease 调度**：为 RVV worker 分配互不重复的 CPU，使用 per-CPU vector
-  DSQ、长时间片和 local lease 减少不必要的迁移与调度相位扰动。
+- **Phase-aware dirty lease**：为每组 RVV worker 分配互不重复的 CPU，使用
+  per-team/per-CPU vector DSQ 和长时间片；普通 wakeup 重新进入 VDSQ，由 phase
+  hint 决定 A/B team 的消费顺序，并对 preferred wakeup 提供定向抢占。
 - **用户态调度提示**：llama.cpp 可通过 mmapable BPF map 注册 OpenMP worker，
   并发布 `PREFILL`、`DECODE`、`MIXED` 和 `IDLE` 阶段。
 - **调度观测**：采集 RVV save/restore 候选、上下文切换、wake-to-run 延迟、
@@ -35,24 +36,68 @@ llama.cpp 提供的 prefill/decode 阶段提示，改善多线程和多模型竞
 
 ## 工作方式
 
-```text
-patched llama-server
-    | worker registration + phase hint
-    v
-/sys/fs/bpf/scx_rvv_dirty_lease/workers
-    |
-    v
-scx_llm_pin loader ---> sched_ext BPF scheduler ---> Linux runqueues / DSQs
-    ^                                                   |
-    |                                                   v
-rvv_lease_ctl                                  RVV OpenMP workers
+<p align="center">
+  <a href="docs/images/architecture.svg">
+    <img src="docs/images/architecture.svg" width="1200" alt="RVV-aware sched_ext 用户态与 Linux 内核通信架构">
+  </a>
+</p>
 
-rvv_sched_cost independently observes sched_switch, wakeup and futex events.
-```
+`scx_llm_pin` loader 通过 libbpf 加载 eBPF 程序、初始化并 pin `config/workers`
+maps，最后把 struct_ops 附加到 Linux sched_ext。patched llama-server 使用
+`BPF_OBJ_GET + mmap` 写入 OpenMP worker 身份和推理 phase；`rvv_lease_ctl` 使用
+BPF map lookup/update syscall 读取运行状态或在线调整 slice、vector window、dirty
+阈值和 CPU map。
 
-`scx_llm_pin` 可以仅使用内核态 RVV dirty 识别，也可以接收 patched llama.cpp 发布的
-worker 和 phase 信息。没有加载 sched_ext 调度器时，系统继续使用 Linux 默认调度器；
-同一份 llama-server 二进制也可以用于 CFS 对照实验。
+内核调度核心调用 eBPF 的 `select_cpu`、`enqueue`、`dispatch`、`running` 和
+`stopping` callbacks。eBPF 调度器结合 BPF maps 与 `task_struct` 中的 RISC-V
+Vector 状态完成 RVV worker 识别、CPU 分配和 DSQ 选择，再通过 sched_ext kfunc
+把任务交回 Linux 调度核心执行。
+
+### Phase-Aware Dirty Lease
+
+<p align="center">
+  <a href="docs/images/phase-aware-lease.svg">
+    <img src="docs/images/phase-aware-lease.svg" width="1200" alt="Phase-aware lease 中 CPU i 的 DSQ 消费顺序与 vector worker 入队路径">
+  </a>
+</p>
+
+Phase-Aware Dirty Lease 是当前完整策略名称。它把 RVV worker 稳定映射到 CPU，
+使用 100 ms vector slice 和 per-team/per-CPU VDSQ 保持同组 worker 连续推进，再
+根据 llama.cpp 发布的 `PREFILL/MIXED` phase 选择优先运行的 team。
+
+图从左到右展示 CPU、local DSQ、来源 DSQ 和任务；箭头按真实数据流从右向左。
+CPU i 最终只从自己的 local DSQ 运行任务。local 为空时，sched_ext 核心先把
+global DSQ 的普通任务转入 local；只有 global 没有提供任务时，BPF dispatch 才从
+vector DSQ 消费一个 worker 到 local。图中 `VECTOR DSQs (CPU i)` 内的 A/B 是源码
+中的两条独立队列 `VDSQ(A,i)` 和 `VDSQ(B,i)`，不是共享 FIFO。
+
+当前推荐配置使用 `--vector-local-wakeup off`：V worker 普通唤醒后返回所属 VDSQ，
+重新参与 phase-aware 选择，而不通过旧 local-wakeup fast path 直接进入 local DSQ。
+“no-local-wakeup”只描述这一项入队行为，不是策略名称。BPF 优先消费处于
+`PREFILL/MIXED` 的 team，首选队列为空时回退到另一 team；preferred worker 唤醒且
+同核正在运行另一 team 的 V worker 时可定向抢占。等待达到 1 秒的 runnable
+V worker 由 pending safety 兜底，普通任务、helper 和内核任务仍通过 global DSQ
+获得服务。
+
+### 实验数据对比
+
+下表使用当前 Phase-Aware Dirty Lease 配置的 `c=4` 正式测试数据：两个
+llama-server 各使用 8 个 worker 共享 CPU0-7，每个服务承载 2 个请求；A 侧请求
+输出 4 个 token 后向 B 侧异步注入请求，间隔 1 秒，每个请求固定输出 256 token。
+每种策略均为 3 个有效样本，`+/-` 后为样本标准差，括号内为相对 CFS 的变化。
+
+| 策略 | Aggregate TPS | 注入请求 mean TTFT | 注入请求 pooled p95 TTFT | 总上下文切换 |
+|---|---:|---:|---:|---:|
+| CFS | 2.239 +/- 0.014 | 16.716 +/- 0.067 s | 27.862 s | 1,630,478 +/- 26,578 |
+| Dirty Lease (`observe`) | 3.006 +/- 0.004 (+34.2%) | 14.033 +/- 0.398 s (-16.1%) | 23.109 s (-17.1%) | 54,524 +/- 415 (-96.7%) |
+| Phase-Aware Dirty Lease | 3.008 +/- 0.004 (+34.3%) | 9.063 +/- 0.099 s (-45.8%) | 15.214 s (-45.4%) | 54,820 +/- 523 (-96.6%) |
+
+`observe` 读取并校验
+worker/phase hint，但不根据 phase 改变调度；完整策略通过 `prefill-lease` 选择
+preferred team，并允许满足条件的 preferred wakeup 定向抢占。相对 Observe，
+Phase-Aware Dirty Lease 的 TPS 变化 `+0.08%`、mean TTFT 降低 `35.42%`、pooled
+p95 TTFT 降低 `34.17%`，上下文切换增加 `0.54%`。这说明 `c=4` 下 phase hint
+主要改善注入请求的首 token 响应，而没有牺牲稳态吞吐。
 
 ## 环境准备
 
@@ -274,7 +319,7 @@ export GGML_SCX_LEASE_HINT_PATH=/sys/fs/bpf/scx_rvv_dirty_lease/workers
     -t 8 -tb 8 -np 4
 ```
 
-取得 llama-server 的 TGID 后，以 dirty lease 和用户态控制模式启动调度器：
+取得 llama-server 的 TGID 后，启动 Phase-Aware Dirty Lease 调度器：
 
 ```bash
 /tmp/scx_llm_pin/scx_llm_pin \
@@ -282,9 +327,13 @@ export GGML_SCX_LEASE_HINT_PATH=/sys/fs/bpf/scx_rvv_dirty_lease/workers
     --strategy rvv_dirty \
     --vector-slice-ms 100 \
     --vector-local-window-ms 500 \
+    --vector-local-wakeup off \
+    --phase-wakeup-preempt on \
     --dirty-threshold 2 \
     --user-control active \
-    --user-cpu-map auto
+    --user-cpu-map auto \
+    --team-gang prefill-lease \
+    --prefill-starvation-ms 1000
 ```
 
 检查 sched_ext 状态、调度器名称和 worker 注册：
@@ -328,21 +377,77 @@ cd "$EXPERIMENTS_ROOT/benchmark"
     --loops 1 \
     --total-tokens 32
 ```
-
-正式对比可以增加并发档位、循环次数和 RVV trace：
-
-```bash
-RVV_TRACE=1 ./benchmark.sh \
-    --strategy rvv_dirty_lease_all \
-    --concurrency-levels 2,4,8 \
-    --loops 3 \
-    --total-tokens 1000
-```
-
 双 llama-server 异步请求场景位于 [`benchmark/dual_model/`](benchmark/dual_model/)，
 用于评估两个独立模型共享八个 CPU 时的 aggregate TPS、逐任务 TTFT、公平性、
 runqueue wait 和上下文切换。测试参数、指标口径和结果文件结构见
 [`benchmark/README.md`](benchmark/README.md)。
+
+### 双模型 c=4 正式对比
+
+以下两个样例复现“实验数据对比”表中的 `c=4` 工作负载：两个服务各使用 8 个
+worker 共享 CPU0-7，A/B 各承载 2 个请求，A 侧请求均输出第 4 个 token 后注入
+B 侧请求，每请求固定输出 256 token，每种策略重复 3 轮。先设置板端路径：
+
+```bash
+export LLM_PATH="<board-llama-directory>"
+export REMOTE_RUNTIME_DIR="<board-patched-runtime-directory>"
+export REMOTE_SCHEDULER_BIN="<board-scx-llm-pin-binary>"
+export MODEL_PATH="<board-gguf-model-path>"
+export LEASE_HINT_PATH=/sys/fs/bpf/scx_rvv_dirty_lease/workers
+
+cd "$EXPERIMENTS_ROOT/benchmark/dual_model"
+```
+
+使用 Linux 默认 CFS/EEVDF 调度器运行三轮：
+
+```bash
+./run.sh \
+    --strategy cfs-shared \
+    --concurrency 4 \
+    --loops 3 \
+    --directions ab \
+    --output-tokens 256 \
+    --injection-token 4 \
+    --arrival-gap-sec 1 \
+    --metrics standard \
+    --llm-path "$LLM_PATH" \
+    --runtime-bin-dir "$REMOTE_RUNTIME_DIR" \
+    --model-a "$MODEL_PATH" \
+    --model-b "$MODEL_PATH"
+```
+
+使用 Phase-Aware Dirty Lease 运行相同工作负载：
+
+```bash
+./run.sh \
+    --strategy external \
+    --concurrency 4 \
+    --loops 3 \
+    --directions ab \
+    --output-tokens 256 \
+    --injection-token 4 \
+    --arrival-gap-sec 1 \
+    --metrics standard \
+    --llm-path "$LLM_PATH" \
+    --runtime-bin-dir "$REMOTE_RUNTIME_DIR" \
+    --model-a "$MODEL_PATH" \
+    --model-b "$MODEL_PATH" \
+    --lease-hint-path "$LEASE_HINT_PATH" \
+    --scheduler-validation auto \
+    --external-start-cmd "$REMOTE_SCHEDULER_BIN \
+      --tgid \"\$MODEL_A_PID\" --tgid2 \"\$MODEL_B_PID\" \
+      --strategy rvv_dirty \
+      --vector-slice-ms 100 --vector-local-window-ms 500 \
+      --dirty-threshold 2 --user-control active --user-cpu-map auto \
+      --vector-local-wakeup off --phase-wakeup-preempt on \
+      --team-gang prefill-lease --prefill-starvation-ms 1000"
+```
+
+两个命令都使用 `standard` 低扰动采样，并自动执行请求完整性、注入顺序、频率、
+温度、内核日志和服务存活检查。Phase-Aware Dirty Lease 还会校验 8+8 worker、
+phase hint、VDSQ 收支、定向抢占和 pending safety；无效 attempt 不进入三轮汇总。
+每次运行结束后可在结果目录的 `report.md` 查看 TPS、逐任务 TTFT、pooled p95 TTFT
+和上下文切换。
 
 ## 文档
 
