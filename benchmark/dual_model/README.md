@@ -25,10 +25,12 @@ export MODEL_B_PORT="<model-b-port>"
 - injected 请求同样按 1 秒间隔到达。
 - 每个请求默认固定输出 256 token，8 个请求共输出 2048 token。
 - 默认只运行一个 `A -> B` 方向和一个 loop。该配置显著长于之前的 16-token 五分钟场景。
-- 四个固定 prompt 在当前模型上分别为 27、111、326、713 input token。
+- 四个基础 prompt 内容不同且没有共同的长前缀。脚本先调用目标模型的
+  `/tokenize`，再将每个 prompt 构造成精确 128 input token 的 token 数组。
 
-并发低于 8 时，固定 prompt 文件按顺序取前 N 档。例如总并发 2/4/8
-分别使用 short、short+medium、全部四档 prompt。每个 server 使用相同的
+并发低于 8 时，固定 prompt 文件按顺序取前 N 个。例如总并发 2/4/8 分别在
+每个 server 使用 1/2/4 个不同内容的等长 prompt。四个 prompt 的输入长度都为
+128 token，因此跨并发结果不再混入 prompt 长度变化；每个 server 使用相同的
 prompt 子集，保证两组请求对称。
 
 所有正式请求固定使用：
@@ -81,9 +83,13 @@ cd symmetric
 ./run.sh --strategy cfs-shared --smoke
 ```
 
-默认测试仍使用完整四档 prompt。长 prompt 在 4 核对照上可能需要数分钟，因此里程碑超时默认保留 600 秒。
+默认测试使用四个不同内容的 128-token prompt。脚本会先验证所有基础文本都不
+超过目标长度，然后使用 token 数组精确补齐；无法构造等长输入时直接拒绝运行。
+里程碑超时默认保留 600 秒。
 
-`--prompts-file PATH` 可为功能 smoke 指定较小的 prompt 集；正式结果必须保留默认四档文件，suite 会把实际输入复制为 `prompts.json`。
+`--prompts-file PATH` 可为功能 smoke 指定较小的 prompt 集；每个条目必须包含
+唯一 `id`、非空 `prompt` 和相同的正整数 `target_tokens`。正式结果必须保留默认
+等长文件，suite 会把实际输入复制为 `prompts.json`。
 
 原双向长测仍可显式运行：
 
@@ -149,6 +155,33 @@ DSQ 时偏向 prefill，并定向抢占同核的另一组 vector worker：
     --vector-local-wakeup off --phase-wakeup-preempt on \
     --user-control active --user-cpu-map auto \
     --team-gang prefill-lease --prefill-starvation-ms 1000"
+```
+
+## Equal-Length TTFT p95 Campaign
+
+`run_ttft_p95_campaign.sh` 是当前板卡环境的一次性完整对比入口，不接受参数。它固定
+使用四个 128-token prompt、256 output token、A→B token-4 注入和 standard
+metrics，运行 CFS、Dirty Lease Observe、Phase-Aware Dirty Lease 的 c=2/4/8
+矩阵。
+
+每轮 injected TTFT 样本数为 c/2。脚本为每个策略/并发单元收集 60 个样本，因此
+c=2/4/8 分别运行 60/30/15 轮。结果写入
+`results/ttft_p95_equal128/`；成功单元使用 `.done` 标记，重新执行时自动跳过，失败
+单元保留日志并在下次执行时重试。
+
+后台启动：
+
+```bash
+tmux new-session -d -s ttft-p95 \
+  'cd /path/to/experiments/benchmark/dual_model && \
+   ./run_ttft_p95_campaign.sh > ttft-p95.log 2>&1'
+```
+
+查看状态：
+
+```bash
+tail -f ttft-p95.log
+cat results/ttft_p95_equal128/status.tsv
 ```
 
 c=4 消融中，关闭 local-wakeup fast path 后 TPS 与原 phase-aware 路径持平，

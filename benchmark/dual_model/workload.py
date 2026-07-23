@@ -90,7 +90,7 @@ class Workload:
         )
 
         payload = {
-            "prompt": prompt["prompt"],
+            "prompt": self.prompt_tokens[model][prompt["id"]],
             "n_predict": self.args.output_tokens,
             "temperature": 0,
             "top_k": 1,
@@ -621,6 +621,42 @@ def validate_prompt_manifest(prompts):
         raise ValueError("every prompt must have a unique non-empty id")
     if len(set(prompt_ids)) != len(prompt_ids):
         raise ValueError("every prompt must have a unique non-empty id")
+    if any(not isinstance(prompt.get("prompt"), str) or not prompt["prompt"] for prompt in prompts):
+        raise ValueError("every prompt must contain non-empty text")
+    targets = [prompt.get("target_tokens") for prompt in prompts]
+    if any(not isinstance(target, int) or target <= 0 for target in targets):
+        raise ValueError("every prompt must define a positive target_tokens value")
+    if len(set(targets)) != 1:
+        raise ValueError("all prompts must use the same target_tokens value")
+
+
+def build_equal_prompt_tokens(prompts, source_tokens):
+    """Pad distinct tokenized prompts to one exact length for each model."""
+    target_tokens = prompts[0]["target_tokens"]
+    result = {}
+    for model, model_tokens in source_tokens.items():
+        result[model] = {}
+        for prompt in prompts:
+            prompt_id = prompt["id"]
+            tokens = list(model_tokens[prompt_id])
+            if not tokens:
+                raise ValueError(f"prompt {prompt_id} tokenized to an empty sequence on model {model}")
+            if len(tokens) > target_tokens:
+                raise ValueError(
+                    f"prompt {prompt_id} has {len(tokens)} tokens on model {model}, "
+                    f"exceeding target_tokens={target_tokens}"
+                )
+            tokens.extend([tokens[-1]] * (target_tokens - len(tokens)))
+            result[model][prompt_id] = tokens
+
+    lengths = {
+        len(tokens)
+        for model_tokens in result.values()
+        for tokens in model_tokens.values()
+    }
+    if lengths != {target_tokens}:
+        raise ValueError(f"equal-length prompt construction failed: {sorted(lengths)}")
+    return result
 
 
 def select_prompts(prompts, request_count):
@@ -676,7 +712,6 @@ def main():
     prompts = json.loads(Path(args.prompts).read_text())
     try:
         validate_prompt_manifest(prompts)
-        prompts = select_prompts(prompts, args.request_count)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -684,17 +719,28 @@ def main():
         args.incumbent_model: args.incumbent_url,
         args.injected_model: args.injected_url,
     }
-    prompt_tokens = {}
+    source_tokens = {}
     for model, base_url in model_urls.items():
-        prompt_tokens[model] = {}
+        source_tokens[model] = {}
         for prompt in prompts:
             tokens = tokenize(base_url, prompt["prompt"], args.request_timeout)
-            if not prompt["min_tokens"] <= len(tokens) <= prompt["max_tokens"]:
-                raise SystemExit(
-                    f"prompt {prompt['id']} token count {len(tokens)} is outside "
-                    f"[{prompt['min_tokens']}, {prompt['max_tokens']}] on model {model}"
-                )
-            prompt_tokens[model][prompt["id"]] = tokens
+            source_tokens[model][prompt["id"]] = tokens
+
+    try:
+        prompt_tokens = build_equal_prompt_tokens(prompts, source_tokens)
+        prompts = select_prompts(prompts, args.request_count)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    selected_ids = {prompt["id"] for prompt in prompts}
+    prompt_tokens = {
+        model: {
+            prompt_id: tokens
+            for prompt_id, tokens in model_tokens.items()
+            if prompt_id in selected_ids
+        }
+        for model, model_tokens in prompt_tokens.items()
+    }
 
     valid = Workload(args, prompts, prompt_tokens).run()
     raise SystemExit(0 if valid else 2)

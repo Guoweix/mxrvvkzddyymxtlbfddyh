@@ -3,7 +3,12 @@
 import unittest
 from types import SimpleNamespace
 
-from workload import Workload, select_prompts, validate_prompt_manifest
+from workload import (
+    Workload,
+    build_equal_prompt_tokens,
+    select_prompts,
+    validate_prompt_manifest,
+)
 
 
 class EventSink:
@@ -47,11 +52,25 @@ class InjectionHookTest(unittest.TestCase):
 
 class PromptManifestTest(unittest.TestCase):
     def test_short_smoke_manifest_is_valid(self):
-        validate_prompt_manifest([{"id": "short"}])
+        validate_prompt_manifest([{"id": "fixed-1", "prompt": "one", "target_tokens": 4}])
 
     def test_duplicate_prompt_ids_are_rejected(self):
         with self.assertRaises(ValueError):
-            validate_prompt_manifest([{"id": "same"}, {"id": "same"}])
+            validate_prompt_manifest(
+                [
+                    {"id": "same", "prompt": "one", "target_tokens": 4},
+                    {"id": "same", "prompt": "two", "target_tokens": 4},
+                ]
+            )
+
+    def test_mixed_target_lengths_are_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_prompt_manifest(
+                [
+                    {"id": "one", "prompt": "one", "target_tokens": 4},
+                    {"id": "two", "prompt": "two", "target_tokens": 5},
+                ]
+            )
 
     def test_request_count_selects_fixed_prefix(self):
         prompts = [{"id": "short"}, {"id": "medium"}, {"id": "long"}]
@@ -63,6 +82,30 @@ class PromptManifestTest(unittest.TestCase):
     def test_request_count_rejects_zero(self):
         with self.assertRaises(ValueError):
             select_prompts([{"id": "short"}], 0)
+
+    def test_distinct_prompts_are_padded_to_one_exact_length(self):
+        prompts = [
+            {"id": "one", "prompt": "first", "target_tokens": 5},
+            {"id": "two", "prompt": "second", "target_tokens": 5},
+        ]
+        source = {
+            "A": {"one": [1, 2, 3], "two": [1, 8, 9, 10]},
+            "B": {"one": [4, 5], "two": [4, 7, 8]},
+        }
+
+        result = build_equal_prompt_tokens(prompts, source)
+
+        self.assertEqual(result["A"]["one"], [1, 2, 3, 3, 3])
+        self.assertEqual(result["A"]["two"], [1, 8, 9, 10, 10])
+        self.assertEqual(result["B"]["one"], [4, 5, 5, 5, 5])
+        self.assertTrue(
+            all(len(tokens) == 5 for model in result.values() for tokens in model.values())
+        )
+
+    def test_prompt_longer_than_target_is_rejected(self):
+        prompts = [{"id": "one", "prompt": "first", "target_tokens": 2}]
+        with self.assertRaises(ValueError):
+            build_equal_prompt_tokens(prompts, {"A": {"one": [1, 2, 3]}})
 
 
 if __name__ == "__main__":

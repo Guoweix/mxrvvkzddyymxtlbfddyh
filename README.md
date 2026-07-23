@@ -81,23 +81,43 @@ V worker 由 pending safety 兜底，普通任务、helper 和内核任务仍通
 
 ### 实验数据对比
 
-下表使用当前 Phase-Aware Dirty Lease 配置的 `c=4` 正式测试数据：两个
-llama-server 各使用 8 个 worker 共享 CPU0-7，每个服务承载 2 个请求；A 侧请求
-输出 4 个 token 后向 B 侧异步注入请求，间隔 1 秒，每个请求固定输出 256 token。
-每种策略均为 3 个有效样本，`+/-` 后为样本标准差，括号内为相对 CFS 的变化。
+以下正式 campaign 使用两个 llama-server 各 8 个 worker 共享 CPU0-7。四个默认
+prompt 文本不同，但均构造为 128 input token；每请求固定输出 256 token。A 侧
+incumbent 请求达到 token-4 后，按 1 秒间隔向 B 侧注入等量请求。
 
-| 策略 | Aggregate TPS | 注入请求 mean TTFT | 注入请求 pooled p95 TTFT | 总上下文切换 |
-|---|---:|---:|---:|---:|
-| CFS | 2.239 +/- 0.014 | 16.716 +/- 0.067 s | 27.862 s | 1,630,478 +/- 26,578 |
-| Dirty Lease (`observe`) | 3.006 +/- 0.004 (+34.2%) | 14.033 +/- 0.398 s (-16.1%) | 23.109 s (-17.1%) | 54,524 +/- 415 (-96.7%) |
-| Phase-Aware Dirty Lease | 3.008 +/- 0.004 (+34.3%) | 9.063 +/- 0.099 s (-45.8%) | 15.214 s (-45.4%) | 54,820 +/- 523 (-96.6%) |
+c=2/4/8 分别运行 60/30/15 个有效轮次，因此每个策略与并发组合都包含 60 个
+injected TTFT 样本。TPS 为跨轮 mean +/- sample SD；TTFT mean、sample SD 和
+nearest-rank p95 均直接从 60 个 injected 单请求汇总。
 
-`observe` 读取并校验
-worker/phase hint，但不根据 phase 改变调度；完整策略通过 `prefill-lease` 选择
-preferred team，并允许满足条件的 preferred wakeup 定向抢占。相对 Observe，
-Phase-Aware Dirty Lease 的 TPS 变化 `+0.08%`、mean TTFT 降低 `35.42%`、pooled
-p95 TTFT 降低 `34.17%`，上下文切换增加 `0.54%`。这说明 `c=4` 下 phase hint
-主要改善注入请求的首 token 响应，而没有牺牲稳态吞吐。
+#### c=2
+
+| 策略 | Aggregate TPS (mean +/- SD) | Injected TTFT (mean +/- SD) | Injected TTFT p95 |
+|---|---:|---:|---:|
+| CFS | 1.6300 +/- 0.0340 | 22.786 +/- 0.291 s | 23.195 s |
+| Dirty Lease (`observe`) | 2.5347 +/- 0.0227 (+55.5%) | 15.956 +/- 0.483 s (-30.0%) | 16.747 s (-27.8%) |
+| Phase-Aware Dirty Lease | 2.5250 +/- 0.0168 (+54.9%) | 13.904 +/- 0.181 s (-39.0%) | 14.253 s (-38.6%) |
+
+#### c=4
+
+| 策略 | Aggregate TPS (mean +/- SD) | Injected TTFT (mean +/- SD) | Injected TTFT p95 |
+|---|---:|---:|---:|
+| CFS | 2.0701 +/- 0.0244 | 36.513 +/- 12.556 s | 49.724 s |
+| Dirty Lease (`observe`) | 2.6995 +/- 0.0176 (+30.4%) | 26.975 +/- 9.353 s (-26.1%) | 37.767 s (-24.0%) |
+| Phase-Aware Dirty Lease | 2.7056 +/- 0.0122 (+30.7%) | 21.173 +/- 7.076 s (-42.0%) | 28.677 s (-42.3%) |
+
+#### c=8
+
+| 策略 | Aggregate TPS (mean +/- SD) | Injected TTFT (mean +/- SD) | Injected TTFT p95 |
+|---|---:|---:|---:|
+| CFS | 3.2008 +/- 0.0288 | 76.130 +/- 30.395 s | 96.264 s |
+| Dirty Lease (`observe`) | 4.0109 +/- 0.0195 (+25.3%) | 50.988 +/- 20.191 s (-33.0%) | 65.434 s (-32.0%) |
+| Phase-Aware Dirty Lease | 4.0210 +/- 0.0080 (+25.6%) | 43.983 +/- 17.556 s (-42.2%) | 55.395 s (-42.5%) |
+
+`observe` 读取并校验 worker/phase hint，但不根据 phase 改变调度；完整策略通过
+`prefill-lease` 选择 preferred team，并允许满足条件的 preferred wakeup 定向抢占。
+Phase-Aware Dirty Lease 相对 CFS 在 c=2/4/8 下分别提升 TPS 约 54.9%、30.7% 和
+25.6%，并将 injected TTFT p95 分别降低约 38.6%、42.3% 和 42.5%。相对 Observe，
+Phase-Aware 的 TPS 变化不超过 0.4%，但 p95 进一步降低约 14.9%、24.1% 和 15.3%。
 
 ## 环境准备
 
@@ -386,7 +406,8 @@ runqueue wait 和上下文切换。测试参数、指标口径和结果文件结
 
 以下两个样例复现“实验数据对比”表中的 `c=4` 工作负载：两个服务各使用 8 个
 worker 共享 CPU0-7，A/B 各承载 2 个请求，A 侧请求均输出第 4 个 token 后注入
-B 侧请求，每请求固定输出 256 token，每种策略重复 3 轮。先设置板端路径：
+B 侧请求，两个不同文本的 prompt 均为 128 input token，每请求固定输出 256 token，
+每种策略重复 30 个有效轮次。先设置板端路径：
 
 ```bash
 export LLM_PATH="<board-llama-directory>"
@@ -398,13 +419,13 @@ export LEASE_HINT_PATH=/sys/fs/bpf/scx_rvv_dirty_lease/workers
 cd "$EXPERIMENTS_ROOT/benchmark/dual_model"
 ```
 
-使用 Linux 默认 CFS/EEVDF 调度器运行三轮：
+使用 Linux 默认 CFS/EEVDF 调度器运行 30 轮：
 
 ```bash
 ./run.sh \
     --strategy cfs-shared \
     --concurrency 4 \
-    --loops 3 \
+    --loops 30 \
     --directions ab \
     --output-tokens 256 \
     --injection-token 4 \
@@ -422,7 +443,7 @@ cd "$EXPERIMENTS_ROOT/benchmark/dual_model"
 ./run.sh \
     --strategy external \
     --concurrency 4 \
-    --loops 3 \
+    --loops 30 \
     --directions ab \
     --output-tokens 256 \
     --injection-token 4 \
@@ -445,7 +466,7 @@ cd "$EXPERIMENTS_ROOT/benchmark/dual_model"
 
 两个命令都使用 `standard` 低扰动采样，并自动执行请求完整性、注入顺序、频率、
 温度、内核日志和服务存活检查。Phase-Aware Dirty Lease 还会校验 8+8 worker、
-phase hint、VDSQ 收支、定向抢占和 pending safety；无效 attempt 不进入三轮汇总。
+phase hint、VDSQ 收支、定向抢占和 pending safety；无效 attempt 不进入 30 轮汇总。
 每次运行结束后可在结果目录的 `report.md` 查看 TPS、逐任务 TTFT、pooled p95 TTFT
 和上下文切换。
 
