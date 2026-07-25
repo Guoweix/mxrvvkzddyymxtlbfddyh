@@ -15,7 +15,6 @@ export REMOTE_PORT="${REMOTE_PORT:-9090}"
 export LLM_THREADS=8          # 单 token / generation 计算线程数 (-t)
 # 留空时在参数解析后跟随 LLM_THREADS；也可通过环境变量或 --threads-batch 单独覆盖。
 export LLM_THREADS_BATCH="${LLM_THREADS_BATCH:-}" # 多 token / prompt batch 线程数 (-tb)
-export LLM_PARALLEL=4         # 并行槽位数 (-np)
 export LLM_CONTEXT=4096       # 上下文长度 (-c)
 # GNU libgomp barrier spin count；留空表示使用板端默认值。
 export GOMP_SPINCOUNT="${GOMP_SPINCOUNT:-}"
