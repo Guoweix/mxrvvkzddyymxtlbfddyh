@@ -137,9 +137,9 @@ Phase-Aware 的 TPS 变化不超过 0.4%，但 p95 进一步降低约 14.9%、24
 export PROJECT_ROOT=/path/to/riscv-rvv
 export EXPERIMENTS_ROOT="$PROJECT_ROOT/experiments"
 export BIANBU_ROOT=/path/to/jupiter-buildroot
-export BOARD_IP=<board-ip>
-export BOARD_USER=<board-user>
-export BOARD_PASS=<board-password>
+export BOARD_IP="<board-ip>"
+export BOARD_USER="<board-user>"
+export BOARD_PASS="<board-password>"
 ```
 
 ## 从 Buildroot 构建完整实验环境
@@ -414,16 +414,16 @@ export LLM_PATH="<board-llama-directory>"
 export REMOTE_RUNTIME_DIR="<board-patched-runtime-directory>"
 export REMOTE_SCHEDULER_BIN="<board-scx-llm-pin-binary>"
 export MODEL_PATH="<board-gguf-model-path>"
-export LEASE_HINT_PATH=/sys/fs/bpf/scx_rvv_dirty_lease/workers
 
-cd "$EXPERIMENTS_ROOT/benchmark/dual_model"
+cd "$EXPERIMENTS_ROOT/benchmark"
 ```
 
 使用 Linux 默认 CFS/EEVDF 调度器运行 30 轮：
 
 ```bash
-./run.sh \
-    --strategy cfs-shared \
+./benchmark.sh \
+    --scenario dual-asynchronous \
+    --strategy cfs \
     --concurrency 4 \
     --loops 30 \
     --directions ab \
@@ -431,7 +431,6 @@ cd "$EXPERIMENTS_ROOT/benchmark/dual_model"
     --injection-token 4 \
     --arrival-gap-sec 1 \
     --metrics standard \
-    --llm-path "$LLM_PATH" \
     --runtime-bin-dir "$REMOTE_RUNTIME_DIR" \
     --model-a "$MODEL_PATH" \
     --model-b "$MODEL_PATH"
@@ -440,8 +439,9 @@ cd "$EXPERIMENTS_ROOT/benchmark/dual_model"
 使用 Phase-Aware Dirty Lease 运行相同工作负载：
 
 ```bash
-./run.sh \
-    --strategy external \
+./benchmark.sh \
+    --scenario dual-asynchronous \
+    --strategy phase-aware \
     --concurrency 4 \
     --loops 30 \
     --directions ab \
@@ -449,19 +449,10 @@ cd "$EXPERIMENTS_ROOT/benchmark/dual_model"
     --injection-token 4 \
     --arrival-gap-sec 1 \
     --metrics standard \
-    --llm-path "$LLM_PATH" \
     --runtime-bin-dir "$REMOTE_RUNTIME_DIR" \
+    --scheduler-bin "$REMOTE_SCHEDULER_BIN" \
     --model-a "$MODEL_PATH" \
-    --model-b "$MODEL_PATH" \
-    --lease-hint-path "$LEASE_HINT_PATH" \
-    --scheduler-validation auto \
-    --external-start-cmd "$REMOTE_SCHEDULER_BIN \
-      --tgid \"\$MODEL_A_PID\" --tgid2 \"\$MODEL_B_PID\" \
-      --strategy rvv_dirty \
-      --vector-slice-ms 100 --vector-local-window-ms 500 \
-      --dirty-threshold 2 --user-control active --user-cpu-map auto \
-      --vector-local-wakeup off --phase-wakeup-preempt on \
-      --team-gang prefill-lease --prefill-starvation-ms 1000"
+    --model-b "$MODEL_PATH"
 ```
 
 两个命令都使用 `standard` 低扰动采样，并自动执行请求完整性、注入顺序、频率、

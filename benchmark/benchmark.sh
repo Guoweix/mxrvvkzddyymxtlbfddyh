@@ -94,6 +94,295 @@ require_concurrency_list() {
     fi
 }
 
+routes_to_dual_model() {
+    local arg
+
+    for arg in "$@"; do
+        if [ "$arg" = "dual-asynchronous" ] ||
+           [ "$arg" = "--scenario=dual-asynchronous" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+dual_model_help() {
+    cat <<'EOF'
+用法: ./benchmark.sh --scenario dual-asynchronous [选项]
+
+双模型 A/B 异步注入选项:
+  --strategy S                 phase-aware、observe、cfs 或 cfs-4plus4
+  --concurrency N              总并发请求数，只支持 2、4、8（默认 4）
+  --loops N                    重复轮数（默认 1）
+  --directions D               ab、ba 或 both（默认 ab）
+  --output-tokens N            每请求固定输出 Token（默认 256）
+  --injection-token N          incumbent 达到该 Token 后注入（默认 4）
+  --arrival-gap-sec N          同组请求到达间隔秒数（默认 1）
+  --metrics M                  standard、rvv 或 rvv-barrier（默认 standard）
+  --runtime-bin-dir PATH       板端 patched llama runtime
+  --scheduler-bin PATH         板端 scx_llm_pin 可执行文件
+  --model-a PATH               板端模型 A
+  --model-b PATH               板端模型 B
+  --port-a N / --port-b N      两个服务端口（默认 9090/9091）
+  --results-dir PATH           dual-model 结果根目录
+  --dry-run                    仅输出最终 dual_model/run.sh 命令
+  --help                       显示本帮助
+
+连接信息默认复用 config.sh 的 REMOTE_IP、REMOTE_USER、REMOTE_PASS 和 LLM_PATH。
+EOF
+}
+
+run_dual_model_route() {
+    local strategy="cfs"
+    local concurrency="4"
+    local loops="1"
+    local directions="ab"
+    local output_tokens="256"
+    local injection_token="4"
+    local arrival_gap_sec="1"
+    local metrics="standard"
+    local runtime_bin_dir="${DUAL_MODEL_RUNTIME_BIN_DIR:-$LLM_PATH/bin}"
+    local scheduler_bin="${DUAL_MODEL_SCHEDULER_BIN:-$SCX_REMOTE_DIR/scx_llm_pin}"
+    local default_model="${DUAL_MODEL_MODEL_PATH:-$LLM_PATH/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf}"
+    local model_a="$default_model"
+    local model_b="$default_model"
+    local port_a="${DUAL_MODEL_PORT_A:-9090}"
+    local port_b="${DUAL_MODEL_PORT_B:-9091}"
+    local results_dir="$SCRIPT_DIR/dual_model/results"
+    local prompts_file="$SCRIPT_DIR/dual_model/prompts.json"
+    local max_attempts="3"
+    local vector_slice_ms="100"
+    local vector_local_window_ms="500"
+    local dirty_threshold="2"
+    local prefill_starvation_ms="1000"
+    local lease_hint_path="${SCX_LEASE_CONTROL_DIR:-/sys/fs/bpf/scx_rvv_dirty_lease}/workers"
+    local dry_run=0
+    local external_start_cmd=""
+    local -a command=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --scenario)
+                [ "${2:-}" = "dual-asynchronous" ] || {
+                    log_error "双模型路由只支持 --scenario dual-asynchronous"
+                    return 2
+                }
+                shift 2
+                ;;
+            --scenario=dual-asynchronous)
+                shift
+                ;;
+            --strategy)
+                strategy="$2"
+                shift 2
+                ;;
+            --concurrency|--tasks)
+                concurrency="$2"
+                shift 2
+                ;;
+            --loops)
+                loops="$2"
+                shift 2
+                ;;
+            --directions)
+                directions="$2"
+                shift 2
+                ;;
+            --output-tokens|--tokens)
+                output_tokens="$2"
+                shift 2
+                ;;
+            --injection-token)
+                injection_token="$2"
+                shift 2
+                ;;
+            --arrival-gap-sec)
+                arrival_gap_sec="$2"
+                shift 2
+                ;;
+            --metrics)
+                metrics="$2"
+                shift 2
+                ;;
+            --runtime-bin-dir)
+                runtime_bin_dir="$2"
+                shift 2
+                ;;
+            --scheduler-bin)
+                scheduler_bin="$2"
+                shift 2
+                ;;
+            --model-a)
+                model_a="$2"
+                shift 2
+                ;;
+            --model-b)
+                model_b="$2"
+                shift 2
+                ;;
+            --port-a)
+                port_a="$2"
+                shift 2
+                ;;
+            --port-b)
+                port_b="$2"
+                shift 2
+                ;;
+            --results-dir)
+                results_dir="$2"
+                shift 2
+                ;;
+            --prompts-file)
+                prompts_file="$2"
+                shift 2
+                ;;
+            --max-attempts)
+                max_attempts="$2"
+                shift 2
+                ;;
+            --vector-slice-ms)
+                vector_slice_ms="$2"
+                shift 2
+                ;;
+            --vector-local-window-ms)
+                vector_local_window_ms="$2"
+                shift 2
+                ;;
+            --dirty-threshold)
+                dirty_threshold="$2"
+                shift 2
+                ;;
+            --prefill-starvation-ms)
+                prefill_starvation_ms="$2"
+                shift 2
+                ;;
+            --lease-hint-path)
+                lease_hint_path="$2"
+                shift 2
+                ;;
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            --help)
+                dual_model_help
+                return 0
+                ;;
+            *)
+                log_error "dual-asynchronous 不支持选项: $1"
+                return 2
+                ;;
+        esac
+    done
+
+    case "$concurrency" in
+        2|4|8) ;;
+        *) log_error "dual concurrency 只支持 2、4、8"; return 2 ;;
+    esac
+    require_positive_int "loops" "$loops"
+    require_positive_int "output_tokens" "$output_tokens"
+    require_positive_int "injection_token" "$injection_token"
+    require_positive_int "max_attempts" "$max_attempts"
+    require_positive_int "vector_slice_ms" "$vector_slice_ms"
+    require_positive_int "vector_local_window_ms" "$vector_local_window_ms"
+    require_positive_int "dirty_threshold" "$dirty_threshold"
+    require_positive_int "prefill_starvation_ms" "$prefill_starvation_ms"
+    if [ "$injection_token" -ge "$output_tokens" ]; then
+        log_error "injection_token 必须小于 output_tokens"
+        return 2
+    fi
+    case "$directions" in ab|ba|both) ;; *) log_error "directions 只支持 ab、ba、both"; return 2 ;; esac
+    case "$metrics" in standard|rvv|rvv-barrier) ;; *) log_error "未知 dual metrics: $metrics"; return 2 ;; esac
+
+    command=(
+        "$SCRIPT_DIR/dual_model/run.sh"
+        --scenario asynchronous
+        --directions "$directions"
+        --concurrency "$concurrency"
+        --loops "$loops"
+        --output-tokens "$output_tokens"
+        --injection-token "$injection_token"
+        --arrival-gap-sec "$arrival_gap_sec"
+        --metrics "$metrics"
+        --host "$REMOTE_IP"
+        --user "$REMOTE_USER"
+        --password "$REMOTE_PASS"
+        --port-a "$port_a"
+        --port-b "$port_b"
+        --llm-path "$LLM_PATH"
+        --runtime-bin-dir "$runtime_bin_dir"
+        --model-a "$model_a"
+        --model-b "$model_b"
+        --prompts-file "$prompts_file"
+        --scheduler-validation auto
+        --max-attempts "$max_attempts"
+        --results-dir "$results_dir"
+    )
+
+    case "$strategy" in
+        phase-aware|phase-aware-dirty-lease)
+            external_start_cmd="$scheduler_bin \
+--tgid \"\$MODEL_A_PID\" --tgid2 \"\$MODEL_B_PID\" \
+--strategy rvv_dirty --vector-slice-ms $vector_slice_ms \
+--vector-local-window-ms $vector_local_window_ms --dirty-threshold $dirty_threshold \
+--user-control active --user-cpu-map auto \
+--team-gang prefill-lease --prefill-starvation-ms $prefill_starvation_ms \
+--vector-local-wakeup off --phase-wakeup-preempt on"
+            command+=(
+                --strategy external
+                --lease-hint-path "$lease_hint_path"
+                --external-start-cmd "$external_start_cmd"
+            )
+            ;;
+        observe)
+            external_start_cmd="$scheduler_bin \
+--tgid \"\$MODEL_A_PID\" --tgid2 \"\$MODEL_B_PID\" \
+--strategy rvv_dirty --vector-slice-ms $vector_slice_ms \
+--vector-local-window-ms $vector_local_window_ms --dirty-threshold $dirty_threshold \
+--user-control active --user-cpu-map auto \
+--team-gang observe --prefill-starvation-ms $prefill_starvation_ms \
+--vector-local-wakeup off --phase-wakeup-preempt on"
+            command+=(
+                --strategy external
+                --lease-hint-path "$lease_hint_path"
+                --external-start-cmd "$external_start_cmd"
+            )
+            ;;
+        cfs|cfs-shared)
+            command+=(--strategy cfs-shared)
+            ;;
+        cfs-4plus4|cfs-split)
+            command+=(--strategy cfs-split)
+            ;;
+        *)
+            log_error "未知 dual strategy: $strategy"
+            return 2
+            ;;
+    esac
+
+    if [ "$dry_run" -eq 1 ]; then
+        local redact_password=0
+        local arg
+
+        printf '[DRY-RUN]'
+        for arg in "${command[@]}"; do
+            if [ "$redact_password" -eq 1 ]; then
+                printf ' %q' '<redacted>'
+                redact_password=0
+                continue
+            fi
+            printf ' %q' "$arg"
+            if [ "$arg" = "--password" ]; then
+                redact_password=1
+            fi
+        done
+        printf '\n'
+        return 0
+    fi
+
+    exec "${command[@]}"
+}
+
 expand_cpu_list() {
     local spec=$1
     local old_ifs=$IFS
@@ -1881,8 +2170,6 @@ cleanup() {
     return "$exit_status"
 }
 
-trap cleanup EXIT
-
 # ========================================
 # 主函数
 # ========================================
@@ -2100,5 +2387,10 @@ main() {
     log_header "全部完成！"
 }
 
-# 运行主函数
-main "$@"
+# 运行主函数；dual route 不安装单模型 cleanup trap。
+if routes_to_dual_model "$@"; then
+    run_dual_model_route "$@"
+else
+    trap cleanup EXIT
+    main "$@"
+fi

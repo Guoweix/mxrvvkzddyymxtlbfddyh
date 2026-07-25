@@ -1,8 +1,8 @@
 # RVV LLM Benchmark
 
-`experiments/benchmark` 是单个 llama.cpp 服务的性能测试入口，用于比较 CFS、Linux
-task affinity 和当前 `scx_llm_pin` sched_ext 策略。双服务异步注入场景使用独立入口：
-[`dual_model/README.md`](dual_model/README.md)。
+`experiments/benchmark` 提供单个 llama.cpp 服务的性能测试，并通过
+`benchmark.sh --scenario dual-asynchronous` 路由到双服务异步注入 harness。底层双
+模型入口和完整参数仍见 [`dual_model/README.md`](dual_model/README.md)。
 
 本脚本默认按 `2,4,8` 三个并发档位运行，每档默认 1 轮。默认启用固定总输出 token
 模式：每个并发档位的请求共享 `FIXED_TOTAL_TOKENS=1000`，请求完成后按真实 token
@@ -179,7 +179,7 @@ cd "$EXPERIMENTS_ROOT/benchmark"
 | 单 server 通用性能 | `benchmark.sh` | 一个 llama-server，`-np` 个并发请求 | 当前所有可用 strategy，包括 CFS、affinity、`scx_llm_pin` 的各种策略 | TPS、TTFT、p95 TTFT、RVV trace |
 | 单 server + Linux affinity | `linux_affinity_benchmark.sh` | 一个 llama-server，固定高 runtime worker 到 CPU | `linux_affinity` | TPS、TTFT、上下文切换、CPU affinity |
 | 单 server futex/barrier 诊断 | 历史 `barrier_c4/` | 一个 llama-server，`-np=4`、4 个并发请求 | 当前目录没有可运行 harness；可用普通 `benchmark.sh` + `RVV_TRACE_FUTEX=1` 做近似采集 | futex blocked waits、blocked time |
-| 双 server 异步竞争 | `dual_model/run_benchmark.py` | 两个 llama-server，请求分为 incumbent 和 injected，异步重叠 | 当前主要支持 `cfs-shared` 和 `external` phase-aware dirty lease | Aggregate TPS、每任务 TTFT、p95 TTFT、公平性、runqueue wait、上下文切换 |
+| 双 server 异步竞争 | `benchmark.sh --scenario dual-asynchronous`（路由到 `dual_model/run.sh`） | 两个 llama-server，请求分为 incumbent 和 injected，异步重叠 | `cfs`、`observe`、`phase-aware`、`cfs-4plus4` | Aggregate TPS、每任务 TTFT、p95 TTFT、公平性、runqueue wait、上下文切换 |
 | 历史单请求 phase 扫描 | `phase_c1/` | 单请求 c=1，固定 prompt/output，扫描 `-t/-tb` | 历史 CFS、lease、barrier-gang 结果；当前无可运行 harness | Prefill、TTFT、Decode TPS、ITL |
 
 典型调用方式：
@@ -195,14 +195,26 @@ cd "$EXPERIMENTS_ROOT/benchmark"
 RVV_TRACE=1 RVV_TRACE_FUTEX=1 \
   ./benchmark.sh --strategy rvv_dirty_lease_all --concurrency-levels 4
 
-# 双 server 异步场景
-cd dual_model
-./run.sh --strategy cfs-shared --concurrency 4 --loops 3
+# 双 server A->B Phase-Aware Dirty Lease
+export REMOTE_RUNTIME_DIR="<board-patched-runtime-directory>"
+export REMOTE_SCHEDULER_BIN="<board-scx-llm-pin-binary>"
+export MODEL_PATH="<board-gguf-model-path>"
+
+./benchmark.sh \
+  --scenario dual-asynchronous \
+  --strategy phase-aware \
+  --directions ab \
+  --concurrency 4 \
+  --loops 3 \
+  --runtime-bin-dir "$REMOTE_RUNTIME_DIR" \
+  --scheduler-bin "$REMOTE_SCHEDULER_BIN" \
+  --model-a "$MODEL_PATH" --model-b "$MODEL_PATH"
 ```
 
-`dual_model` 的 `external` strategy 需要通过 `--external-start-cmd` 显式提供调度器
-启动命令；它不会读取 `benchmark.sh --strategy rvv_dirty_lease_all` 的 strategy preset。
-同样，`benchmark.sh` 中的单 server strategy 也不会自动改用双 server workload。
+顶层路由支持 `phase-aware`、`observe`、`cfs` 和 `cfs-4plus4`。前两种会自动展开
+包含两个 server TGID 的 external 调度器命令；底层 `dual_model/run.sh` 仍可用于传入
+自定义 `--external-start-cmd`。不指定 `--scenario dual-asynchronous` 时，
+`benchmark.sh` 保持原有单 server 行为。
 
 推荐基线和当前主要策略：
 

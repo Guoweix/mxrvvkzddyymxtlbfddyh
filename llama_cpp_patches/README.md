@@ -121,8 +121,127 @@ cmake --build "$BUILD_DIR" --target llama-server -j"$(nproc)"
 若交叉编译器位于容器中，应把 `LLAMA_SRC` 挂载到容器内，再在容器路径执行相同
 CMake 配置。不要复用由另一个绝对源码路径生成的 `CMakeCache.txt`。
 
-部署时应同步匹配版本的 `llama-server`、`libllama`、`libggml` 和
-`libggml-cpu`，不能只替换一个 ABI 不匹配的共享库。
+## 板端部署
+
+benchmark 不会上传完整 llama.cpp、模型或 patched runtime；运行测试前应先把本节
+产物部署到板端。不要只替换 `libggml-cpu`：`llama-server`、`libllama`、GGML 和
+server 公共库必须来自同一次构建，否则可能出现 SONAME、符号或 C++ ABI 不匹配。
+单模型 benchmark 的 lease 准备流程可以临时替换已经匹配的 `libggml-cpu`，但该
+机制只用于同版本实验切换，不能代替首次完整 runtime 部署。
+
+当前构建至少需要同步以下文件，并保留 `.so`、SONAME 和完整版本之间的软链接：
+
+```text
+llama-server
+libllama.so*
+libllama-common.so*
+libllama-server-impl.so*
+libggml.so*
+libggml-base.so*
+libggml-cpu.so*
+libmtmd.so*
+```
+
+模型文件不受本 patch 改动，可以继续复用板端已有 GGUF。推荐把 patched runtime
+放入独立版本目录，不覆盖默认 `bin/`，以便 CFS/调度实验使用完全相同的二进制，
+也便于快速回退：
+
+```text
+<LLAMA_REMOTE>/
+├── bin/                         # 板端原有 runtime 和动态加载器
+├── bin-phase-aware/             # 本次 patched runtime
+│   ├── llama-server
+│   ├── libllama.so*
+│   ├── libllama-common.so*
+│   ├── libllama-server-impl.so*
+│   ├── libggml.so*
+│   ├── libggml-base.so*
+│   ├── libggml-cpu.so*
+│   └── libmtmd.so*
+└── models/
+    └── <model>.gguf
+```
+
+以下示例从构建目录创建归档。使用 `tar` 而不是逐个 `scp`，可以保留共享库软链接：
+
+```bash
+export BOARD="<user>@<board-host>"
+export LLAMA_REMOTE="<board-llama-directory>"
+export REMOTE_RUNTIME="$LLAMA_REMOTE/bin-phase-aware"
+export RUNTIME_ARCHIVE="$(pwd)/llama-riscv-hint-runtime.tar.gz"
+
+(
+    cd "$BUILD_DIR/bin"
+    tar -czf "$RUNTIME_ARCHIVE" \
+        llama-server \
+        libllama.so* libllama-common.so* libllama-server-impl.so* \
+        libggml.so* libggml-base.so* libggml-cpu.so* libmtmd.so*
+)
+
+ssh "$BOARD" "mkdir -p '$REMOTE_RUNTIME'"
+scp "$RUNTIME_ARCHIVE" "$BOARD:/tmp/llama-riscv-hint-runtime.tar.gz"
+ssh "$BOARD" \
+    "tar -xzf /tmp/llama-riscv-hint-runtime.tar.gz -C '$REMOTE_RUNTIME' && \
+     rm -f /tmp/llama-riscv-hint-runtime.tar.gz"
+```
+
+动态加载器不由 llama.cpp 构建产生。应使用与交叉编译 sysroot ABI 匹配的板端加载
+器；本项目的 benchmark 默认从 `<LLAMA_REMOTE>/bin/` 使用它，并把 patched runtime
+放在共享库搜索路径首位：
+
+```bash
+export REMOTE_LOADER="$LLAMA_REMOTE/bin/ld-linux-riscv64-lp64d.so.1"
+export MODEL_PATH="$LLAMA_REMOTE/models/<model>.gguf"
+
+ssh "$BOARD" \
+    "test -x '$REMOTE_LOADER' && test -x '$REMOTE_RUNTIME/llama-server' && \
+     test -r '$MODEL_PATH'"
+
+ssh "$BOARD" \
+    "'$REMOTE_LOADER' --library-path '$REMOTE_RUNTIME:$LLAMA_REMOTE/bin' \
+     '$REMOTE_RUNTIME/llama-server' --version"
+```
+
+如板端基础系统已经提供兼容加载器，也可以把 `REMOTE_LOADER` 指向系统路径；不要
+混用不同 libc ABI。可用 `readelf -d` 检查 `NEEDED` 项，并确认每个依赖都能从
+`REMOTE_RUNTIME`、板端默认 runtime 或基础系统解析：
+
+```bash
+"${CROSS_COMPILE}readelf" -d "$BUILD_DIR/bin/llama-server" | grep NEEDED
+ssh "$BOARD" "find '$REMOTE_RUNTIME' -maxdepth 1 -type l -o -type f"
+```
+
+部署后可先在不加载 sched_ext 的情况下验证同一构建产物：
+
+```bash
+export SERVER_PORT="<unused-port>"
+
+ssh "$BOARD" \
+    "unset GGML_SCX_LEASE_HINT_PATH GGML_SCX_GANG_HINT_PATH; \
+     nohup '$REMOTE_LOADER' --library-path '$REMOTE_RUNTIME:$LLAMA_REMOTE/bin' \
+       '$REMOTE_RUNTIME/llama-server' -m '$MODEL_PATH' --host 0.0.0.0 \
+       --port '$SERVER_PORT' -ngl 0 -t 8 -tb 8 -np 4 --cache-ram 0 \
+       >/tmp/llama-server-phase-aware.log 2>&1 </dev/null &"
+
+curl --fail "http://<board-host>:$SERVER_PORT/health"
+```
+
+双模型 harness 通过 `--runtime-bin-dir` 选择该目录，不会再次上传 runtime：
+
+```bash
+cd "$PATCH_DIR/../benchmark/dual_model"
+./run.sh \
+    --llm-path "$LLAMA_REMOTE" \
+    --runtime-bin-dir "$REMOTE_RUNTIME" \
+    --model-a "$MODEL_PATH" --model-b "$MODEL_PATH" \
+    --port-a "<model-a-port>" --port-b "<model-b-port>" \
+    --strategy cfs-shared --concurrency 4 --loops 1
+```
+
+正式启用 dirty lease 后，再检查 server 日志中的
+`GGML_SCX_LEASE_HINT connected`，并使用 `rvv_lease_ctl status` 验证两个 team 的
+worker 和 phase。若部署验证失败，停止测试 server，并把 `--runtime-bin-dir` 切回
+原 runtime；独立目录部署不需要覆盖或恢复默认库。
 
 ## Dirty Lease 接口
 
