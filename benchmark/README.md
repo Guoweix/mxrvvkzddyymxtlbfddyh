@@ -99,7 +99,6 @@ REMOTE_PORT="<llama-server-port>"
 LLM_PATH="<board-llama-directory>"
 LLM_THREADS=8
 LLM_THREADS_BATCH=       # 留空时跟随 LLM_THREADS
-LLM_PARALLEL=4
 LLM_CONTEXT=4096
 ```
 

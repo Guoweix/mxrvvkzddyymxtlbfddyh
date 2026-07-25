@@ -16,4 +16,5 @@ benchmark/logs
 benchmark/__pycache__
 benchmark/dual_model/__pycache__
 benchmark/dual_model/results
+benchmark/dual_model/*.log
 scx_llm_pin/rvv_lease_ctl

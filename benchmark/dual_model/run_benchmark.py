@@ -178,6 +178,9 @@ class SuiteRunner:
         self.restore_default_server = False
         self.server_pids = {}
         self.sampler_pid = None
+        self.perf_pid = None
+        self.perf_record_pid = None
+        self.perf_record_run_tag = None
         self.scheduler_pid = None
         self.trace_pids = {}
         self.scheduler_validation_profile = detect_profile(
@@ -188,6 +191,18 @@ class SuiteRunner:
         self.remote.run(f"mkdir -p {shlex.quote(self.remote_dir)}")
         self.remote.upload(SCRIPT_DIR / "remote_sampler.py", f"{self.remote_dir}/remote_sampler.py")
         self.remote.run(f"chmod +x {self.remote_dir}/remote_sampler.py")
+        if self.args.perf_stat:
+            probe = self.remote.run(
+                "command -v perf >/dev/null 2>&1 && "
+                "perf stat -a -e cycles,instructions -- sleep 0.1 >/dev/null 2>&1",
+                check=False,
+            )
+            if probe.returncode:
+                raise RuntimeError("--perf-stat requested but board perf/PMU probe failed")
+        if self.args.perf_record:
+            probe = self.remote.run("command -v perf >/dev/null 2>&1", check=False)
+            if probe.returncode:
+                raise RuntimeError("--perf-record requested but board perf is unavailable")
         if self.args.metrics in {"rvv", "rvv-barrier"}:
             rvv_bin = Path(self.args.rvv_bin)
             rvv_libelf = Path(self.args.rvv_libelf)
@@ -325,6 +340,33 @@ class SuiteRunner:
                 future.result()
         time.sleep(self.args.quiet_sec)
 
+    def pin_workers_shared(self, run_dir):
+        if not self.args.pin_workers_shared:
+            return
+        code = (
+            "import json, os\n"
+            f"pids={json.dumps(self.server_pids)}\n"
+            "result={}\n"
+            "for model,pid in pids.items():\n"
+            " rows=[]\n"
+            " for name in os.listdir(f'/proc/{pid}/task'):\n"
+            "  if not name.isdigit(): continue\n"
+            "  try:\n"
+            "   runtime=int(open(f'/proc/{pid}/task/{name}/schedstat').read().split()[0])\n"
+            "  except (OSError, ValueError, IndexError):\n"
+            "   continue\n"
+            "  rows.append((runtime,int(name)))\n"
+            " selected=sorted(rows,reverse=True)[:8]\n"
+            " if len(selected)!=8: raise RuntimeError(f'{model}: expected 8 workers')\n"
+            " result[model]=[]\n"
+            " for cpu,(runtime,tid) in enumerate(selected):\n"
+            "  os.sched_setaffinity(tid,{cpu})\n"
+            "  result[model].append({'tid':tid,'cpu':cpu,'runtime_ns':runtime,'affinity':sorted(os.sched_getaffinity(tid))})\n"
+            "print(json.dumps(result,indent=2))\n"
+        )
+        result = self.remote.run(f"python3 -c {shlex.quote(code)}")
+        (run_dir / "affinity.json").write_text(result.stdout)
+
     def start_sampler(self, run_tag):
         output = f"{self.remote_dir}/{run_tag}_sampler.jsonl"
         command = (
@@ -339,6 +381,110 @@ class SuiteRunner:
     def stop_sampler(self):
         stop_pid(self.remote, self.sampler_pid, grace=3)
         self.sampler_pid = None
+
+    def start_perf_stat(self, run_tag):
+        if not self.args.perf_stat:
+            return
+        output = f"{self.remote_dir}/{run_tag}_perf_stat.csv"
+        events = "task-clock,cycles,instructions,context-switches,cpu-migrations"
+        duration = int(self.args.request_timeout + self.args.milestone_timeout + 60)
+        perf_command = (
+            f"exec perf stat -a -x, --no-big-num -e {events} "
+            f"-o {shlex.quote(output)} -- sleep {duration}"
+        )
+        self.perf_pid = start_background(
+            self.remote,
+            f"sh -c {shlex.quote(perf_command)}",
+            f"{self.remote_dir}/{run_tag}_perf_stat.log",
+        )
+
+    def stop_perf_stat(self):
+        if self.perf_pid:
+            pid = int(self.perf_pid)
+            self.remote.run(
+                f"children=$(cat /proc/{pid}/task/{pid}/children 2>/dev/null || true); "
+                "if [ -n \"$children\" ]; then kill -TERM $children 2>/dev/null || true; fi",
+                check=False,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if self.remote.run(
+                    f"kill -0 {pid} 2>/dev/null", check=False
+                ).returncode:
+                    break
+                time.sleep(0.25)
+            else:
+                stop_pid(self.remote, pid, grace=2)
+        self.perf_pid = None
+
+    def start_perf_record(self, run_dir, run_tag):
+        if not self.args.perf_record:
+            return
+        tids = {}
+        for model, pid in self.server_pids.items():
+            result = self.remote.run(f"ls /proc/{int(pid)}/task")
+            tids[model] = sorted(
+                int(line) for line in result.stdout.splitlines() if line.strip().isdigit()
+            )
+            if not tids[model]:
+                raise RuntimeError(f"perf record found no TIDs for model {model}")
+
+        metadata = {
+            "event": "cpu-clock:u",
+            "frequency_hz": self.args.perf_record_frequency,
+            "models": {
+                model: {"pid": self.server_pids[model], "tids": tids[model]}
+                for model in ("A", "B")
+            },
+        }
+        (run_dir / "perf_record_tids.json").write_text(
+            json.dumps(metadata, indent=2) + "\n"
+        )
+
+        output = f"{self.remote_dir}/{run_tag}_perf_record.data"
+        all_tids = ",".join(str(tid) for model in ("A", "B") for tid in tids[model])
+        duration = int(self.args.request_timeout + self.args.milestone_timeout + 60)
+        perf_command = (
+            "exec perf record -q -e cpu-clock:u "
+            f"-F {self.args.perf_record_frequency} -t {shlex.quote(all_tids)} "
+            f"-o {shlex.quote(output)} -- sleep {duration}"
+        )
+        self.perf_record_pid = start_background(
+            self.remote,
+            f"sh -c {shlex.quote(perf_command)}",
+            f"{self.remote_dir}/{run_tag}_perf_record.log",
+        )
+        self.perf_record_run_tag = run_tag
+
+    def stop_perf_record(self):
+        if not self.perf_record_pid:
+            return
+        pid = int(self.perf_record_pid)
+        run_tag = self.perf_record_run_tag
+        self.remote.run(
+            f"children=$(cat /proc/{pid}/task/{pid}/children 2>/dev/null || true); "
+            "if [ -n \"$children\" ]; then kill -TERM $children 2>/dev/null || true; fi",
+            check=False,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.remote.run(f"kill -0 {pid} 2>/dev/null", check=False).returncode:
+                break
+            time.sleep(0.25)
+        else:
+            stop_pid(self.remote, pid, grace=2)
+
+        data = f"{self.remote_dir}/{run_tag}_perf_record.data"
+        report = f"{self.remote_dir}/{run_tag}_perf_record_report.txt"
+        report_log = f"{self.remote_dir}/{run_tag}_perf_record_report.log"
+        report_command = (
+            f"perf report -i {shlex.quote(data)} --stdio --no-children "
+            "--sort dso,symbol --percent-limit 0 --show-nr-samples "
+            f"> {shlex.quote(report)} 2> {shlex.quote(report_log)}"
+        )
+        self.remote.run(report_command, check=False, timeout=120)
+        self.perf_record_pid = None
+        self.perf_record_run_tag = None
 
     def start_traces(self, run_tag):
         if self.args.metrics not in {"rvv", "rvv-barrier"}:
@@ -395,6 +541,12 @@ class SuiteRunner:
             f"{run_tag}_server_b.log": "server_b.log",
             f"{run_tag}_sampler.jsonl": "sampler.jsonl",
             f"{run_tag}_sampler.log": "sampler.log",
+            f"{run_tag}_perf_stat.csv": "perf_stat.csv",
+            f"{run_tag}_perf_stat.log": "perf_stat.log",
+            f"{run_tag}_perf_record.data": "perf_record.data",
+            f"{run_tag}_perf_record.log": "perf_record.log",
+            f"{run_tag}_perf_record_report.txt": "perf_record_report.txt",
+            f"{run_tag}_perf_record_report.log": "perf_record_report.log",
             f"{run_tag}_scheduler.log": "scheduler.log",
             f"{run_tag}_rvv_a.json": "rvv_a.json",
             f"{run_tag}_rvv_b.json": "rvv_b.json",
@@ -590,9 +742,12 @@ class SuiteRunner:
                 self.start_server(model, run_tag)
             run_pids = dict(self.server_pids)
             self.warmup()
+            self.pin_workers_shared(run_dir)
             self.start_external_scheduler(run_tag)
             self.start_sampler(run_tag)
             self.start_traces(run_tag)
+            self.start_perf_stat(run_tag)
+            self.start_perf_record(run_dir, run_tag)
             return_code = self.run_workload(run_dir, direction)
             if self.args.strategy == "external" and self.scheduler_pid:
                 scheduler_alive = (
@@ -605,6 +760,8 @@ class SuiteRunner:
             (run_dir / "harness_error.txt").write_text(f"{type(exc).__name__}: {exc}\n")
             print(f"[ERROR] {run_tag}: {exc}")
         finally:
+            self.stop_perf_stat()
+            self.stop_perf_record()
             self.stop_traces()
             self.stop_sampler()
             self.stop_external_scheduler()
@@ -665,6 +822,8 @@ class SuiteRunner:
                 if failed:
                     break
         finally:
+            self.stop_perf_record()
+            self.stop_perf_stat()
             self.stop_traces()
             self.stop_sampler()
             self.stop_external_scheduler()
@@ -701,6 +860,27 @@ def parse_args():
     parser.add_argument("--max-start-skew-ms", type=float, default=25.0)
     parser.add_argument(
         "--metrics", choices=("standard", "rvv", "rvv-barrier"), default="standard"
+    )
+    parser.add_argument(
+        "--perf-stat",
+        action="store_true",
+        help="collect system-wide perf counters only during the measured workload",
+    )
+    parser.add_argument(
+        "--perf-record",
+        action="store_true",
+        help="sample user-space on-CPU symbols for both servers during the workload",
+    )
+    parser.add_argument(
+        "--perf-record-frequency",
+        type=int,
+        default=99,
+        help="cpu-clock:u sampling frequency for --perf-record (default: 99 Hz)",
+    )
+    parser.add_argument(
+        "--pin-workers-shared",
+        action="store_true",
+        help="pin each server's eight hottest workers one-per-CPU while retaining CFS",
     )
     parser.add_argument("--host", default=os.environ.get("REMOTE_IP", "192.168.3.67"))
     parser.add_argument("--user", default=os.environ.get("REMOTE_USER", "root"))
@@ -758,6 +938,10 @@ def parse_args():
         args.lead_sec = 2.0 if args.scenario == "symmetric" else 1.0
     if args.strategy == "external" and not args.external_start_cmd:
         parser.error("--strategy external requires --external-start-cmd")
+    if args.pin_workers_shared and args.strategy != "cfs-shared":
+        parser.error("--pin-workers-shared requires --strategy cfs-shared")
+    if args.perf_record_frequency < 1 or args.perf_record_frequency > 1000:
+        parser.error("--perf-record-frequency must be between 1 and 1000 Hz")
     if (
         args.scenario == "asynchronous"
         and (args.injection_token <= 0 or args.injection_token >= args.output_tokens)

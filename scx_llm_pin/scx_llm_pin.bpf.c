@@ -1077,11 +1077,13 @@ static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
 		return select_cpu_from_mask(allowed_mask, prev_cpu);
 
 	if (cfg->user_control_mode == RVV_LEASE_CONTROL_ACTIVE &&
-	    cfg->user_cpu_map_enabled && state->user_ith_plus1 &&
+	    cfg->user_cpu_map_enabled &&
 	    state->user_session_id == cfg->user_session_id) {
-		__u32 ith = state->user_ith_plus1 - 1;
+		__u32 user_ith_plus1 = state->user_ith_plus1;
 
-		if (ith < RVV_LEASE_CONTROL_WORKERS) {
+		if (user_ith_plus1 >= 1 &&
+		    user_ith_plus1 <= RVV_LEASE_CONTROL_WORKERS) {
+			__u32 ith = user_ith_plus1 - 1;
 			s32 user_cpu = (s32)cfg->user_cpu_map[ith];
 
 			if (cpu_in_mask(user_cpu, allowed_mask)) {

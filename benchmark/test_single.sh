@@ -13,7 +13,6 @@ echo ""
 echo "配置："
 echo "  IP: $REMOTE_IP"
 echo "  线程: $LLM_THREADS"
-echo "  并行槽位: $LLM_PARALLEL"
 echo "  测试次数: 10次"
 echo ""
 

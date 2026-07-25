@@ -22,7 +22,7 @@ VMLINUX_BTF ?= vmlinux.btf
 VMLINUX_H ?= vmlinux.h
 LIBBPF_A ?= $(STAGING_DIR)/usr/lib/libbpf.a
 
-BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_riscv
+BPF_CFLAGS := -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_riscv
 BPF_CFLAGS += -I. -I$(KERNEL_SRC)/tools/lib -I$(BUILDROOT_OUT)/host/include
 USER_CFLAGS := -g -O2 -Wall -Wextra -I. -I$(STAGING_DIR)/usr/include -I$(BUILDROOT_OUT)/host/include
 USER_LDFLAGS := -static-libgcc -Wl,-Bstatic -L$(STAGING_DIR)/usr/lib
