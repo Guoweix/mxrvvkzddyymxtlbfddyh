@@ -122,15 +122,11 @@ static int parse_u32_range(const char *value, __u32 min, __u32 max,
 
 static int parse_preferred_team(const char *value, __u32 *team_plus1)
 {
-	if (!strcmp(value, "off"))
-		*team_plus1 = 0;
-	else if (!strcmp(value, "0"))
-		*team_plus1 = 1;
-	else if (!strcmp(value, "1"))
-		*team_plus1 = 2;
-	else
-		return -EINVAL;
-	return 0;
+    if (!strcmp(value, "off")) { *team_plus1 = 0; return 0; }
+    __u32 team;
+    if (parse_u32_range(value, 0, RVV_LEASE_CONTROL_TEAMS - 1, &team)) return -EINVAL;
+    *team_plus1 = team + 1;
+    return 0;
 }
 
 static __u64 monotonic_ns(void)
@@ -143,10 +139,10 @@ static __u64 monotonic_ns(void)
 }
 
 static int parse_cpu_map(const char *value,
-			 __u32 cpus[RVV_LEASE_CONTROL_WORKERS],
+			 __u32 cpus[RVV_LEASE_MAX_CPUS],
 			 __u32 *enabled)
 {
-	bool seen[RVV_LEASE_CONTROL_WORKERS] = {};
+	bool seen[RVV_LEASE_MAX_CPUS] = {};
 	char *saveptr = NULL;
 	char *token;
 	char *copy;
@@ -163,8 +159,8 @@ static int parse_cpu_map(const char *value,
 	     token = strtok_r(NULL, ",", &saveptr)) {
 		__u32 cpu;
 
-		if (count >= RVV_LEASE_CONTROL_WORKERS ||
-		    parse_u32_range(token, 0, RVV_LEASE_CONTROL_WORKERS - 1, &cpu) ||
+		if (count >= RVV_LEASE_MAX_CPUS ||
+		    parse_u32_range(token, 0, RVV_LEASE_MAX_CPUS - 1, &cpu) ||
 		    seen[cpu]) {
 			free(copy);
 			return -EINVAL;
@@ -173,7 +169,7 @@ static int parse_cpu_map(const char *value,
 		cpus[count++] = cpu;
 	}
 	free(copy);
-	if (count != RVV_LEASE_CONTROL_WORKERS)
+	if (count != RVV_LEASE_MAX_CPUS)
 		return -EINVAL;
 	*enabled = 1;
 	return 0;
@@ -187,7 +183,7 @@ static void usage(const char *prog)
 		"  %s set [--control-dir PATH] [--mode observe|active]\n"
 		"       [--slice-ms 1..2000] [--window-ms 1..5000]\n"
 		"       [--dirty-threshold 1..64] [--cpu-map auto|0,1,2,3,4,5,6,7]\n"
-		"       [--prefer-team off|0|1 [--prefer-ms 1..300000]]\n"
+		"       [--prefer-team off|0..7 [--prefer-ms 1..300000]]\n"
 		"  %s reset [--control-dir PATH]\n",
 		prog, prog, prog);
 }
@@ -198,6 +194,12 @@ static void print_status(const struct llm_pin_config *config,
 	__u64 now = monotonic_ns();
 
 	printf("mode=%s\n", mode_name(config->user_control_mode));
+	printf("team_count=%u\n", config->team_count);
+    for (unsigned t = 0; t < config->team_count && t < RVV_LEASE_CONTROL_TEAMS; t++) {
+        printf("team[%u]_tgid=%u threads=%u threads_batch=%u cpu_mask=0x%x\n",
+            t, config->teams[t].tgid, config->teams[t].threads,
+            config->teams[t].threads_batch, config->teams[t].cpu_mask);
+    }
 	printf("target_tgid=%u\n", config->target_tgid);
 	printf("target_tgid2=%u\n", config->target_tgid2);
 	printf("session=%llu\n", (unsigned long long)config->user_session_id);
@@ -241,6 +243,9 @@ static void print_status(const struct llm_pin_config *config,
 		printf("worker_page[%u]_active=%u\n", team, page->header.active);
 		if (!page->header.active)
 			continue;
+        printf("membership[%u]=epoch:%llu,registered_mask:0x%x,limit:%u\n", team,
+            (unsigned long long)page->team_hint.membership_epoch,
+            page->header.registered_mask, page->header.worker_limit);
 		printf("team_phase[%u]=phase:%s,workers:%u,prompt:%u,decode:%u,epoch:%llu,begin_ns:%llu,expires_ns:%llu,session:%llu,sequence:%u\n",
 		       team, phase_name(page->team_hint.phase),
 		       page->team_hint.active_workers, page->team_hint.prompt_tokens,
@@ -255,9 +260,11 @@ static void print_status(const struct llm_pin_config *config,
 
 			if (!slot->sequence || !slot->tid || (slot->sequence & 1U))
 				continue;
-			printf("worker[%u][%u]=tid:%u,tgid:%u,n_threads:%u,session:%llu\n",
+			printf("worker[%u][%u]=tid:%u,tgid:%u,n_threads:%u,session:%llu,membership:%llu,current:%u\n",
 			       team, ith, slot->tid, slot->tgid, slot->n_threads,
-			       (unsigned long long)slot->session_id);
+			       (unsigned long long)slot->session_id,
+                   (unsigned long long)slot->membership_epoch,
+                   slot->membership_epoch == page->team_hint.membership_epoch);
 		}
 	}
 }
@@ -335,7 +342,7 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "--prefer-team") && i + 1 < argc) {
 			if (parse_preferred_team(argv[++i],
 						 &requested.user_preferred_team_plus1)) {
-				fprintf(stderr, "prefer-team must be off, 0, or 1\n");
+				fprintf(stderr, "prefer-team must be off or 0..7\n");
 				return 1;
 			}
 			set_prefer_team = true;
@@ -358,7 +365,7 @@ int main(int argc, char **argv)
 	}
 	if (set_prefer_team && requested.user_preferred_team_plus1 &&
 	    !set_prefer_ms) {
-		fprintf(stderr, "--prefer-team 0|1 requires --prefer-ms\n");
+		fprintf(stderr, "--prefer-team 0..7 requires --prefer-ms\n");
 		return 1;
 	}
 
@@ -381,7 +388,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	for (key = 0; key < RVV_LEASE_CONTROL_TEAMS; key++) {
-		__u32 target_tgid = key == 0 ? config.target_tgid : config.target_tgid2;
+		__u32 target_tgid = key < config.team_count ? config.teams[key].tgid : 0;
 
 		if (map_lookup(worker_fd, &key, &pages[key])) {
 			fprintf(stderr, "failed to read worker map team %u: %s\n",
@@ -448,6 +455,19 @@ int main(int argc, char **argv)
 				requested.user_preferred_team_plus1 ?
 				monotonic_ns() + (__u64)prefer_ms * NSEC_PER_MSEC : 0;
 		}
+        if (config.user_preferred_team_plus1 > config.team_count) {
+            fprintf(stderr, "preferred team is not configured\n"); return 1;
+        }
+        if (config.user_cpu_map_enabled) {
+            for (unsigned t = 0; t < config.team_count && t < RVV_LEASE_CONTROL_TEAMS; t++) {
+                unsigned n = config.teams[t].threads > config.teams[t].threads_batch ?
+                    config.teams[t].threads : config.teams[t].threads_batch;
+                for (unsigned i = 0; i < n && i < RVV_LEASE_MAX_ACTIVE_WORKERS; i++)
+                    if (!(config.teams[t].cpu_mask & (1U << config.user_cpu_map[i]))) {
+                        fprintf(stderr, "CPU map exceeds team CPU mask\n"); return 1;
+                    }
+            }
+        }
 		config.user_policy_epoch++;
 		if (map_update(config_fd, &key, &config)) {
 			fprintf(stderr, "failed to update config: %s\n", strerror(errno));

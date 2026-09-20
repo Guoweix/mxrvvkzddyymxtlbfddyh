@@ -5,6 +5,8 @@
  * 用法:
  *   scx_llm_pin --tgid <pid> --strategy rvv_dirty [--duration 60]
  */
+#define _GNU_SOURCE
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +22,12 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "scx_llm_pin.h"
+#include "team_config.h"
+#ifdef SCX_LLM_SKEL_HEADER
+#include SCX_LLM_SKEL_HEADER
+#else
 #include "scx_llm_pin.skel.h"
+#endif
 
 #define NSEC_PER_MSEC 1000000ULL
 #define NSEC_PER_USEC 1000ULL
@@ -105,6 +112,8 @@ static const char *team_gang_mode_name(__u32 mode)
 		return "always";
 	case LLM_TEAM_GANG_PREFILL_LEASE:
 		return "prefill-lease";
+	case LLM_TEAM_GANG_PAIR:
+		return "pair-gang";
 	default:
 		return "unknown";
 	}
@@ -120,10 +129,79 @@ static int parse_team_gang_mode(const char *str, __u32 *mode)
 		*mode = LLM_TEAM_GANG_ALWAYS;
 	else if (!strcmp(str, "prefill-lease"))
 		*mode = LLM_TEAM_GANG_PREFILL_LEASE;
+	else if (!strcmp(str, "pair-gang"))
+		*mode = LLM_TEAM_GANG_PAIR;
 	else
 		return -EINVAL;
 	return 0;
 }
+
+static const char *x86_smt_mode_name(__u32 mode)
+{
+	switch (mode) {
+	case LLM_X86_SMT_OFF:
+		return "off";
+	case LLM_X86_SMT_ADAPTIVE:
+		return "adaptive";
+	default:
+		return "unknown";
+	}
+}
+
+static int parse_x86_smt_mode(const char *str, __u32 *mode)
+{
+	if (!strcmp(str, "off"))
+		*mode = LLM_X86_SMT_OFF;
+	else if (!strcmp(str, "adaptive"))
+		*mode = LLM_X86_SMT_ADAPTIVE;
+	else
+		return -EINVAL;
+	return 0;
+}
+
+#ifdef SCX_ARCH_X86
+static int read_cpu_topology_value(unsigned cpu, const char *name, int *value)
+{
+	char path[PATH_MAX];
+	FILE *file;
+	int err;
+
+	err = snprintf(path, sizeof(path),
+		       "/sys/devices/system/cpu/cpu%u/topology/%s", cpu, name);
+	if (err < 0 || (size_t)err >= sizeof(path))
+		return -ENAMETOOLONG;
+	file = fopen(path, "r");
+	if (!file)
+		return -errno;
+	err = fscanf(file, "%d", value) == 1 ? 0 : -EINVAL;
+	fclose(file);
+	return err;
+}
+
+static int validate_x86_4c8t_topology(void)
+{
+	struct {
+		int package;
+		int core;
+	} cpu[8];
+
+	for (unsigned i = 0; i < 8; i++) {
+		if (read_cpu_topology_value(i, "physical_package_id", &cpu[i].package) ||
+		    read_cpu_topology_value(i, "core_id", &cpu[i].core))
+			return -EINVAL;
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		if (cpu[i].package != cpu[i + 4].package ||
+		    cpu[i].core != cpu[i + 4].core)
+			return -EINVAL;
+		for (unsigned j = i + 1; j < 4; j++)
+			if (cpu[i].package == cpu[j].package &&
+			    cpu[i].core == cpu[j].core)
+				return -EINVAL;
+	}
+	return 0;
+}
+#endif
 
 static int parse_vector_local_wakeup_mode(const char *str, __u32 *mode)
 {
@@ -201,14 +279,14 @@ static __u64 new_control_session_id(void)
 
 static __u32 config_team_tgid(const struct llm_pin_config *config, __u32 team)
 {
-	return team == 0 ? config->target_tgid : config->target_tgid2;
+	return team < config->team_count ? config->teams[team].tgid : 0;
 }
 
 static int parse_cpu_order(const char *str,
-			   __u32 cpus[RVV_LEASE_CONTROL_WORKERS],
+			   __u32 cpus[RVV_LEASE_MAX_CPUS],
 			   __u32 *enabled)
 {
-	bool seen[RVV_LEASE_CONTROL_WORKERS] = {};
+	bool seen[RVV_LEASE_MAX_CPUS] = {};
 	char *saveptr = NULL;
 	char *token;
 	char *tmp;
@@ -227,14 +305,14 @@ static int parse_cpu_order(const char *str,
 		char *end = NULL;
 		long cpu;
 
-		if (count >= RVV_LEASE_CONTROL_WORKERS) {
+		if (count >= RVV_LEASE_MAX_CPUS) {
 			free(tmp);
 			return -EINVAL;
 		}
 		errno = 0;
 		cpu = strtol(token, &end, 10);
 		if (errno || !end || *end != '\0' || cpu < 0 ||
-		    cpu >= RVV_LEASE_CONTROL_WORKERS || seen[cpu]) {
+		    cpu >= RVV_LEASE_MAX_CPUS || seen[cpu]) {
 			free(tmp);
 			return -EINVAL;
 		}
@@ -242,7 +320,7 @@ static int parse_cpu_order(const char *str,
 		cpus[count++] = (__u32)cpu;
 	}
 	free(tmp);
-	if (count != RVV_LEASE_CONTROL_WORKERS)
+	if (count != RVV_LEASE_MAX_CPUS)
 		return -EINVAL;
 	*enabled = 1;
 	return 0;
@@ -279,6 +357,8 @@ static int initialize_and_pin_control_maps(
 			page.header.active = 1;
 			page.header.target_tgid = target_tgid;
 			page.header.max_workers = RVV_LEASE_CONTROL_WORKERS;
+            page.header.worker_limit = config->teams[key].threads > config->teams[key].threads_batch ?
+                config->teams[key].threads : config->teams[key].threads_batch;
 			page.header.loader_pid = (__u32)getpid();
 			page.header.team_id = key;
 			page.header.hint_flags = RVV_LEASE_MODEL_ACTIVE;
@@ -343,8 +423,9 @@ static void print_worker_page(struct scx_llm_pin_bpf *skel)
 		       (unsigned long long)page.header.session_id,
 		       (unsigned long long)page.header.policy_epoch,
 		       page.header.abi_version);
-		printf("team_hint team=%u phase=%s phase_epoch=%llu workers=%u prompt=%u decode=%u begin_ns=%llu expires_ns=%llu seq=%u\n",
+		printf("team_hint team=%u phase=%s membership_epoch=%llu phase_epoch=%llu workers=%u prompt=%u decode=%u begin_ns=%llu expires_ns=%llu seq=%u\n",
 		       key, phase_name(page.team_hint.phase),
+		       (unsigned long long)page.team_hint.membership_epoch,
 		       (unsigned long long)page.team_hint.phase_epoch,
 		       page.team_hint.active_workers, page.team_hint.prompt_tokens,
 		       page.team_hint.decode_tokens,
@@ -356,8 +437,9 @@ static void print_worker_page(struct scx_llm_pin_bpf *skel)
 
 			if (!slot->sequence || !slot->tid)
 				continue;
-			printf("lease_worker team=%u ith=%u tid=%u tgid=%u n_threads=%u session=%llu seq=%u\n",
+			printf("lease_worker team=%u ith=%u tid=%u tgid=%u n_threads=%u membership_epoch=%llu session=%llu seq=%u\n",
 			       key, slot->ith, slot->tid, slot->tgid, slot->n_threads,
+			       (unsigned long long)slot->membership_epoch,
 			       (unsigned long long)slot->session_id, slot->sequence);
 		}
 	}
@@ -497,7 +579,30 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	printf("Phase lease wakeup candidates/preempts:  %llu/%llu\n",
 	       stats.phase_lease_wakeup_candidates,
 	       stats.phase_lease_wakeup_preempts);
-	printf("SCX_GANG_STATS rvv_team0=%llu rvv_team1=%llu hint_valid_workers=%llu hint_active_workers=%llu hint_fallbacks=%llu hint_deferred=%llu hint_excluded=%llu hint_demotions=%llu phase_reads=%llu phase_valid=%llu phase_invalid=%llu phase_idle=%llu phase_prefill=%llu phase_decode=%llu phase_mixed=%llu gang_engagements=%llu gang_quanta=%llu gang_switches=%llu gang_kicks=%llu gang_enqueues=%llu gang_selected=%llu gang_empty=%llu gang_fallback=%llu gang_runs=%llu gang_active_runs=%llu gang_wrong_runs=%llu phase_lease_engagements=%llu phase_lease_preferred=%llu phase_lease_empty=%llu phase_lease_fallback=%llu phase_lease_safety_forced=%llu phase_lease_safety_misses=%llu phase_lease_pending_stale=%llu phase_lease_pending_max_ns=%llu phase_lease_pending_ge_4s=%llu phase_lease_runs=%llu phase_lease_preferred_runs=%llu phase_lease_other_runs=%llu phase_lease_wakeup_candidates=%llu phase_lease_wakeup_preempts=%llu vector_local_dispatches=%llu vector_window_starts=%llu exclusive_handoffs=%llu exclusive_denials=%llu dsq_dispatches=%llu dsq_consumes=%llu dsq_dispatches_team0=%llu dsq_dispatches_team1=%llu dsq_consumes_team0=%llu dsq_consumes_team1=%llu\n",
+	printf("x86 SMT primary/sibling selections: %llu/%llu\n",
+	       stats.x86_smt_primary_selections,
+	       stats.x86_smt_sibling_selections);
+	printf("x86 SMT latency-primary/decode-shared: %llu/%llu\n",
+	       stats.x86_smt_latency_primary,
+	       stats.x86_smt_decode_shared);
+	printf("x86 pair gang engage/quanta/switches: %llu/%llu/%llu\n",
+	       stats.x86_pair_gang_engagements,
+	       stats.x86_pair_gang_quanta,
+	       stats.x86_pair_gang_switches);
+	printf("x86 pair gang primary/sibling/empty/wrong: %llu/%llu/%llu/%llu\n",
+	       stats.x86_pair_gang_primary_consumes,
+	       stats.x86_pair_gang_sibling_consumes,
+	       stats.x86_pair_gang_empty_consumes,
+	       stats.x86_pair_gang_wrong_runs);
+	printf("SCX_PAIR_STATS engagements=%llu quanta=%llu switches=%llu primary=%llu sibling=%llu empty=%llu wrong_runs=%llu\n",
+	       stats.x86_pair_gang_engagements,
+	       stats.x86_pair_gang_quanta,
+	       stats.x86_pair_gang_switches,
+	       stats.x86_pair_gang_primary_consumes,
+	       stats.x86_pair_gang_sibling_consumes,
+	       stats.x86_pair_gang_empty_consumes,
+	       stats.x86_pair_gang_wrong_runs);
+	printf("SCX_GANG_STATS rvv_team0=%llu rvv_team1=%llu hint_valid_workers=%llu hint_active_workers=%llu hint_fallbacks=%llu hint_deferred=%llu hint_excluded=%llu hint_demotions=%llu phase_reads=%llu phase_valid=%llu phase_invalid=%llu phase_idle=%llu phase_prefill=%llu phase_decode=%llu phase_mixed=%llu gang_engagements=%llu gang_quanta=%llu gang_switches=%llu gang_kicks=%llu gang_enqueues=%llu gang_selected=%llu gang_empty=%llu gang_fallback=%llu gang_runs=%llu gang_active_runs=%llu gang_wrong_runs=%llu phase_lease_engagements=%llu phase_lease_preferred=%llu phase_lease_empty=%llu phase_lease_fallback=%llu phase_lease_safety_forced=%llu phase_lease_safety_misses=%llu phase_lease_pending_stale=%llu phase_lease_pending_max_ns=%llu phase_lease_pending_ge_4s=%llu phase_lease_runs=%llu phase_lease_preferred_runs=%llu phase_lease_other_runs=%llu phase_lease_wakeup_candidates=%llu phase_lease_wakeup_preempts=%llu vector_local_dispatches=%llu vector_window_starts=%llu exclusive_handoffs=%llu exclusive_denials=%llu dsq_dispatches=%llu dsq_consumes=%llu dsq_dispatches_team0=%llu dsq_dispatches_team1=%llu dsq_consumes_team0=%llu dsq_consumes_team1=%llu x86_smt_primary=%llu x86_smt_sibling=%llu x86_smt_latency_primary=%llu x86_smt_decode_shared=%llu\n",
 	       stats.rvv_vector_threads_team0, stats.rvv_vector_threads_team1,
 	       stats.user_hint_valid_workers, stats.user_hint_active_workers,
 	       stats.user_hint_fallbacks, stats.user_hint_deferred_tasks,
@@ -535,13 +640,25 @@ static void print_stats(struct scx_llm_pin_bpf *skel)
 	       stats.rvv_vector_dsq_dispatches_team0,
 	       stats.rvv_vector_dsq_dispatches_team1,
 	       stats.rvv_vector_dsq_consumes_team0,
-	       stats.rvv_vector_dsq_consumes_team1);
+	       stats.rvv_vector_dsq_consumes_team1,
+	       stats.x86_smt_primary_selections,
+	       stats.x86_smt_sibling_selections,
+	       stats.x86_smt_latency_primary,
+	       stats.x86_smt_decode_shared);
+	for (unsigned t = 0; t < RVV_LEASE_CONTROL_TEAMS; t++) {
+		printf("SCX_TEAM_STATS team=%u workers=%llu enqueues=%llu consumes=%llu runs=%llu\n",
+		       t, (unsigned long long)stats.teams[t].vector_threads,
+		       (unsigned long long)stats.teams[t].enqueues,
+		       (unsigned long long)stats.teams[t].consumes,
+		       (unsigned long long)stats.teams[t].runs);
+	}
 	fflush(stdout);
 }
 
 static void sample_gang_placement(struct scx_llm_pin_bpf *skel,
 				  struct gang_sample_stats *samples)
 {
+	struct llm_pin_config config = {};
 	struct gang_state_snapshot before = {};
 	struct gang_state_snapshot after = {};
 	__u32 key = 0;
@@ -559,9 +676,19 @@ static void sample_gang_placement(struct scx_llm_pin_bpf *skel,
 	if (!before.engaged || !before.active_team_plus1 ||
 	    before.active_team_plus1 > RVV_LEASE_CONTROL_TEAMS)
 		return;
+	key = 0;
+	if (bpf_map__lookup_elem(skel->maps.config_map, &key, sizeof(key),
+				 &config, sizeof(config), 0)) {
+		samples->read_errors++;
+		return;
+	}
 
-	for (__u32 cpu = 0; cpu < RVV_LEASE_CONTROL_WORKERS; cpu++) {
+	for (__u32 cpu = 0; cpu < RVV_LEASE_MAX_CPUS; cpu++) {
 		__u32 running_team = 0;
+		__u32 expected_team = before.active_team_plus1;
+
+		if (config.team_gang_mode == LLM_TEAM_GANG_PAIR && cpu >= 4)
+			expected_team++;
 
 		expected_slots++;
 		key = cpu;
@@ -573,7 +700,7 @@ static void sample_gang_placement(struct scx_llm_pin_bpf *skel,
 		}
 		if (!running_team)
 			idle_slots++;
-		else if (running_team == before.active_team_plus1)
+		else if (running_team == expected_team)
 			active_slots++;
 		else
 			wrong_slots++;
@@ -682,6 +809,8 @@ static void print_vector_cpu_assignments(struct scx_llm_pin_bpf *skel)
 
 enum {
 	OPT_USER_CONTROL = 1000,
+	OPT_TEAM,
+	OPT_CHECK_CONFIG,
 	OPT_CONTROL_DIR,
 	OPT_USER_CPU_MAP,
 	OPT_TGID2,
@@ -692,6 +821,7 @@ enum {
 	OPT_GANG_SAMPLE_US,
 	OPT_VECTOR_LOCAL_WAKEUP,
 	OPT_PHASE_WAKEUP_PREEMPT,
+	OPT_X86_SMT,
 };
 
 static void usage(const char *prog)
@@ -700,21 +830,24 @@ static void usage(const char *prog)
 		"Usage: %s [options]\n"
 		"\n"
 		"Options:\n"
+		"  --team PID:T:TB[:MASK] Repeat for 1..8 models; T/TB <= allowed CPUs (max 8)\n"
+        "  --check-config        Validate and print configuration without loading BPF\n"
 		"  --tgid <pid>           Target process TGID (llama-server PID)\n"
 		"  --tgid2 <pid>          Optional second llama-server TGID\n"
 		"  --strategy <name>      global|rvv_dirty|rvv_dirty_local (default: global)\n"
 		"  --vector-slice-ms <ms> RVV vector worker slice (default: 100)\n"
 		"  --vector-local-window-ms <ms> RVV local fast-path window after vector DSQ consume (default: 500)\n"
-		"  --vector-local-wakeup <mode> team|off|exclusive (default: team)\n"
+		"  --vector-local-wakeup <mode> team|off|exclusive (default: off)\n"
 		"  --dirty-threshold <n>  Dirty samples before marking vector thread (default: 2)\n"
 		"  --user-control <mode>  off|observe|active (default: off)\n"
 		"  --control-dir <path>   Pin config/worker maps under this bpffs directory\n"
 		"  --user-cpu-map <map>   auto or OpenMP ith0..7 CPU order (default: auto)\n"
-		"  --team-gang <mode>     off|observe|always|prefill-lease (default: off)\n"
+		"  --team-gang <mode>     off|observe|always|prefill-lease|pair-gang (default: off)\n"
 		"  --gang-quantum-us <us> Shared team gang quantum (default: 5000)\n"
 		"  --phase-hint-timeout-ms <ms> Reject stale phase hints (default: 300000)\n"
 		"  --prefill-starvation-ms <ms> V DSQ safety wait for prefill-lease (default: 1000)\n"
 		"  --phase-wakeup-preempt <on|off> Preferred wakeup targeted preemption (default: on)\n"
+		"  --x86-smt <mode>       off|adaptive (x86 i5-10200H 4C/8T; default: off)\n"
 		"  --gang-sample-us <us> Sample running teams for diagnostics (0=off, min=1000)\n"
 		"  --duration <sec>       Run duration in seconds (0 = infinite, default: 0)\n"
 		"  -h, --help             Show this help\n"
@@ -737,13 +870,14 @@ int main(int argc, char **argv)
 	__u64 gang_sample_us = 0;
 	struct gang_sample_stats gang_samples = {};
 	bool control_maps_pinned = false;
+    bool check_config = false;
 	int err;
 	__u32 key = 0;
 
 	config.strategy = LLM_STRATEGY_GLOBAL;
 	config.dirty_threshold = 2;
 	config.vector_local_window_ns = 500 * NSEC_PER_MSEC;
-	config.vector_local_wakeup_mode = LLM_VECTOR_LOCAL_WAKEUP_TEAM;
+	config.vector_local_wakeup_mode = LLM_VECTOR_LOCAL_WAKEUP_OFF;
 	config.phase_wakeup_preempt_enabled = 1;
 	config.team_gang_mode = LLM_TEAM_GANG_OFF;
 	config.gang_quantum_ns = 5000 * NSEC_PER_USEC;
@@ -753,6 +887,8 @@ int main(int argc, char **argv)
 		config.user_cpu_map[ith] = ith;
 
 	static struct option long_options[] = {
+		{"team", required_argument, 0, OPT_TEAM},
+        {"check-config", no_argument, 0, OPT_CHECK_CONFIG},
 		{"tgid",        required_argument, 0, 't'},
 		{"tgid2",       required_argument, 0, OPT_TGID2},
 		{"strategy",    required_argument, 0, 'p'},
@@ -768,6 +904,7 @@ int main(int argc, char **argv)
 		{"phase-hint-timeout-ms", required_argument, 0, OPT_PHASE_HINT_TIMEOUT_MS},
 		{"prefill-starvation-ms", required_argument, 0, OPT_PREFILL_STARVATION_MS},
 		{"phase-wakeup-preempt", required_argument, 0, OPT_PHASE_WAKEUP_PREEMPT},
+		{"x86-smt", required_argument, 0, OPT_X86_SMT},
 		{"gang-sample-us", required_argument, 0, OPT_GANG_SAMPLE_US},
 		{"duration",    required_argument, 0, 'd'},
 		{"help",        no_argument,       0, 'h'},
@@ -781,6 +918,17 @@ int main(int argc, char **argv)
 			break;
 
 		switch (c) {
+        case OPT_TEAM:
+            if (config.team_count >= RVV_LEASE_CONTROL_TEAMS ||
+                llm_parse_team(optarg, &config.teams[config.team_count])) {
+                fprintf(stderr, "Error: --team requires PID:T:TB[:MASK], T/TB in 1..allowed cores (max 8); at most 8 models\n");
+                return 1;
+            }
+            config.team_count++;
+            break;
+        case OPT_CHECK_CONFIG:
+            check_config = true;
+            break;
 		case 't':
 			config.target_tgid = atoi(optarg);
 			break;
@@ -848,6 +996,12 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			break;
+		case OPT_X86_SMT:
+			if (parse_x86_smt_mode(optarg, &config.x86_smt_mode)) {
+				fprintf(stderr, "Error: --x86-smt requires off|adaptive\n");
+				return 1;
+			}
+			break;
 		case OPT_GANG_SAMPLE_US:
 			gang_sample_us = strtoull(optarg, NULL, 10);
 			break;
@@ -862,6 +1016,71 @@ int main(int argc, char **argv)
 	}
 
 	// 参数验证
+    if (config.team_count && (config.target_tgid || config.target_tgid2)) {
+        fprintf(stderr, "Error: use --team or legacy --tgid/--tgid2, not both\n");
+        return 1;
+    }
+    if (!config.team_count && config.target_tgid) {
+        config.team_count = config.target_tgid2 ? 2 : 1;
+        for (unsigned t = 0; t < config.team_count; t++) {
+            config.teams[t].tgid = t ? config.target_tgid2 : config.target_tgid;
+            config.teams[t].threads = config.teams[t].threads_batch = 8;
+            config.teams[t].cpu_mask = LLM_CPU_MASK;
+        }
+    }
+    if (llm_prepare_teams(&config)) {
+        fprintf(stderr, "Error: invalid/duplicate model configuration; supply --team or --tgid\n");
+        return 1;
+    }
+    if (config.team_gang_mode == LLM_TEAM_GANG_ALWAYS && config.team_count != 2) {
+        fprintf(stderr, "Error: legacy always gang ablation requires exactly two models\n");
+        return 1;
+    }
+#ifndef SCX_ARCH_X86
+	if (config.team_gang_mode == LLM_TEAM_GANG_PAIR) {
+		fprintf(stderr, "Error: --team-gang pair-gang is available only in the x86 build\n");
+		return 1;
+	}
+#else
+	if (config.team_gang_mode == LLM_TEAM_GANG_PAIR) {
+		if (config.team_count < 2 || (config.team_count & 1U)) {
+			fprintf(stderr, "Error: --team-gang pair-gang requires an even number of teams in 2..8\n");
+			return 1;
+		}
+		if (config.user_control_mode != RVV_LEASE_CONTROL_ACTIVE) {
+			fprintf(stderr, "Error: --team-gang pair-gang requires --user-control active\n");
+			return 1;
+		}
+		if (config.user_cpu_map_enabled) {
+			fprintf(stderr, "Error: --team-gang pair-gang requires --user-cpu-map auto\n");
+			return 1;
+		}
+		for (unsigned t = 0; t < config.team_count; t++) {
+			unsigned n = config.teams[t].threads > config.teams[t].threads_batch ?
+				config.teams[t].threads : config.teams[t].threads_batch;
+
+			if (n > 4 || config.teams[t].cpu_mask != 0xff) {
+				fprintf(stderr, "Error: --team-gang pair-gang requires T/TB <= 4 and CPU mask 0xff for every team\n");
+				return 1;
+			}
+		}
+		if (validate_x86_4c8t_topology()) {
+			fprintf(stderr, "Error: --team-gang pair-gang requires sibling pairs 0/4, 1/5, 2/6 and 3/7\n");
+			return 1;
+		}
+	}
+#endif
+    if (config.user_cpu_map_enabled) {
+        for (unsigned t = 0; t < config.team_count; t++) {
+            unsigned n = config.teams[t].threads > config.teams[t].threads_batch ?
+                config.teams[t].threads : config.teams[t].threads_batch;
+            for (unsigned i = 0; i < n; i++)
+                if (!(config.teams[t].cpu_mask & (1U << config.user_cpu_map[i]))) {
+                    fprintf(stderr, "Error: CPU map exceeds team CPU mask\n");
+                    return 1;
+                }
+        }
+    }
 	if (!config.target_tgid) {
 		fprintf(stderr, "Error: --tgid is required\n\n");
 		usage(argv[0]);
@@ -879,8 +1098,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Error: userspace control requires an rvv_dirty strategy\n");
 		return 1;
 	}
-	if (config.team_gang_mode != LLM_TEAM_GANG_OFF && !config.target_tgid2) {
-		fprintf(stderr, "Error: --team-gang requires --tgid2\n");
+	if (config.team_gang_mode == LLM_TEAM_GANG_ALWAYS && !config.target_tgid2) {
+		fprintf(stderr, "Error: --team-gang always requires at least two teams\n");
 		return 1;
 	}
 	if (config.team_gang_mode != LLM_TEAM_GANG_OFF &&
@@ -895,8 +1114,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (config.gang_quantum_ns < 500 * NSEC_PER_USEC ||
-	    config.gang_quantum_ns > 50000 * NSEC_PER_USEC) {
-		fprintf(stderr, "Error: --gang-quantum-us must be in 500..50000\n");
+	    config.gang_quantum_ns > 500000 * NSEC_PER_USEC) {
+		fprintf(stderr, "Error: --gang-quantum-us must be in 500..500000\n");
 		return 1;
 	}
 	if (config.prefill_starvation_ns < 100 * NSEC_PER_MSEC ||
@@ -916,13 +1135,50 @@ int main(int argc, char **argv)
 	if (gang_sample_us &&
 	    (config.team_gang_mode == LLM_TEAM_GANG_OFF ||
 	     config.team_gang_mode == LLM_TEAM_GANG_PREFILL_LEASE)) {
-		fprintf(stderr, "Error: --gang-sample-us requires --team-gang observe|always\n");
+		fprintf(stderr, "Error: --gang-sample-us requires --team-gang observe|always|pair-gang\n");
 		return 1;
 	}
 	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF &&
 	    (!control_dir || control_dir[0] != '/')) {
 		fprintf(stderr, "Error: --control-dir must be an absolute bpffs path\n");
 		return 1;
+	}
+	if (config.x86_smt_mode > LLM_X86_SMT_ADAPTIVE) {
+		fprintf(stderr, "Error: invalid x86 SMT mode\n");
+		return 1;
+	}
+	if (config.x86_smt_mode == LLM_X86_SMT_ADAPTIVE) {
+#ifndef SCX_ARCH_X86
+		fprintf(stderr, "Error: --x86-smt adaptive is available only in the x86 build\n");
+		return 1;
+#else
+		if (config.team_count != 2) {
+			fprintf(stderr, "Error: --x86-smt adaptive currently requires exactly two teams\n");
+			return 1;
+		}
+		if (config.user_control_mode != RVV_LEASE_CONTROL_ACTIVE ||
+		    config.team_gang_mode != LLM_TEAM_GANG_PREFILL_LEASE) {
+			fprintf(stderr, "Error: --x86-smt adaptive requires --user-control active and --team-gang prefill-lease\n");
+			return 1;
+		}
+		if (config.user_cpu_map_enabled) {
+			fprintf(stderr, "Error: --x86-smt adaptive requires --user-cpu-map auto\n");
+			return 1;
+		}
+		for (unsigned t = 0; t < config.team_count; t++) {
+			unsigned n = config.teams[t].threads > config.teams[t].threads_batch ?
+				config.teams[t].threads : config.teams[t].threads_batch;
+
+			if (n > 4 || config.teams[t].cpu_mask != 0xff) {
+				fprintf(stderr, "Error: --x86-smt adaptive requires T/TB <= 4 and CPU mask 0xff for every team\n");
+				return 1;
+			}
+		}
+		if (validate_x86_4c8t_topology()) {
+			fprintf(stderr, "Error: --x86-smt adaptive requires sibling pairs 0/4, 1/5, 2/6 and 3/7\n");
+			return 1;
+		}
+#endif
 	}
 
 	if (config.strategy == LLM_STRATEGY_RVV_DIRTY ||
@@ -961,6 +1217,7 @@ int main(int argc, char **argv)
 	       (unsigned long long)(config.prefill_starvation_ns / NSEC_PER_MSEC));
 	printf("  Phase wakeup preempt: %s\n",
 	       config.phase_wakeup_preempt_enabled ? "on" : "off");
+	printf("  x86 SMT policy:  %s\n", x86_smt_mode_name(config.x86_smt_mode));
 	printf("  Gang sampler:    %lluus\n",
 	       (unsigned long long)gang_sample_us);
 	if (config.user_control_mode != RVV_LEASE_CONTROL_OFF) {
@@ -979,7 +1236,35 @@ int main(int argc, char **argv)
 	printf("  Duration:        %s\n", duration ? "limited" : "infinite");
 	printf("\n");
 
-	// 信号处理
+	for (unsigned t = 0; t < config.team_count; t++) {
+		printf("TEAM_CONFIG team=%u tgid=%u threads=%u threads_batch=%u cpu_mask=0x%x cpu_order=",
+		       t, config.teams[t].tgid, config.teams[t].threads,
+		       config.teams[t].threads_batch, config.teams[t].cpu_mask);
+		for (unsigned i = 0;
+		     i < (unsigned)__builtin_popcount(config.teams[t].cpu_mask); i++)
+			printf("%s%u", i ? "," : "", config.teams[t].cpu_order[i]);
+		printf("\n");
+	}
+	if (check_config)
+		return 0;
+	for (unsigned t = 0; t < config.team_count; t++) {
+		cpu_set_t allowed;
+
+		CPU_ZERO(&allowed);
+		if (sched_getaffinity(config.teams[t].tgid, sizeof(allowed), &allowed)) {
+			perror("target sched_getaffinity");
+			return 1;
+		}
+		for (unsigned cpu = 0; cpu < RVV_LEASE_MAX_CPUS; cpu++) {
+			if ((config.teams[t].cpu_mask & (1U << cpu)) &&
+			    !CPU_ISSET(cpu, &allowed)) {
+				fprintf(stderr, "Error: team CPU mask must fit target process affinity/online CPUs\n");
+				return 1;
+			}
+		}
+	}
+
+    // 信号处理
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 	libbpf_set_print(libbpf_log);
