@@ -1,0 +1,1295 @@
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -33,6 +33,13 @@
+         ggml-cpu/scx-barrier-hint-client.h
+         ggml-cpu/scx-rvv-barrier-hint.h
+         ggml-cpu/scx-rvv-lease-control.h
++        ggml-cpu/dynamic-control.h
++        ggml-cpu/dynamic-client.c
++        ggml-cpu/dynamic-client.h
++        ggml-cpu/dynamic-worker-team.c
++        ggml-cpu/dynamic-worker-team.h
++        ggml-cpu/dynamic-grant-client.c
++        ggml-cpu/dynamic-grant-client.h
+         ggml-cpu/repack.cpp
+         ggml-cpu/repack.h
+         ggml-cpu/hbm.cpp
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1,3 +1,6 @@
++#if defined(__gnu_linux__) && !defined(_GNU_SOURCE)
++#define _GNU_SOURCE
++#endif
+ #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
+ #define _USE_MATH_DEFINES // For M_PI on MSVC
+ 
+@@ -18,6 +21,8 @@
+ 
+ #if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
+ #include "scx-rvv-barrier-hint.h"
++#include "dynamic-grant-client.h"
++#include <sched.h>
+ #include <sys/syscall.h>
+ #endif
+ 
+@@ -3061,11 +3066,17 @@
+     const struct ggml_cgraph * cgraph = tp->cgraph;
+     const struct ggml_cplan  * cplan  = tp->cplan;
+ 
++#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
++    if (!ggml_dynamic_threads_in_graph()) {
++#endif
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
+ #else
+     set_numa_thread_affinity(state->ith);
+ #endif
++#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
++    }
++#endif
+ 
+     struct ggml_compute_params params = {
+         /*.ith        =*/ state->ith,
+@@ -3130,6 +3141,9 @@
+     ggml_barrier(state->threadpool);
+ 
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
++#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
++    if (!ggml_dynamic_threads_in_graph())
++#endif
+     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
+ #endif
+ 
+@@ -3380,7 +3394,12 @@
+     }
+ 
+ #ifdef GGML_USE_OPENMP
++    int dynamic_error = 0;
+ #if defined(__gnu_linux__)
++    const bool dynamic_graph = ggml_dynamic_threads_in_graph();
++    const bool dynamic_persistent = ggml_dynamic_threads_persistent();
++    uint32_t dynamic_tids[GGML_MAX_N_THREADS] = {0};
++    int dynamic_errors[GGML_MAX_N_THREADS] = {0};
+     threadpool->barrier_hint_graph_epoch =
+             ggml_scx_barrier_hint_graph_begin(n_threads);
+ #endif
+@@ -3390,6 +3409,9 @@
+             #pragma omp single
+             {
+                 // update the number of threads from the actual number of threads that we got from OpenMP
++#if defined(__gnu_linux__)
++                if (dynamic_graph && n_threads != omp_get_num_threads()) dynamic_error = 1;
++#endif
+                 n_threads = omp_get_num_threads();
+ #if defined(__gnu_linux__)
+                 ggml_scx_lease_hint_graph_begin(n_threads);
+@@ -3400,9 +3422,48 @@
+             // Apply thread CPU mask and priority
+             int ith = omp_get_thread_num();
+ 
++            ggml_thread_apply_priority(threadpool->prio);
++            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)
++#if defined(__gnu_linux__)
++                    && !dynamic_persistent
++#endif
++                    ) {
++                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
++            }
++
+ #if defined(__gnu_linux__)
+             struct ggml_compute_state * hint_worker = &threadpool->workers[ith];
+             hint_worker->barrier_hint_tid = (uint32_t) syscall(SYS_gettid);
++            cpu_set_t dynamic_original;
++            int dynamic_have_original = 0;
++            if (dynamic_graph) {
++                dynamic_tids[ith] = hint_worker->barrier_hint_tid;
++                if (dynamic_persistent) {
++                    if (ggml_dynamic_threads_observe(ith)) dynamic_errors[ith] = 1;
++                    if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) dynamic_errors[ith] = 1;
++                } else {
++                dynamic_have_original = sched_getaffinity(0, sizeof(dynamic_original), &dynamic_original) == 0;
++                const int cpu = ggml_dynamic_threads_cpu(ith);
++                if (!dynamic_have_original || (cpu >= 0 && !CPU_ISSET(cpu, &dynamic_original))) {
++                    dynamic_errors[ith] = 1;
++                } else if (cpu >= 0) {
++                    cpu_set_t target;
++                    CPU_ZERO(&target);
++                    CPU_SET(cpu, &target);
++                    if (sched_setaffinity(0, sizeof(target), &target)) dynamic_errors[ith] = 1;
++                }
++                }
++            }
++            #pragma omp barrier
++            #pragma omp single
++            {
++                if (dynamic_graph) {
++                    for (int j = 0; j < n_threads; j++) dynamic_error |= dynamic_errors[j];
++                    if (!dynamic_error && ggml_dynamic_threads_register(dynamic_tids, n_threads)) {
++                        dynamic_error = 1;
++                    }
++                }
++            }
+             ggml_scx_lease_hint_register(
+                     hint_worker->barrier_hint_tid,
+                     ith,
+@@ -3418,12 +3479,11 @@
+                     0,
+                     0);
+ #endif
+-
+-            ggml_thread_apply_priority(threadpool->prio);
+-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+-                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
+-            }
++#if defined(__gnu_linux__)
++            if (!dynamic_error) ggml_graph_compute_thread(&threadpool->workers[ith]);
++#else
+             ggml_graph_compute_thread(&threadpool->workers[ith]);
++#endif
+ #if defined(__gnu_linux__)
+             ggml_scx_barrier_hint_update(
+                     hint_worker->barrier_hint_tid,
+@@ -3433,18 +3493,63 @@
+                     threadpool->barrier_hint_graph_epoch,
+                     hint_worker->barrier_hint_epoch,
+                     hint_worker->barrier_hint_node_index);
++            #pragma omp barrier
++            #pragma omp single
++            {
++                if (dynamic_graph && ggml_dynamic_threads_unregister()) dynamic_error = 1;
++            }
++            if (dynamic_graph && dynamic_have_original &&
++                    sched_setaffinity(0, sizeof(dynamic_original), &dynamic_original)) {
++                dynamic_errors[ith] = 1;
++            }
+ #endif
+         }
+     } else {
+         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+ #if defined(__gnu_linux__)
+         ggml_scx_lease_hint_graph_begin(1);
+-        ggml_scx_lease_hint_register((uint32_t) syscall(SYS_gettid), 0, 1);
++        dynamic_tids[0] = (uint32_t) syscall(SYS_gettid);
++        ggml_scx_lease_hint_register(dynamic_tids[0], 0, 1);
++        cpu_set_t dynamic_original;
++        int dynamic_have_original = 0;
++        if (dynamic_graph) {
++            if (dynamic_persistent) {
++                if (ggml_dynamic_threads_observe(0)) dynamic_error = 1;
++            } else {
++            dynamic_have_original = sched_getaffinity(0, sizeof(dynamic_original), &dynamic_original) == 0;
++            const int cpu = ggml_dynamic_threads_cpu(0);
++            if (!dynamic_have_original || (cpu >= 0 && !CPU_ISSET(cpu, &dynamic_original))) {
++                dynamic_error = 1;
++            } else if (cpu >= 0) {
++                cpu_set_t target;
++                CPU_ZERO(&target);
++                CPU_SET(cpu, &target);
++                if (sched_setaffinity(0, sizeof(target), &target)) dynamic_error = 1;
++            }
++            }
++            if (!dynamic_error && ggml_dynamic_threads_register(dynamic_tids, 1)) dynamic_error = 1;
++        }
+ #endif
++#if defined(__gnu_linux__)
++        if (!dynamic_error) ggml_graph_compute_thread(&threadpool->workers[0]);
++#else
+         ggml_graph_compute_thread(&threadpool->workers[0]);
++#endif
++#if defined(__gnu_linux__)
++        if (dynamic_graph && ggml_dynamic_threads_unregister()) dynamic_error = 1;
++        if (dynamic_graph && dynamic_have_original &&
++                sched_setaffinity(0, sizeof(dynamic_original), &dynamic_original)) dynamic_error = 1;
++#endif
+     }
+ #if defined(__gnu_linux__)
+     threadpool->barrier_hint_graph_epoch = 0;
++    if (dynamic_graph) {
++        for (int j = 0; j < n_threads; j++) dynamic_error |= dynamic_errors[j];
++        if (dynamic_error) {
++            threadpool->ec = GGML_STATUS_FAILED;
++            ggml_dynamic_threads_fail();
++        }
++    }
+ #endif
+ #else
+     if (n_threads > threadpool->n_threads) {
+@@ -3460,7 +3565,11 @@
+ #endif
+ 
+     // don't leave affinity set on the main thread
++#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
++    if (!ggml_dynamic_threads_in_graph()) clear_numa_thread_affinity();
++#else
+     clear_numa_thread_affinity();
++#endif
+ 
+     enum ggml_status ret = threadpool->ec;
+ 
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -6,6 +6,7 @@
+ #include "ggml-impl.h"
+ #include "amx/amx.h"
+ #include "scx-barrier-hint-client.h"
++#include "dynamic-grant-client.h"
+ 
+ #include <cctype>
+ #include <string>
+@@ -129,28 +130,45 @@
+ struct ggml_backend_plan_cpu {
+     struct ggml_cplan cplan;
+     struct ggml_cgraph cgraph;
++    size_t work_size;
+ };
+ 
++static bool ggml_backend_cpu_plan_update(
++        struct ggml_backend_plan_cpu * cpu_plan,
++        struct ggml_backend_cpu_context * cpu_ctx,
++        int n_threads) {
++    struct ggml_cplan next = ggml_graph_plan(&cpu_plan->cgraph, n_threads, cpu_ctx->threadpool);
++    if (cpu_plan->work_size < next.work_size) {
++        delete[] cpu_plan->cplan.work_data;
++        cpu_plan->cplan.work_data = new uint8_t[next.work_size];
++        if (cpu_plan->cplan.work_data == NULL) {
++            cpu_plan->work_size = 0;
++            return false;
++        }
++        cpu_plan->work_size = next.work_size;
++    }
++    next.work_data = cpu_plan->cplan.work_data;
++    next.abort_callback = cpu_ctx->abort_callback;
++    next.abort_callback_data = cpu_ctx->abort_callback_data;
++    next.use_ref = cpu_ctx->use_ref;
++    cpu_plan->cplan = next;
++    return true;
++}
++
+ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+ 
+     struct ggml_backend_plan_cpu * cpu_plan = new ggml_backend_plan_cpu;
+ 
+-    cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+     cpu_plan->cgraph = *cgraph; // FIXME: deep copy
++    cpu_plan->cplan = {};
++    cpu_plan->work_size = 0;
+ 
+-    if (cpu_plan->cplan.work_size > 0) {
+-        cpu_plan->cplan.work_data = new uint8_t[cpu_plan->cplan.work_size];
+-        if (cpu_plan->cplan.work_data == NULL) {
+-            delete cpu_plan;
+-            return NULL;
+-        }
++    if (!ggml_backend_cpu_plan_update(cpu_plan, cpu_ctx, cpu_ctx->n_threads)) {
++        delete cpu_plan;
++        return NULL;
+     }
+ 
+-    cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
+-    cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
+-    cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
+-
+     return cpu_plan;
+ }
+ 
+@@ -164,23 +182,42 @@
+ }
+ 
+ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
++    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
+-
+-    return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
+-
+-    GGML_UNUSED(backend);
++    if (!ggml_backend_cpu_plan_update(cpu_plan, cpu_ctx, cpu_ctx->n_threads)) {
++        return GGML_STATUS_ALLOC_FAILED;
++    }
++    unsigned n_threads = cpu_plan->cplan.n_threads;
++    const int acquired = ggml_dynamic_threads_begin(cpu_ctx->n_threads, &n_threads,
++            cpu_ctx->sched_phase, cpu_ctx->sched_prompt_tokens, cpu_ctx->sched_decode_tokens);
++    if (acquired < 0) return GGML_STATUS_FAILED;
++    if (!ggml_backend_cpu_plan_update(cpu_plan, cpu_ctx, n_threads)) {
++        if (acquired > 0) ggml_dynamic_threads_end();
++        return GGML_STATUS_ALLOC_FAILED;
++    }
++    enum ggml_status status = ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
++    if (acquired > 0 && ggml_dynamic_threads_end()) status = GGML_STATUS_FAILED;
++    return status;
+ }
+ 
+ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+ 
+     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
++    unsigned n_threads = cplan.n_threads;
++    const int acquired = ggml_dynamic_threads_begin(cpu_ctx->n_threads, &n_threads,
++            cpu_ctx->sched_phase, cpu_ctx->sched_prompt_tokens, cpu_ctx->sched_decode_tokens);
++    if (acquired < 0) return GGML_STATUS_FAILED;
++    if (n_threads != (unsigned)cplan.n_threads) {
++        cplan = ggml_graph_plan(cgraph, n_threads, cpu_ctx->threadpool);
++    }
+ 
+     if (cpu_ctx->work_size < cplan.work_size) {
+         delete[] cpu_ctx->work_data;
+         cpu_ctx->work_data = new uint8_t[cplan.work_size];
+         if (cpu_ctx->work_data == NULL) {
+             cpu_ctx->work_size = 0;
++            if (acquired > 0) ggml_dynamic_threads_end();
+             return GGML_STATUS_ALLOC_FAILED;
+         }
+         cpu_ctx->work_size = cplan.work_size;
+@@ -195,9 +232,10 @@
+             cpu_ctx->sched_phase,
+             cpu_ctx->sched_prompt_tokens,
+             cpu_ctx->sched_decode_tokens,
+-            (uint32_t) cpu_ctx->n_threads);
+-    const enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
++            n_threads);
++    enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
+     ggml_scx_lease_hint_phase_end();
++    if (acquired > 0 && ggml_dynamic_threads_end()) status = GGML_STATUS_FAILED;
+     return status;
+ }
+ 
+@@ -296,6 +334,11 @@
+     ctx->sched_decode_tokens = decode_tokens;
+ }
+ 
++static bool ggml_backend_cpu_set_dynamic_activity(ggml_backend_t backend_cpu, bool active) {
++    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
++    return ggml_dynamic_threads_set_active(active);
++}
++
+ void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
+     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+ 
+@@ -704,6 +747,9 @@
+     if (strcmp(name, "ggml_backend_cpu_set_sched_hint") == 0) {
+         return (void *)ggml_backend_cpu_set_sched_hint;
+     }
++    if (strcmp(name, "ggml_backend_cpu_set_dynamic_activity") == 0) {
++        return (void *)ggml_backend_cpu_set_dynamic_activity;
++    }
+ 
+     return NULL;
+ 
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -970,11 +970,16 @@
+               struct llama_batch   batch);
+ 
+     // Set a one-shot scheduling hint for the next llama_decode() call.
+-    // The hint is ignored when no compatible sched_ext mmap endpoint is present.
++    // Consumed by compatible phase-hint endpoints and the dynamic grant controller.
++    // Without either consumer it does not change scheduling.
+     LLAMA_API void llama_set_sched_hint(
+             struct llama_context          * ctx,
+             const struct llama_sched_hint * hint);
+ 
++    // Mark this context as having inference work. If dynamic threads are configured,
++    // the first true and final false transition notify the local grant controller.
++    LLAMA_API bool llama_set_dynamic_threads_active(struct llama_context * ctx, bool active);
++
+     // Set the number of threads used for decoding
+     // n_threads is the number of threads used for generation (single token)
+     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1144,6 +1144,17 @@
+     };
+ }
+ 
++bool llama_context::set_dynamic_threads_active(bool active) {
++    if (backend_cpu == nullptr) {
++        return true;
++    }
++    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
++    using set_activity_fn_t = bool (*)(ggml_backend_t, bool);
++    auto * set_activity_fn = (set_activity_fn_t) ggml_backend_reg_get_proc_address(
++            reg, "ggml_backend_cpu_set_dynamic_activity");
++    return set_activity_fn == nullptr || set_activity_fn(backend_cpu, active);
++}
++
+ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+     if (!sampler && sampling.samplers.count(seq_id) == 0) {
+         return true;
+@@ -3982,6 +3993,10 @@
+     ctx->set_sched_hint(*hint);
+ }
+ 
++bool llama_set_dynamic_threads_active(llama_context * ctx, bool active) {
++    return ctx == nullptr || ctx->set_dynamic_threads_active(active);
++}
++
+ //
+ // perf
+ //
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -115,6 +115,7 @@
+     void set_warmup(bool value);
+     void set_sched_hint(const llama_sched_hint & hint);
+     void clear_sched_hint();
++    bool set_dynamic_threads_active(bool active);
+ 
+     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+ 
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -687,6 +687,7 @@
+     int trace = 0;
+     int slots_debug = 0;
+     int n_empty_consecutive = 0;
++    int dynamic_active_slots = 0;
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+ 
+@@ -705,6 +706,12 @@
+     bool sleeping = false;
+ 
+     void destroy() {
++        if (dynamic_active_slots > 0 && ctx_tgt != nullptr) {
++            if (!llama_set_dynamic_threads_active(ctx_tgt, false)) {
++                SRV_ERR("%s", "failed to mark dynamic thread controller idle during shutdown\n");
++            }
++            dynamic_active_slots = 0;
++        }
+         spec.reset();
+         ctx_dft.reset();
+         model_dft.reset();
+@@ -1062,6 +1069,12 @@
+             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+ 
+             slot.callback_on_release = [this](int id_slot) {
++                GGML_ASSERT(dynamic_active_slots > 0);
++                dynamic_active_slots--;
++                if (dynamic_active_slots == 0 && !llama_set_dynamic_threads_active(ctx_tgt, false)) {
++                    SRV_ERR("%s", "failed to mark dynamic thread controller idle\n");
++                    GGML_ABORT("dynamic grant idle/release failed; stop without fallback");
++                }
+                 queue_tasks.pop_deferred_task(id_slot);
+             };
+ 
+@@ -1498,6 +1511,11 @@
+             slot.smpl.reset();
+         }
+ 
++        if (dynamic_active_slots == 0 && !llama_set_dynamic_threads_active(ctx_tgt, true)) {
++            send_error(task, "Dynamic thread controller is unavailable", ERROR_TYPE_SERVER);
++            return false;
++        }
++        dynamic_active_slots++;
+         slot.task = std::make_unique<const server_task>(std::move(task));
+ 
+         slot.state = slot.task->is_child()
+--- /dev/null
++++ b/ggml/src/ggml-cpu/dynamic-client.c
+@@ -0,0 +1,253 @@
++#define _GNU_SOURCE
++#include "dynamic-client.h"
++#include <errno.h>
++#include <poll.h>
++#include <stdbool.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
++_Static_assert(sizeof(struct dt_msg) == 112, "wire layout changed");
++static int64_t clock_ms(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++static int wait_fd(int fd, short events, int64_t deadline)
++{
++    for (;;) {
++        int64_t remaining = deadline < 0 ? -1 : deadline - clock_ms();
++        if (deadline >= 0 && remaining <= 0) { errno = ETIMEDOUT; return -1; }
++        struct pollfd pollfd = {.fd = fd, .events = events};
++        int rc = poll(&pollfd, 1, remaining);
++        if (rc < 0 && errno == EINTR) continue;
++        if (rc < 0) return -1;
++        if (!rc) { errno = ETIMEDOUT; return -1; }
++        if (pollfd.revents & events) return 0;
++        errno = ECONNRESET;
++        return -1;
++    }
++}
++static int valid_message(const struct dt_client *c, const struct dt_msg *m)
++{
++    if (m->magic != DT_MAGIC || m->version != DT_VERSION || m->slot >= DT_TEAMS ||
++        !m->session || (c->session && (m->session != c->session || m->slot != c->slot))) {
++        errno = EPROTO; return -1;
++    }
++    if (m->status) { errno = m->status; return -1; }
++    return 0;
++}
++static int valid_grant(const struct dt_msg *m, unsigned maximum)
++{
++    if (!m->workers || m->workers > maximum || m->workers > DT_WORKERS || m->pin > 1 ||
++        !m->cpu_mask || (m->cpu_mask & ~255ULL) ||
++        __builtin_popcountll(m->cpu_mask) < (int)m->workers) { errno = EPROTO; return -1; }
++    return 0;
++}
++static int notification(struct dt_client *c, const struct dt_msg *m)
++{
++    if (c->lifetime != DT_PERSISTENT || m->request || valid_message(c, m)) {
++        errno = EPROTO; return -1;
++    }
++    if (m->op == DT_GRANT) {
++        if (c->held || !c->pending || m->epoch != c->epoch + 1 || valid_grant(m, c->maximum)) {
++            errno = EPROTO; return -1;
++        }
++        c->grant = *m;
++        c->epoch = m->epoch;
++        c->held = true;
++        c->revoked = false;
++        c->pending = false;
++    } else if (m->op == DT_REVOKE) {
++        if (!c->held || c->revoked || m->epoch != c->epoch ||
++            m->workers > c->maximum || (m->cpu_mask & ~255ULL) ||
++            __builtin_popcountll(m->cpu_mask) != (int)m->workers) {
++            errno = EPROTO; return -1;
++        }
++        c->revoke = *m;
++        c->revoked = true;
++    } else { errno = EPROTO; return -1; }
++    return 0;
++}
++static int exchange(struct dt_client *c, struct dt_msg *m)
++{
++    m->magic = DT_MAGIC;
++    m->version = DT_VERSION;
++    m->slot = c->slot;
++    m->session = c->session;
++    m->epoch = c->epoch;
++    m->request = ++c->request;
++    const struct dt_msg sent = *m;
++    int64_t deadline = clock_ms() + c->timeout_ms;
++    for (;;) {
++        if (wait_fd(c->fd, POLLOUT, deadline)) return -1;
++        ssize_t n = send(c->fd, m, sizeof(*m), MSG_NOSIGNAL | MSG_DONTWAIT);
++        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
++        if (n != sizeof(*m)) { if (n >= 0) errno = EPROTO; return -1; }
++        break;
++    }
++    for (;;) {
++        if (wait_fd(c->fd, POLLIN, deadline)) return -1;
++        ssize_t n = recv(c->fd, m, sizeof(*m), MSG_TRUNC | MSG_DONTWAIT);
++        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
++        if (n != sizeof(*m)) { if (n >= 0) errno = EPROTO; return -1; }
++        if (!m->request) {
++            if (notification(c, m)) return -1;
++            continue;
++        }
++        break;
++    }
++    if (valid_message(c, m) || m->op != sent.op ||
++        m->request != sent.request || m->epoch != sent.epoch) {
++        errno = EPROTO; return -1;
++    }
++    return 0;
++}
++int dt_connect(struct dt_client *c, const char *path, unsigned maximum)
++{
++    memset(c, 0, sizeof(*c));
++    c->fd = -1;
++    c->timeout_ms = DT_TIMEOUT_MS;
++    struct sockaddr_un addr = {.sun_family = AF_UNIX};
++    if (!path || !maximum || maximum > DT_WORKERS || strlen(path) >= sizeof(addr.sun_path)) {
++        errno = EINVAL; return -1;
++    }
++    strcpy(addr.sun_path, path);
++    c->fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++    if (c->fd < 0) return -1;
++    if (connect(c->fd, (struct sockaddr *)&addr, sizeof(addr))) {
++        int saved = errno; dt_close(c); errno = saved; return -1;
++    }
++    struct dt_msg m = {.op = DT_HELLO, .max_workers = maximum};
++    if (exchange(c, &m)) { int saved = errno; dt_close(c); errno = saved; return -1; }
++    c->slot = m.slot;
++    c->session = m.session;
++    c->maximum = maximum;
++    c->lifetime = m.pin;
++    c->allocation = m.allocation;
++    if (c->lifetime > DT_PERSISTENT || c->allocation > DT_PREFILL_FIRST ||
++        (c->allocation == DT_PREFILL_FIRST && c->lifetime != DT_PERSISTENT)) {
++        dt_close(c); errno = EPROTO; return -1;
++    }
++    return 0;
++}
++void dt_close(struct dt_client *c)
++{
++    if (c->fd >= 0) close(c->fd);
++    c->fd = -1;
++}
++int dt_activity(struct dt_client *c, int active)
++{
++    struct dt_msg m = {.op = DT_ACTIVITY, .workers = !!active};
++    if (exchange(c, &m)) return -1;
++    c->active = !!active;
++    if (!active) { c->pending = false; c->phase = DT_UNKNOWN; }
++    return 0;
++}
++int dt_phase(struct dt_client *c, unsigned phase, unsigned prompt, unsigned decode)
++{
++    if (c->allocation == DT_EQUAL) return 0;
++    if (!c->active || !dt_valid_phase(phase, prompt, decode)) { errno = EINVAL; return -1; }
++    if (phase != c->phase && (c->held || c->pending)) {
++        struct dt_msg m = {.op = DT_PHASE, .phase = phase,
++                          .prompt_tokens = prompt, .decode_tokens = decode};
++        if (exchange(c, &m)) return -1;
++    }
++    c->phase = phase;
++    c->prompt_tokens = prompt;
++    c->decode_tokens = decode;
++    return 0;
++}
++int dt_request(struct dt_client *c, unsigned maximum)
++{
++    if (!maximum || maximum > DT_WORKERS || c->held || c->pending) { errno = EINVAL; return -1; }
++    if (c->allocation == DT_PREFILL_FIRST &&
++        !dt_valid_phase(c->phase, c->prompt_tokens, c->decode_tokens)) { errno = EINVAL; return -1; }
++    struct dt_msg m = {.op = DT_ACQUIRE, .max_workers = maximum,
++        .phase = c->phase, .prompt_tokens = c->prompt_tokens, .decode_tokens = c->decode_tokens};
++    if (c->lifetime == DT_GRAPH) c->epoch++;
++    c->maximum = maximum;
++    if (exchange(c, &m)) return -1;
++    if (c->lifetime == DT_PERSISTENT) { c->pending = true; return 0; }
++    if (valid_grant(&m, maximum)) return -1;
++    c->grant = m;
++    c->held = true;
++    return 0;
++}
++int dt_poll(struct dt_client *c)
++{
++    if (c->lifetime == DT_GRAPH) return 0;
++    for (;;) {
++        struct dt_msg m;
++        ssize_t n = recv(c->fd, &m, sizeof(m), MSG_TRUNC | MSG_DONTWAIT);
++        if (n < 0 && errno == EINTR) continue;
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
++        if (n != sizeof(m)) { if (n >= 0) errno = ECONNRESET; return -1; }
++        if (notification(c, &m)) return -1;
++    }
++}
++int dt_wait_grant(struct dt_client *c)
++{
++    while (!c->held) {
++        if (!c->pending) { errno = ECANCELED; return -1; }
++        if (wait_fd(c->fd, POLLIN, -1) || dt_poll(c)) return -1;
++    }
++    return 0;
++}
++int dt_acquire(struct dt_client *c, unsigned maximum)
++{
++    if (dt_request(c, maximum)) return -1;
++    return dt_wait_grant(c);
++}
++int dt_members(struct dt_client *c, const uint32_t *tids, unsigned count)
++{
++    if (!count || count > DT_WORKERS) { errno = EINVAL; return -1; }
++    struct dt_msg m = {.op = DT_MEMBERS, .workers = count};
++    memcpy(m.tids, tids, count * sizeof(*tids));
++    return exchange(c, &m);
++}
++int dt_unmembers(struct dt_client *c)
++{
++    struct dt_msg m = {.op = DT_UNMEMBERS};
++    return exchange(c, &m);
++}
++int dt_release(struct dt_client *c)
++{
++    struct dt_msg m = {.op = DT_RELEASE};
++    if (exchange(c, &m)) return -1;
++    c->held = false;
++    c->revoked = false;
++    /* An active persistent peer is automatically queued for its next grant.
++       Idle callers clear this using dt_activity before/after releasing. */
++    c->pending = c->lifetime == DT_PERSISTENT && c->active;
++    return 0;
++}
++int dt_shrink(struct dt_client *c)
++{
++    const struct dt_msg target = c->revoke;
++    if (!c->held || !c->revoked || !c->grant.pin || !target.workers ||
++        target.workers >= c->grant.workers ||
++        (target.cpu_mask & ~c->grant.cpu_mask)) { errno = EINVAL; return -1; }
++    struct dt_msg m = {.op = DT_SHRINK, .workers = target.workers,
++                       .cpu_mask = target.cpu_mask};
++    if (exchange(c, &m)) return -1;
++    if (m.workers != target.workers || m.cpu_mask != target.cpu_mask) {
++        errno = EPROTO; return -1;
++    }
++    c->grant.workers = m.workers;
++    c->grant.cpu_mask = m.cpu_mask;
++    c->revoked = false;
++    return 0;
++}
++int dt_cpu(const struct dt_client *c, unsigned ith)
++{
++    if (!c->grant.pin || ith >= c->grant.workers) return -1;
++    for (unsigned cpu = 0, index = 0; cpu < DT_WORKERS; cpu++) {
++        if (!(c->grant.cpu_mask & (1ULL << cpu))) continue;
++        if (index++ == ith) return cpu;
++    }
++    return -1;
++}
+--- /dev/null
++++ b/ggml/src/ggml-cpu/dynamic-client.h
+@@ -0,0 +1,32 @@
++#ifndef DT_CLIENT_H
++#define DT_CLIENT_H
++#include "dynamic-control.h"
++#include <stdbool.h>
++
++struct dt_client {
++    int fd, timeout_ms;
++    uint32_t slot;
++    unsigned lifetime, maximum;
++    unsigned allocation, phase, prompt_tokens, decode_tokens;
++    bool held, revoked, pending, active;
++    uint64_t session, request, epoch;
++    struct dt_msg grant, revoke;
++};
++int dt_connect(struct dt_client *c, const char *path, unsigned maximum);
++void dt_close(struct dt_client *c);
++int dt_activity(struct dt_client *c, int active);
++/* At a graph boundary, BEFORE waiting. Initial hint rides on ACQUIRE. */
++int dt_phase(struct dt_client *c, unsigned phase, unsigned prompt, unsigned decode);
++int dt_acquire(struct dt_client *c, unsigned maximum);
++/* Persistent: submit without waiting, then poll/wait for asynchronous grant. */
++int dt_request(struct dt_client *c, unsigned maximum);
++int dt_poll(struct dt_client *c);
++int dt_wait_grant(struct dt_client *c);
++int dt_members(struct dt_client *c, const uint32_t *tids, unsigned count);
++int dt_unmembers(struct dt_client *c);
++int dt_release(struct dt_client *c);
++/* After UNMEMBERS and restoring only the workers outside this subset. */
++int dt_shrink(struct dt_client *c);
++/* Return ith's assigned CPU, or -1 for shared/no-pinning grants. */
++int dt_cpu(const struct dt_client *c, unsigned ith);
++#endif
+--- /dev/null
++++ b/ggml/src/ggml-cpu/dynamic-control.h
+@@ -0,0 +1,64 @@
++/* Local SOCK_SEQPACKET protocol. Fixed-width, native-endian on one machine. */
++#ifndef DT_CONTROL_H
++#define DT_CONTROL_H
++#ifdef __VMLINUX_H__
++typedef __u64 uint64_t;
++typedef __u32 uint32_t;
++#else
++#include <stdint.h>
++#endif
++
++#define DT_MAGIC 0x44544752u
++#define DT_VERSION 4u
++#define DT_TEAMS 8
++#define DT_GRAPH_TEAMS 2
++#define DT_WORKERS 8
++#define DT_TIMEOUT_MS 30000
++
++enum dt_lifetime { DT_GRAPH = 0, DT_PERSISTENT = 1 };
++enum dt_allocation { DT_EQUAL = 0, DT_PREFILL_FIRST = 1 };
++/* Matches the backend hint (not the public llama enum, which has AUTO first). */
++enum dt_phase { DT_UNKNOWN = 0, DT_PREFILL = 1, DT_DECODE = 2, DT_MIXED = 3 };
++static inline int dt_valid_phase(uint32_t phase, uint32_t prompt, uint32_t decode)
++{
++    return (phase == DT_PREFILL && prompt && !decode) ||
++           (phase == DT_DECODE && !prompt && decode) ||
++           (phase == DT_MIXED && prompt && decode);
++}
++
++enum dt_op {
++    DT_HELLO = 1,
++    DT_ACTIVITY,
++    DT_ACQUIRE,
++    DT_MEMBERS,
++    DT_RELEASE,
++    /* Disable BPF placement while retaining the graph's CPU grant. */
++    DT_UNMEMBERS,
++    /* Server notifications have request=0. HELLO.pin negotiates lifetime. */
++    DT_GRANT,
++    DT_REVOKE,
++    DT_PHASE,
++    /* Quiescent partial return: keep a nonempty subset, in the same epoch. */
++    DT_SHRINK,
++};
++struct dt_msg {
++    uint32_t magic, version, op, status;
++    uint32_t slot, workers, max_workers, pin;
++    uint64_t request, session, epoch, cpu_mask;
++    /* REVOKE.workers/cpu_mask describe the target, not the still-held grant.
++       SHRINK.workers/cpu_mask describe the retained subset; ACK commits it. */
++    uint32_t tids[DT_WORKERS];
++    /* HELLO returns allocation; ACQUIRE/PHASE carry work intent. */
++    uint32_t allocation, phase, prompt_tokens, decode_tokens;
++};
++
++/* Loader is the only writer; BPF only reads. ready is published after members. */
++struct dt_bpf_grant {
++    uint64_t session, epoch, cpu_mask;
++    uint32_t tgid, workers, ready, pin;
++};
++struct dt_bpf_member {
++    uint64_t session, epoch, start_boottime;
++    uint32_t slot, cpu;
++};
++#endif
+--- /dev/null
++++ b/ggml/src/ggml-cpu/dynamic-worker-team.c
+@@ -0,0 +1,181 @@
++#define _GNU_SOURCE
++#include "dynamic-worker-team.h"
++#include <errno.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++struct dt_worker {
++    uint32_t tid;
++    cpu_set_t original;
++    atomic_uint refs;
++    bool alive;
++};
++static pthread_key_t worker_key;
++static pthread_once_t key_once = PTHREAD_ONCE_INIT;
++static int key_error;
++/* Separate from the graph mutex: libgomp can join retiring threads while the
++ * graph mutex is held. Holding this lock prevents a TLS destructor from exiting
++ * the thread (and thus prevents TID reuse) during a remote affinity restoration. */
++static pthread_mutex_t registry = PTHREAD_MUTEX_INITIALIZER;
++
++static void drop(struct dt_worker *worker)
++{
++    if (worker && atomic_fetch_sub_explicit(&worker->refs, 1, memory_order_acq_rel) == 1)
++        free(worker);
++}
++static void exited(void *value)
++{
++    struct dt_worker *worker = value;
++    pthread_mutex_lock(&registry);
++    worker->alive = false;
++    pthread_mutex_unlock(&registry);
++    drop(worker);
++}
++static void create_key(void) { key_error = pthread_key_create(&worker_key, exited); }
++
++int dt_team_init(struct dt_team *team)
++{
++    memset(team, 0, sizeof(*team));
++    /* External OpenMP placement competes with this experiment's ownership. */
++    const char *bind = getenv("OMP_PROC_BIND");
++    if ((bind && strcasecmp(bind, "false")) || getenv("GOMP_CPU_AFFINITY") || getenv("OMP_PLACES")) {
++        errno = EINVAL; return -1;
++    }
++    return sched_getaffinity(0, sizeof(team->allowed), &team->allowed);
++}
++int dt_team_observe(struct dt_team *team, unsigned ith)
++{
++    if (ith >= DT_WORKERS || team->current[ith]) { errno = EINVAL; return -1; }
++    pthread_once(&key_once, create_key);
++    if (key_error) { errno = key_error; return -1; }
++    struct dt_worker *worker = pthread_getspecific(worker_key);
++    if (!worker) {
++        worker = calloc(1, sizeof(*worker));
++        if (!worker) return -1;
++        worker->tid = syscall(SYS_gettid);
++        atomic_init(&worker->refs, 1); /* TLS owns one reference until exit. */
++        worker->alive = true;
++        if (sched_getaffinity(0, sizeof(worker->original), &worker->original)) {
++            free(worker); return -1;
++        }
++        /* Newly created libgomp workers inherit the pinned master's mask.
++         * A persistent team has one baseline, captured before any grant. */
++        if (team->count && CPU_COUNT(&worker->original) == 1)
++            worker->original = team->allowed;
++        int rc = pthread_setspecific(worker_key, worker);
++        if (rc) { free(worker); errno = rc; return -1; }
++    }
++    atomic_fetch_add_explicit(&worker->refs, 1, memory_order_relaxed);
++    team->current[ith] = worker;
++    return 0;
++}
++static int unpublish(struct dt_team *team, struct dt_client *client)
++{
++    /* Never widen affinity while the BPF membership is still published. */
++    if (team->registered && dt_unmembers(client)) return -1;
++    team->registered = false;
++    return 0;
++}
++static int restore(struct dt_worker *worker)
++{
++    int result = 0;
++    pthread_mutex_lock(&registry);
++    if (worker->alive)
++        result = sched_setaffinity(worker->tid, sizeof(worker->original), &worker->original);
++    pthread_mutex_unlock(&registry);
++    return result;
++}
++static int trim(struct dt_team *team, uint64_t keep)
++{
++    int result = 0;
++    for (unsigned i = 0; i < team->count; i++) {
++        struct dt_worker *worker = team->members[i];
++        if (worker && !(keep & (1ULL << team->cpus[i])) && restore(worker)) result = -1;
++    }
++    if (result) return -1; /* Keep ownership; caller must fail closed. */
++    for (unsigned i = 0; i < team->count; i++) {
++        if (keep & (1ULL << team->cpus[i])) continue;
++        drop(team->members[i]);
++        team->members[i] = NULL;
++    }
++    /* Keep index slots until the next actual OpenMP team is observed. */
++    if (!keep) team->count = 0;
++    return 0;
++}
++int dt_team_detach(struct dt_team *team, struct dt_client *client)
++{
++    if (unpublish(team, client)) return -1;
++    return trim(team, 0);
++}
++int dt_team_revoke(struct dt_team *team, struct dt_client *client)
++{
++    if (!client->held || !client->revoked) { errno = EINVAL; return -1; }
++    const struct dt_msg *target = &client->revoke;
++    if (client->grant.pin && target->workers && target->workers < client->grant.workers &&
++        !(target->cpu_mask & ~client->grant.cpu_mask)) {
++        if (unpublish(team, client) || trim(team, target->cpu_mask)) return -1;
++        return dt_shrink(client);
++    }
++    if (dt_team_detach(team, client)) return -1;
++    return dt_release(client);
++}
++int dt_team_commit(struct dt_team *team, struct dt_client *client, unsigned count)
++{
++    if (!client->held || !count || count > client->grant.workers) { errno = EINVAL; return -1; }
++    bool same = team->registered && count == team->count;
++    for (unsigned i = 0; i < count; i++) {
++        if (!team->current[i]) { errno = EINVAL; return -1; }
++        same &= team->current[i] == team->members[i] && team->cpus[i] == dt_cpu(client, i);
++    }
++    if (same) {
++        for (unsigned i = 0; i < count; i++) {
++            drop(team->current[i]);
++            team->current[i] = NULL;
++        }
++        return 0;
++    }
++    if (unpublish(team, client)) return -1;
++    bool retained[DT_WORKERS] = {0};
++    /* Match live worker identity AND destination CPU, not only team width.
++       The allocator keeps the low-CPU prefix on shrink, as does dt_cpu(). */
++    for (unsigned old = 0; old < team->count; old++) {
++        struct dt_worker *worker = team->members[old];
++        if (!worker) continue;
++        bool keep = false;
++        for (unsigned i = 0; i < count; i++) {
++            if (worker == team->current[i] && team->cpus[old] == dt_cpu(client, i)) {
++                retained[i] = keep = true;
++                break;
++            }
++        }
++        if (!keep && restore(worker)) return -1;
++    }
++    for (unsigned i = 0; i < team->count; i++) {
++        drop(team->members[i]);
++        team->members[i] = NULL;
++    }
++    team->count = 0;
++    uint32_t tids[DT_WORKERS] = {0};
++    for (unsigned i = 0; i < count; i++) {
++        struct dt_worker *worker = team->current[i];
++        int cpu = dt_cpu(client, i);
++        if (cpu < 0 || !CPU_ISSET(cpu, &team->allowed) || !CPU_ISSET(cpu, &worker->original)) {
++            errno = EINVAL; return -1;
++        }
++        cpu_set_t target;
++        CPU_ZERO(&target); CPU_SET(cpu, &target);
++        if (!retained[i] && sched_setaffinity(worker->tid, sizeof(target), &target)) return -1;
++        tids[i] = worker->tid;
++        team->members[i] = worker;
++        team->cpus[i] = cpu;
++        team->current[i] = NULL;
++        team->count++;
++    }
++    if (dt_members(client, tids, count)) return -1;
++    team->registered = true;
++    return 0;
++}
+--- /dev/null
++++ b/ggml/src/ggml-cpu/dynamic-worker-team.h
+@@ -0,0 +1,24 @@
++#ifndef DT_WORKER_TEAM_H
++#define DT_WORKER_TEAM_H
++#include "dynamic-client.h"
++#include <sched.h>
++
++struct dt_worker;
++struct dt_team {
++    cpu_set_t allowed;
++    struct dt_worker *members[DT_WORKERS], *current[DT_WORKERS];
++    int cpus[DT_WORKERS];
++    unsigned count;
++    bool registered;
++};
++/* Call before the first grant/pin on the inference thread. */
++int dt_team_init(struct dt_team *team);
++/* Each actual OpenMP thread records itself, then ALL threads barrier. */
++int dt_team_observe(struct dt_team *team, unsigned ith);
++/* Single thread calls commit; ALL threads barrier before computing. */
++int dt_team_commit(struct dt_team *team, struct dt_client *client, unsigned count);
++/* Only at a quiescent graph boundary or while every team member is at a barrier. */
++int dt_team_detach(struct dt_team *team, struct dt_client *client);
++/* At a graph boundary: retain bindings on a pure shrink, fully release otherwise. */
++int dt_team_revoke(struct dt_team *team, struct dt_client *client);
++#endif
+--- /dev/null
++++ b/ggml/src/ggml-cpu/dynamic-grant-client.c
+@@ -0,0 +1,206 @@
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include "dynamic-grant-client.h"
++#include "dynamic-client.h"
++#include "dynamic-worker-team.h"
++#include <errno.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static struct {
++    pthread_mutex_t mutex;
++    struct dt_client client;
++    bool initialized;
++    bool configured;
++    bool active;
++    bool in_graph;
++    bool members;
++    bool failed;
++    bool team_initialized;
++    bool retain_shrink;
++    struct dt_team team;
++} runtime = {
++    .mutex = PTHREAD_MUTEX_INITIALIZER,
++    .client = {.fd = -1},
++    .retain_shrink = true,
++};
++
++static int release_persistent(void) {
++    if (!runtime.client.held) return 0;
++    if (dt_team_detach(&runtime.team, &runtime.client)) return -1;
++    return dt_release(&runtime.client);
++}
++
++static int revoke_persistent(void) {
++    return runtime.retain_shrink ? dt_team_revoke(&runtime.team, &runtime.client)
++                                 : release_persistent();
++}
++
++static int initialize_locked(void) {
++    if (!runtime.initialized) {
++        const char * path = getenv("GGML_DYNAMIC_THREADS_SOCKET");
++        const char * retain = getenv("GGML_DYNAMIC_THREADS_RETAIN_SHRINK");
++        runtime.initialized = true;
++        /* Experimental ablation only. Production/default behavior retains the
++         * surviving worker bindings; exactly "0" restores full release. */
++        runtime.retain_shrink = retain == NULL || strcmp(retain, "0") != 0;
++        runtime.configured = path != NULL && path[0] != '\0';
++        if (runtime.configured) {
++            if (dt_connect(&runtime.client, path, DT_WORKERS)) {
++                fprintf(stderr, "GGML_DYNAMIC_THREADS connect failed: %s\n", strerror(errno));
++                runtime.failed = true;
++                return -1;
++            }
++            fprintf(stderr, "GGML_DYNAMIC_THREADS connected slot=%u session=%llu\n",
++                    runtime.client.slot, (unsigned long long) runtime.client.session);
++        }
++    }
++    return runtime.failed ? -1 : 0;
++}
++
++bool ggml_dynamic_threads_set_active(bool active) {
++    pthread_mutex_lock(&runtime.mutex);
++    int result = initialize_locked();
++    if (!result && runtime.configured && runtime.active != active) {
++        if (dt_activity(&runtime.client, active)) {
++            fprintf(stderr, "GGML_DYNAMIC_THREADS activity failed: %s\n", strerror(errno));
++            runtime.failed = true;
++            result = -1;
++        } else {
++            runtime.active = active;
++            if (!active && runtime.client.lifetime == DT_PERSISTENT && release_persistent()) {
++                runtime.failed = true;
++                result = -1;
++            }
++        }
++    }
++    pthread_mutex_unlock(&runtime.mutex);
++    return result == 0;
++}
++
++int ggml_dynamic_threads_begin(unsigned maximum, unsigned * workers,
++                              uint32_t backend_phase, uint32_t prompt_tokens, uint32_t decode_tokens) {
++    if (workers == NULL || maximum == 0) {
++        errno = EINVAL;
++        return -1;
++    }
++    const unsigned effective = *workers;
++    if (!effective || effective > maximum) { errno = EINVAL; return -1; }
++    pthread_mutex_lock(&runtime.mutex);
++    if (initialize_locked() || runtime.in_graph) {
++        pthread_mutex_unlock(&runtime.mutex);
++        errno = runtime.in_graph ? EBUSY : EIO;
++        return -1;
++    }
++    if (!runtime.configured || !runtime.active) {
++        pthread_mutex_unlock(&runtime.mutex);
++        return 0;
++    }
++    if (maximum > DT_WORKERS) {
++        runtime.failed = true;
++        pthread_mutex_unlock(&runtime.mutex);
++        errno = EINVAL;
++        return -1;
++    }
++    int error = 0;
++    if (runtime.client.lifetime == DT_PERSISTENT) {
++        if (!runtime.team_initialized) {
++            error = dt_team_init(&runtime.team);
++            runtime.team_initialized = !error;
++        }
++        /* Report NEW intent before releasing/waiting: graph end never waits. */
++        if (!error) error = dt_phase(&runtime.client, backend_phase, prompt_tokens, decode_tokens);
++        if (!error) error = dt_poll(&runtime.client);
++        if (!error && runtime.client.revoked) error = revoke_persistent();
++        if (!error && !runtime.client.held && !runtime.client.pending)
++            error = dt_request(&runtime.client, maximum);
++        if (!error) error = dt_wait_grant(&runtime.client);
++        /* A grant can already be revoked when delivered. Never compute with it. */
++        while (!error && runtime.client.revoked) {
++            error = revoke_persistent();
++            if (!error) error = dt_wait_grant(&runtime.client);
++        }
++    } else {
++        error = dt_acquire(&runtime.client, effective);
++    }
++    if (error) {
++        fprintf(stderr, "GGML_DYNAMIC_THREADS acquire failed: %s\n", strerror(errno));
++        runtime.failed = true;
++        pthread_mutex_unlock(&runtime.mutex);
++        return -1;
++    }
++    runtime.in_graph = true;
++    *workers = runtime.client.grant.workers < effective ? runtime.client.grant.workers : effective;
++    /* Keep the mutex held until end(), serializing graph and activity messages. */
++    return 1;
++}
++
++bool ggml_dynamic_threads_in_graph(void) {
++    return runtime.in_graph;
++}
++
++bool ggml_dynamic_threads_persistent(void) {
++    return runtime.in_graph && runtime.client.lifetime == DT_PERSISTENT;
++}
++
++int ggml_dynamic_threads_observe(unsigned ith) {
++    return dt_team_observe(&runtime.team, ith);
++}
++void ggml_dynamic_threads_fail(void) { runtime.failed = true; }
++
++int ggml_dynamic_threads_register(const uint32_t * tids, unsigned count) {
++    if (ggml_dynamic_threads_persistent()) {
++        int result = dt_team_commit(&runtime.team, &runtime.client, count);
++        if (result) {
++            fprintf(stderr, "GGML_DYNAMIC_THREADS persistent team failed: %s\n", strerror(errno));
++            runtime.failed = true;
++        }
++        return result;
++    }
++    if (!runtime.in_graph || runtime.members || count != runtime.client.grant.workers ||
++            dt_members(&runtime.client, tids, count)) {
++        fprintf(stderr, "GGML_DYNAMIC_THREADS member registration failed: %s\n", strerror(errno));
++        runtime.failed = true;
++        return -1;
++    }
++    runtime.members = true;
++    return 0;
++}
++
++int ggml_dynamic_threads_unregister(void) {
++    if (ggml_dynamic_threads_persistent()) return 0;
++    if (!runtime.in_graph || !runtime.members) return 0;
++    if (dt_unmembers(&runtime.client)) {
++        fprintf(stderr, "GGML_DYNAMIC_THREADS member removal failed: %s\n", strerror(errno));
++        runtime.failed = true;
++        return -1;
++    }
++    runtime.members = false;
++    return 0;
++}
++
++int ggml_dynamic_threads_cpu(unsigned ith) {
++    return runtime.in_graph ? dt_cpu(&runtime.client, ith) : -1;
++}
++
++int ggml_dynamic_threads_end(void) {
++    if (!runtime.in_graph) return 0;
++    int result = runtime.failed ? -1 : 0;
++    if (!result && ggml_dynamic_threads_persistent()) {
++        result = dt_poll(&runtime.client);
++        if (!result && runtime.client.revoked) result = revoke_persistent();
++    } else if (!result) {
++        result = ggml_dynamic_threads_unregister();
++        if (!result) result = dt_release(&runtime.client);
++    }
++    if (result) {
++        fprintf(stderr, "GGML_DYNAMIC_THREADS release failed: %s\n", strerror(errno));
++        runtime.failed = true;
++    }
++    runtime.in_graph = false;
++    pthread_mutex_unlock(&runtime.mutex);
++    return result;
++}
+--- /dev/null
++++ b/ggml/src/ggml-cpu/dynamic-grant-client.h
+@@ -0,0 +1,28 @@
++#ifndef GGML_DYNAMIC_GRANT_CLIENT_H
++#define GGML_DYNAMIC_GRANT_CLIENT_H
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* All functions are no-ops when GGML_DYNAMIC_THREADS_SOCKET is unset. */
++bool ggml_dynamic_threads_set_active(bool active);
++/* Returns 1 for an acquired grant, 0 when disabled/inactive, -1 on failure. */
++int  ggml_dynamic_threads_begin(unsigned maximum, unsigned * workers,
++                               uint32_t backend_phase, uint32_t prompt_tokens, uint32_t decode_tokens);
++bool ggml_dynamic_threads_in_graph(void);
++bool ggml_dynamic_threads_persistent(void);
++int  ggml_dynamic_threads_observe(unsigned ith);
++void ggml_dynamic_threads_fail(void);
++int  ggml_dynamic_threads_register(const uint32_t * tids, unsigned count);
++int  ggml_dynamic_threads_unregister(void);
++int  ggml_dynamic_threads_cpu(unsigned ith);
++int  ggml_dynamic_threads_end(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
