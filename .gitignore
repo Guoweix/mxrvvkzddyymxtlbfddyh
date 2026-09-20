@@ -8,6 +8,7 @@ src/scx_llm_pin/vmlinux.btf
 src/scx_llm_pin/scx_llm_pin.o
 src/scx_llm_pin/scx_llm_pin.bpf.o
 src/scx_llm_pin/llm_load.sh
+src/scx_llm_pin/rvv_team_exec
 src/scx_rvv_exclusive/scx_rvv_exclusive
 src/scx_rvv_exclusive/scx_rvv_exclusive.o
 src/scx_rvv_exclusive/scx_rvv_exclusive.bpf.o
