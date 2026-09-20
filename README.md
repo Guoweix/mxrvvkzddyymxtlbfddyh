@@ -1,28 +1,28 @@
-# RISC-V RVV LLM 调度实验平台
+# INFERSCHED：面向 RISC-V 的 LLM 推理调度器
 
-本项目面向 Milk-V Jupiter / SpacemiT K1 八核 RISC-V 平台，研究 Linux
-`sched_ext` 对 llama.cpp CPU 推理工作负载的调度优化。项目使用 eBPF 调度器识别
-执行 RVV 向量计算的 worker，并结合 CPU 分配、vector DSQ、长时间片以及
-llama.cpp 提供的 prefill/decode 阶段提示，改善多线程和多模型竞争时的调度行为。
+**INFERSCHED**（Inference Scheduler）是一套面向 RISC-V 平台的 Linux 调度方案：
+基于 `sched_ext`（eBPF）与一个用户态控制器，**指导并编排共置的多个 LLM 推理
+进程**（llama.cpp / llama-server）在八核 CPU 上的线程数与核心分配，改善多实例
+竞争时的首 token 延迟（TTFT）、解码吞吐（TPS）与尾延迟。
 
-仓库提供一套可复现的实验环境，包括 K1 Linux 6.6 的 sched_ext 补丁、llama.cpp
-用户态提示补丁、RVV-aware eBPF 调度器、低开销观测工具和 benchmark。
+仓库提供一套可复现的实验环境：K1 Linux 6.6 的 sched_ext 补丁、llama.cpp 运行时
+补丁、独立的 sched_ext 调度器与用户态控制器，以及 benchmark 与门禁脚本。
 
 ## 核心能力
 
 - **K1 sched_ext 内核支持**：将 sched_ext 移植到 K1 厂商 Linux 6.6，并补齐厂商树
   的调度器、cgroup、BTF、libbpf 和驱动构建兼容代码。
-- **RVV worker 识别**：根据任务的 RISC-V Vector 上下文状态和可配置 dirty 命中
-  阈值识别向量计算线程。
-- **Phase-aware dirty lease**：为每组 RVV worker 分配互不重复的 CPU，使用
-  per-team/per-CPU vector DSQ 和长时间片；普通 wakeup 重新进入 VDSQ，由 phase
-  hint 决定 A/B team 的消费顺序，并对 preferred wakeup 提供定向抢占。
-- **用户态调度提示**：llama.cpp 可通过 mmapable BPF map 注册 OpenMP worker，
-  并发布 `PREFILL`、`DECODE`、`MIXED` 和 `IDLE` 阶段。
-- **调度观测**：采集 RVV save/restore 候选、上下文切换、wake-to-run 延迟、
-  futex wait/wake 和 blocked time。
-- **可重复 benchmark**：支持 CFS、Linux affinity 和 sched_ext 策略对比，以及
-  单 llama-server、双 llama-server 异步竞争场景。
+- **动态线程与 CPU 授权**：控制器按需为处于活跃期的推理进程授予 worker 宽度与
+  CPU 掩码，并通过独立 sched_ext 程序把成员线程放置到授权核心。
+- **持续授权（persistent grant）**：稳定期跨 graph 持续持有授权，仅在分配变化时
+  协调，避免逐 graph 反复握手；支持异步 GRANT/REVOKE 与安全交接。
+- **阶段感知分配**：prefill 优先、decode 保底核心，按 `PREFILL/DECODE/MIXED`
+  相位在 graph 边界安全交接。
+- **任务身份校验**：以 `start_boottime` 校验成员身份，避免 worker TID 复用导致的
+  误放置。
+- **多进程共置**：支持最多 8 个独立 llama-server 同时驻留与调度。
+- **可重复 benchmark 与门禁**：`run_benchmark` / `run_control_gate` /
+  `run_multi_benchmark` 覆盖 CFS、动态授权与多进程场景。
 
 ## 项目结构
 
