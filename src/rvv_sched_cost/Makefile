@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 
-# 统一从 tests/benchmark/config.sh 取配置（环境变量优先）。
-CFG := ../../tests/benchmark/config.sh
+# 统一从 tests/config.sh 取配置（环境变量优先）；其中相对路径以仓库根为基准。
+CFG := ../../tests/config.sh
+REPO := ../..
 cfgval = $(shell bash -c 'source $(CFG) >/dev/null 2>&1; printf "%s" "$$$(1)"')
+cfgpath = $(if $(call cfgval,$(1)),$(if $(filter /%,$(call cfgval,$(1))),$(call cfgval,$(1)),$(abspath $(REPO)/$(call cfgval,$(1)))),)
 
-ROOT ?= $(or $(call cfgval,TOOLCHAIN_ROOT),../../..)
+ROOT ?= $(or $(call cfgpath,TOOLCHAIN_ROOT),$(abspath ../../..))
 KERNEL_SRC ?= $(ROOT)/jupiter-buildroot/bsp-src/linux-6.6
 BUILDROOT_OUT ?= $(ROOT)/jupiter-buildroot/output/k1_v2
 BUILDROOT_DIR ?= $(ROOT)/jupiter-buildroot/buildroot

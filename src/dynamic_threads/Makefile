@@ -1,8 +1,10 @@
-# 统一从 tests/benchmark/config.sh 取配置（环境变量优先）。
-CFG := ../../tests/benchmark/config.sh
+# 统一从 tests/config.sh 取配置（环境变量优先）；其中相对路径以仓库根为基准。
+CFG := ../../tests/config.sh
+REPO := ../..
 cfgval = $(shell bash -c 'source $(CFG) >/dev/null 2>&1; printf "%s" "$$$(1)"')
+cfgpath = $(if $(call cfgval,$(1)),$(if $(filter /%,$(call cfgval,$(1))),$(call cfgval,$(1)),$(abspath $(REPO)/$(call cfgval,$(1)))),)
 
-ROOT ?= $(or $(call cfgval,TOOLCHAIN_ROOT),../../..)
+ROOT ?= $(or $(call cfgpath,TOOLCHAIN_ROOT),$(abspath ../../..))
 BUILD := build
 KERNEL := $(ROOT)/jupiter-buildroot/bsp-src/linux-6.6
 HOST := $(ROOT)/jupiter-buildroot/output/k1_v2/host
@@ -22,7 +24,7 @@ SSHPASS ?= sshpass -p $(BOARD_PASS)
 TESTS := ../../tests/dynamic_threads
 # phase_probe 需要“已应用 0001/0002/llama-dynamic.patch”的 llama.cpp ggml-cpu 目录，
 # 默认取 config.sh 的 LLAMA_CPU_SRC，可用环境变量覆盖。
-LLAMA_CPU_SRC ?= $(or $(call cfgval,LLAMA_CPU_SRC),../../../kbuild/llama.cpp/ggml/src/ggml-cpu)
+LLAMA_CPU_SRC ?= $(or $(call cfgpath,LLAMA_CPU_SRC),$(abspath ../../../kbuild/llama.cpp/ggml/src/ggml-cpu))
 DYNAMIC_CPU := $(LLAMA_CPU_SRC)
 
 BPF_FLAGS := -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_riscv -I$(BUILD) -I$(KERNEL)/tools/lib -I$(HOST)/include

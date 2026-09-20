@@ -32,12 +32,11 @@ LLAMA_SRC = SRC / "llama"
 LLAMA_BIN = config_env.path(
     "DT_LLAMA_BIN", str(SRC / "llama" / "build-dynamic-riscv" / "bin")
 )
-BENCH = HERE.parent / "benchmark" / "dual_model"
+BENCH = HERE
 WORKLOAD = BENCH / "workload.py"
 PROMPTS = BENCH / "prompts.json"
-sys.path.insert(0, str(WORKLOAD.parent))
+sys.path.insert(0, str(BENCH))
 from metrics import calculate_run_metrics  # noqa: E402
-from scheduler_stats import validate_scheduler_log  # noqa: E402
 
 DEFAULT_CASES = (
     "cfs_baseline",
@@ -51,7 +50,6 @@ DEFAULT_CASES = (
 ALL_CASES = DEFAULT_CASES + (
     "scx_dynamic_persistent",
     "cfs_dynamic_persistent",
-    "scx_phase_dirty_lease",
     "scx_dynamic_persistent_phase",
     "scx_dynamic_persistent_phase_guard",
     "scx_dynamic_persistent_phase_reserve1",
@@ -73,7 +71,6 @@ CASE_CONFIG = {
     "cfs_dynamic": ("dynamic", False, True),
     "scx_dynamic_persistent": ("dynamic", True, True),
     "cfs_dynamic_persistent": ("dynamic", False, True),
-    "scx_phase_dirty_lease": (None, False, False),
     "scx_dynamic_persistent_phase": ("dynamic", True, True),
     "scx_dynamic_persistent_phase_guard": ("dynamic", True, True),
     "scx_dynamic_persistent_phase_reserve1": ("dynamic", True, True),
@@ -309,7 +306,6 @@ def main():
     parser.add_argument("--injection-token", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260917)
     parser.add_argument("--server-timeout", type=float, default=180)
-    parser.add_argument("--phase-scheduler", default="/tmp/scx-nteam/scx_llm_pin")
     parser.add_argument(
         "--decode-wait-ms",
         type=int,
@@ -446,13 +442,8 @@ def main():
             or not (BUILD / "dt_controller").is_file()
         ):
             raise RuntimeError("missing RISC-V binaries")
-        require_phase = "scx_phase_dirty_lease" in cases
-        phase_probe = (
-            f"; test -x {shlex.quote(args.phase_scheduler)}" if require_phase else ""
-        )
         preflight = remote(
-            "cat /sys/kernel/debug/sched/ext; "
-            f"test -f {shlex.quote(args.model)}{phase_probe}"
+            f"cat /sys/kernel/debug/sched/ext; test -f {shlex.quote(args.model)}"
         )
         if not re.search(r"^enabled\s*:\s*0\s*$", preflight, re.M):
             raise RuntimeError("sched_ext is already active")
@@ -499,7 +490,6 @@ def main():
             prefix = f"{remote_dir}/{case_index:02d}-{case}"
             sock = f"{prefix}.sock"
             controller_pid = None
-            phase_scheduler_pid = None
             server_pids = []
             try:
                 if mode:
@@ -528,8 +518,6 @@ def main():
                 )
                 if interface and not campaign["retain_shrink"][case]:
                     dynamic_env += "GGML_DYNAMIC_THREADS_RETAIN_SHRINK=0 "
-                if case == "scx_phase_dirty_lease":
-                    dynamic_env += "GGML_SCX_LEASE_HINT_PATH=/sys/fs/bpf/scx_rvv_dirty_lease/workers "
                 common = (
                     f"env OMP_DYNAMIC=FALSE {dynamic_env}{loader} --library-path {libpath} "
                     f"{remote_dir}/bin/llama-server -m {shlex.quote(args.model)} --host 0.0.0.0 "
@@ -544,28 +532,6 @@ def main():
                     )
                     server_pids.append(pid)
                     health(port)
-                if case == "scx_phase_dirty_lease":
-                    command = (
-                        f"{shlex.quote(args.phase_scheduler)} "
-                        f"--team {server_pids[0]}:8:8:0xff --team {server_pids[1]}:8:8:0xff "
-                        "--strategy rvv_dirty --vector-slice-ms 100 --vector-local-window-ms 500 "
-                        "--dirty-threshold 2 --user-control active --user-cpu-map auto "
-                        "--team-gang prefill-lease --prefill-starvation-ms 1000 "
-                        "--vector-local-wakeup off --phase-wakeup-preempt on "
-                        f">{prefix}-controller.log 2>&1 </dev/null & echo $!"
-                    )
-                    phase_scheduler_pid = int(remote(command).strip())
-                    for _ in range(200):
-                        state = remote("cat /sys/kernel/debug/sched/ext", check=False)
-                        if re.search(r"^enabled\s*:\s*1\s*$", state, re.M):
-                            break
-                        if remote(f"kill -0 {phase_scheduler_pid}", check=False) != "":
-                            raise RuntimeError(
-                                "phase dirty lease scheduler exited during attach"
-                            )
-                        time.sleep(0.05)
-                    else:
-                        raise RuntimeError("phase dirty lease scheduler attach timeout")
                 # Exercise every configured slot before measurements.
                 for port in (args.port_a, args.port_b):
                     with concurrent.futures.ThreadPoolExecutor(
@@ -661,18 +627,6 @@ def main():
                         )
                     time.sleep(2)
             finally:
-                # The dirty-lease scheduler's final machine-readable line must be
-                # captured while both registered teams still exist.  Stopping the
-                # servers first makes that last line report rvv_team0/1=0 even
-                # though the measured workload ran with 8+8 workers.
-                if phase_scheduler_pid:
-                    remote(
-                        f"kill -TERM {phase_scheduler_pid} 2>/dev/null || true; n=0; "
-                        f"while kill -0 {phase_scheduler_pid} 2>/dev/null; do n=$((n+1)); "
-                        f"[ $n -lt 100 ] || {{ kill -KILL {phase_scheduler_pid}; break; }}; sleep .1; done",
-                        30,
-                        False,
-                    )
                 for pid in server_pids:
                     remote(f"kill -TERM {pid} 2>/dev/null || true", check=False)
                 for pid in server_pids:
@@ -771,22 +725,6 @@ def main():
                             raise RuntimeError(
                                 f"{case}: missing dynamic split masks in {item['path']}"
                             )
-                    run_dir = output_dir / item["path"]
-                    (run_dir / "summary.json").write_text(
-                        json.dumps(item, indent=2) + "\n"
-                    )
-            elif case == "scx_phase_dirty_lease":
-                diagnostics = validate_scheduler_log(
-                    case_dir / "controller.log", "phase-lease"
-                )
-                if not diagnostics["valid"]:
-                    raise RuntimeError(
-                        f"phase dirty lease validation failed: {diagnostics['checks']}"
-                    )
-                for item in campaign["runs"]:
-                    if item["case_index"] != case_index:
-                        continue
-                    item["scheduler"] = diagnostics
                     run_dir = output_dir / item["path"]
                     (run_dir / "summary.json").write_text(
                         json.dumps(item, indent=2) + "\n"

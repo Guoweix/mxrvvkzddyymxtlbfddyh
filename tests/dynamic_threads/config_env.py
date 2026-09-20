@@ -8,15 +8,15 @@ import os
 import subprocess
 from pathlib import Path
 
-CONFIG_SH = Path(__file__).resolve().parent.parent / "benchmark" / "config.sh"
+_HERE = Path(__file__).resolve()
+CONFIG_SH = _HERE.parent.parent / "config.sh"  # tests/config.sh
+REPO_ROOT = _HERE.parents[2]  # 仓库根目录（含 src/ 与 tests/）
 _KEYS = (
     "REMOTE_IP",
     "REMOTE_USER",
     "REMOTE_PASS",
     "REMOTE_PORT",
     "LLM_PATH",
-    "SCX_REMOTE_DIR",
-    "SCX_LEASE_CONTROL_DIR",
     "LLAMA_CPU_SRC",
     "DT_LLAMA_BIN",
 )
@@ -58,14 +58,14 @@ def value(name, fallback=""):
 
 
 def path(name, fallback=""):
-    """Like value(), but resolve a relative path against config.sh's directory."""
+    """Like value(), but resolve a relative path against the repo root."""
     raw = value(name, fallback)
     if not raw:
         return None
     candidate = Path(raw)
     if candidate.is_absolute():
         return candidate
-    return (CONFIG_SH.parent / raw).resolve()
+    return (REPO_ROOT / raw).resolve()
 
 
 def ensure_remote_password():
