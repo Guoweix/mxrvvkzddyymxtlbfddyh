@@ -56,6 +56,14 @@ export RVV_LOCAL_LIBELF="${RVV_LOCAL_LIBELF:-../../../jupiter-buildroot/output/k
 export RVV_REMOTE_DIR="${RVV_REMOTE_DIR:-/tmp/rvv_sched_cost}"
 
 # ========================================
+# dynamic_threads 本地路径
+# ========================================
+# 已应用 0001→0002→llama-dynamic.patch 的 llama.cpp ggml-cpu 目录（编译 phase_probe 用）。
+export LLAMA_CPU_SRC="${LLAMA_CPU_SRC:-../../../experiments/dynamic_threads/llama.cpp/ggml/src/ggml-cpu}"
+# 上述 llama.cpp 构建出的 patched runtime（run_benchmark/run_llama_gate 上传用）。
+export DT_LLAMA_BIN="${DT_LLAMA_BIN:-../../../experiments/dynamic_threads/llama.cpp/build-dynamic-riscv/bin}"
+
+# ========================================
 # 测试配置
 # ========================================
 export TEST_DURATION="${TEST_DURATION:-300}"       # 单轮测试窗口（秒，默认5分钟）

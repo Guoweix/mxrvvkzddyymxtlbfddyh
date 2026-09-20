@@ -10,14 +10,15 @@ import re
 import time
 import uuid
 
+import config_env
 from run_multi_benchmark import Remote, HERE, save, validate_controller
 from run_benchmark import BUILD
 
 
 def main():
     remote = Remote(
-        os.environ.get("REMOTE_IP", "192.168.3.67"),
-        os.environ.get("REMOTE_USER", "root"),
+        config_env.value("REMOTE_IP"),
+        config_env.value("REMOTE_USER"),
     )
     name = (
         "multi-probe-"

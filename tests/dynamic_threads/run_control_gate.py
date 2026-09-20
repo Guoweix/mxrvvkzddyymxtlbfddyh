@@ -14,6 +14,7 @@ import subprocess
 import sys
 import uuid
 
+import config_env
 from control_evidence import validate_cpu_ownership
 
 HERE = Path(__file__).resolve().parent
@@ -22,9 +23,10 @@ BUILD = SRC / "build"
 
 
 def main():
+    config_env.ensure_remote_password()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default=os.environ.get("REMOTE_IP", "192.168.3.67"))
-    parser.add_argument("--user", default=os.environ.get("REMOTE_USER", "root"))
+    parser.add_argument("--host", default=config_env.value("REMOTE_IP"))
+    parser.add_argument("--user", default=config_env.value("REMOTE_USER"))
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument(
         "--grant-lifetime", choices=("graph", "persistent"), default="graph"

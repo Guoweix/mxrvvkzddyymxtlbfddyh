@@ -21,6 +21,7 @@ import urllib.request
 import uuid
 
 from control_evidence import validate_cpu_ownership
+import config_env
 from run_benchmark import event_metrics, LLAMA_BIN, PROMPTS, BUILD
 
 HERE = Path(__file__).resolve().parent
@@ -385,10 +386,13 @@ def aggregate(runs):
 
 
 def main():
+    config_env.ensure_remote_password()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default=os.environ.get("REMOTE_IP", "192.168.3.67"))
-    parser.add_argument("--user", default=os.environ.get("REMOTE_USER", "root"))
-    parser.add_argument("--llm-path", default="/mnt/llm/llama")
+    parser.add_argument("--host", default=config_env.value("REMOTE_IP"))
+    parser.add_argument("--user", default=config_env.value("REMOTE_USER"))
+    parser.add_argument(
+        "--llm-path", default=config_env.value("LLM_PATH", "/mnt/llm/llama")
+    )
     parser.add_argument(
         "--model", default="/mnt/llm/llama/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
     )

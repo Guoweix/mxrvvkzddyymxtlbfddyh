@@ -22,14 +22,15 @@ import time
 import urllib.request
 import uuid
 
+import config_env
 from control_evidence import validate_cpu_ownership
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parent.parent / "src" / "dynamic_threads"
 BUILD = SRC / "build"
 LLAMA_SRC = SRC / "llama"
-LLAMA_BIN = Path(
-    os.environ.get("DT_LLAMA_BIN", str(SRC / "llama" / "build-dynamic-riscv" / "bin"))
+LLAMA_BIN = config_env.path(
+    "DT_LLAMA_BIN", str(SRC / "llama" / "build-dynamic-riscv" / "bin")
 )
 BENCH = HERE.parent / "benchmark" / "dual_model"
 WORKLOAD = BENCH / "workload.py"
@@ -286,9 +287,9 @@ def aggregate_runs(runs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default=os.environ.get("REMOTE_IP", "192.168.3.67"))
-    parser.add_argument("--user", default=os.environ.get("REMOTE_USER", "root"))
-    parser.add_argument("--password", default=os.environ.get("REMOTE_PASS", "bianbu"))
+    parser.add_argument("--host", default=config_env.value("REMOTE_IP"))
+    parser.add_argument("--user", default=config_env.value("REMOTE_USER"))
+    parser.add_argument("--password", default=config_env.value("REMOTE_PASS"))
     parser.add_argument("--llm-path", default="/mnt/llm/llama")
     parser.add_argument(
         "--model", default="/mnt/llm/llama/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"

@@ -12,9 +12,12 @@ CROSS_CC ?= $(CROSS_COMPILE)gcc
 CROSS_STRIP ?= $(CROSS_COMPILE)strip
 BPFTOOL ?= $(KERNEL_SRC)/tools/bpf/bpftool/bpftool
 
-BOARD_IP ?= 192.168.3.67
-BOARD_USER ?= root
-BOARD_PASS ?= bianbu
+# 统一从 tests/benchmark/config.sh 取板端信息（环境变量优先）。
+CFG := ../../tests/benchmark/config.sh
+cfgval = $(shell bash -c 'source $(CFG) >/dev/null 2>&1; printf "%s" "$$$(1)"')
+BOARD_IP ?= $(or $(call cfgval,REMOTE_IP),192.168.3.67)
+BOARD_USER ?= $(or $(call cfgval,REMOTE_USER),root)
+BOARD_PASS ?= $(or $(call cfgval,REMOTE_PASS),bianbu)
 BOARD ?= $(BOARD_USER)@$(BOARD_IP)
 SSH_OPTS ?= -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 SSHPASS ?= sshpass -p $(BOARD_PASS)
@@ -22,7 +25,7 @@ SSHPASS ?= sshpass -p $(BOARD_PASS)
 VMLINUX_BTF ?= vmlinux.btf
 VMLINUX_H ?= vmlinux.h
 LIBBPF_A ?= $(STAGING_DIR)/usr/lib/libbpf.a
-LLAMA_CPU_SRC ?= ../../../kbuild/llama.cpp/ggml/src/ggml-cpu
+LLAMA_CPU_SRC ?= $(or $(call cfgval,LLAMA_CPU_SRC),../../../kbuild/llama.cpp/ggml/src/ggml-cpu)
 
 BPF_CFLAGS := -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_riscv
 BPF_CFLAGS += -I. -I$(KERNEL_SRC)/tools/lib -I$(BUILDROOT_OUT)/host/include

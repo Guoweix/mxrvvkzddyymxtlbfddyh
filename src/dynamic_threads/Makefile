@@ -8,19 +8,21 @@ BPFTOOL ?= $(KERNEL)/tools/bpf/bpftool/bpftool
 CROSS_CC ?= $(HOST)/bin/riscv64-unknown-linux-gnu-gcc
 HOST_CC ?= cc
 
-# 板端信息：构建 BPF 需要 /sys/kernel/btf/vmlinux，可自动抓取。
-BOARD_IP ?= 192.168.3.67
-BOARD_USER ?= root
-BOARD_PASS ?= bianbu
+# 统一从 tests/benchmark/config.sh 取板端信息（环境变量优先）。
+CFG := ../../tests/benchmark/config.sh
+cfgval = $(shell bash -c 'source $(CFG) >/dev/null 2>&1; printf "%s" "$$$(1)"')
+BOARD_IP ?= $(or $(call cfgval,REMOTE_IP),192.168.3.67)
+BOARD_USER ?= $(or $(call cfgval,REMOTE_USER),root)
+BOARD_PASS ?= $(or $(call cfgval,REMOTE_PASS),bianbu)
 BOARD ?= $(BOARD_USER)@$(BOARD_IP)
 SSH_OPTS ?= -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 SSHPASS ?= sshpass -p $(BOARD_PASS)
 
 # 测试/探针源码位于 tests/dynamic_threads。
 TESTS := ../../tests/dynamic_threads
-# phase_probe 需要“已应用 0001/0002/llama-dynamic.patch”的 llama.cpp ggml-cpu 目录。
-# 默认指向开发树的 kbuild/llama.cpp；可用 LLAMA_CPU_SRC 覆盖为你的 llama.cpp 路径。
-LLAMA_CPU_SRC ?= ../../../kbuild/llama.cpp/ggml/src/ggml-cpu
+# phase_probe 需要“已应用 0001/0002/llama-dynamic.patch”的 llama.cpp ggml-cpu 目录，
+# 默认取 config.sh 的 LLAMA_CPU_SRC，可用环境变量覆盖。
+LLAMA_CPU_SRC ?= $(or $(call cfgval,LLAMA_CPU_SRC),../../../kbuild/llama.cpp/ggml/src/ggml-cpu)
 DYNAMIC_CPU := $(LLAMA_CPU_SRC)
 
 BPF_FLAGS := -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_riscv -I$(BUILD) -I$(KERNEL)/tools/lib -I$(HOST)/include
