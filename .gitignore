@@ -19,3 +19,8 @@ tests/benchmark/dual_model/__pycache__
 tests/benchmark/dual_model/results
 tests/benchmark/dual_model/*.log
 src/scx_llm_pin/rvv_lease_ctl
+src/dynamic_threads/build
+src/dynamic_threads/llama/build-dynamic-riscv
+tests/dynamic_threads/results
+tests/dynamic_threads/__pycache__
+tests/dynamic_threads/*.log
