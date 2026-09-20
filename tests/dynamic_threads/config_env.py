@@ -1,7 +1,8 @@
-"""Single source of truth for board/paths: reads tests/benchmark/config.sh.
+"""Single source of truth for board/paths: reads tests/config.sh.
 
-Lookup order is: process environment -> tests/benchmark/config.sh -> fallback.
+Lookup order is: process environment -> tests/config.sh -> fallback.
 Scripts should not define their own board defaults; set values in config.sh.
+Relative paths in config.sh are resolved against the repository root.
 """
 
 import os
