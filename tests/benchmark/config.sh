@@ -31,12 +31,12 @@ export RESTART_LLM="${RESTART_LLM:-1}"
 #   rvv_dirty_local_all
 export BENCHMARK_STRATEGY="${BENCHMARK_STRATEGY:-cfs}"
 export SCX_AUTO_DEPLOY="${SCX_AUTO_DEPLOY:-1}"
-export SCX_LOCAL_BIN="${SCX_LOCAL_BIN:-../scx_llm_pin/scx_llm_pin}"
-export SCX_LEASE_CTL_LOCAL_BIN="${SCX_LEASE_CTL_LOCAL_BIN:-../scx_llm_pin/rvv_lease_ctl}"
+export SCX_LOCAL_BIN="${SCX_LOCAL_BIN:-../../src/scx_llm_pin/scx_llm_pin}"
+export SCX_LEASE_CTL_LOCAL_BIN="${SCX_LEASE_CTL_LOCAL_BIN:-../../src/scx_llm_pin/rvv_lease_ctl}"
 export SCX_REMOTE_DIR="${SCX_REMOTE_DIR:-/tmp/scx_llm_pin}"
 export SCX_LEASE_CONTROL_DIR="${SCX_LEASE_CONTROL_DIR:-/sys/fs/bpf/scx_rvv_dirty_lease}"
 export SCX_LEASE_USER_CPU_MAP="${SCX_LEASE_USER_CPU_MAP:-auto}"
-export SCX_LEASE_HINT_LOCAL_LIB="${SCX_LEASE_HINT_LOCAL_LIB:-../../kbuild/llama.cpp/build-riscv-hint/bin/libggml-cpu.so.0.13.0}"
+export SCX_LEASE_HINT_LOCAL_LIB="${SCX_LEASE_HINT_LOCAL_LIB:-../../../kbuild/llama.cpp/build-riscv-hint/bin/libggml-cpu.so.0.13.0}"
 export SCX_LEASE_HINT_REMOTE_LIB="${SCX_LEASE_HINT_REMOTE_LIB:-$LLM_PATH/bin/libggml-cpu.so.0.13.0}"
 
 # ========================================
@@ -51,8 +51,8 @@ export RVV_TRACE_RVV_ONLY="${RVV_TRACE_RVV_ONLY:-0}"
 export RVV_TRACE_FUTEX="${RVV_TRACE_FUTEX:-0}"
 export RVV_TRACE_FUTEX_DETAIL="${RVV_TRACE_FUTEX_DETAIL:-0}"
 export RVV_TRACE_FUTEX_STACK="${RVV_TRACE_FUTEX_STACK:-0}"
-export RVV_LOCAL_BIN="${RVV_LOCAL_BIN:-../rvv_sched_cost/rvv_sched_cost}"
-export RVV_LOCAL_LIBELF="${RVV_LOCAL_LIBELF:-../../jupiter-buildroot/output/k1_v2/target/usr/lib/libelf-0.186.so}"
+export RVV_LOCAL_BIN="${RVV_LOCAL_BIN:-../../src/rvv_sched_cost/rvv_sched_cost}"
+export RVV_LOCAL_LIBELF="${RVV_LOCAL_LIBELF:-../../../jupiter-buildroot/output/k1_v2/target/usr/lib/libelf-0.186.so}"
 export RVV_REMOTE_DIR="${RVV_REMOTE_DIR:-/tmp/rvv_sched_cost}"
 
 # ========================================

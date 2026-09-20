@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 
-ROOT ?= ../..
+ROOT ?= ../../..
 KERNEL_SRC ?= $(ROOT)/jupiter-buildroot/bsp-src/linux-6.6
 BUILDROOT_OUT ?= $(ROOT)/jupiter-buildroot/output/k1_v2
 BUILDROOT_DIR ?= $(ROOT)/jupiter-buildroot/buildroot
