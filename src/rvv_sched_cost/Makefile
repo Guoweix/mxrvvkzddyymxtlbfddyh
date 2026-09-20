@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 
-ROOT ?= ../../..
+# 统一从 tests/benchmark/config.sh 取配置（环境变量优先）。
+CFG := ../../tests/benchmark/config.sh
+cfgval = $(shell bash -c 'source $(CFG) >/dev/null 2>&1; printf "%s" "$$$(1)"')
+
+ROOT ?= $(or $(call cfgval,TOOLCHAIN_ROOT),../../..)
 KERNEL_SRC ?= $(ROOT)/jupiter-buildroot/bsp-src/linux-6.6
 BUILDROOT_OUT ?= $(ROOT)/jupiter-buildroot/output/k1_v2
 BUILDROOT_DIR ?= $(ROOT)/jupiter-buildroot/buildroot
@@ -13,9 +17,6 @@ CROSS_CC ?= $(CROSS_COMPILE)gcc
 CROSS_STRIP ?= $(CROSS_COMPILE)strip
 BPFTOOL ?= $(KERNEL_SRC)/tools/bpf/bpftool/bpftool
 
-# 统一从 tests/benchmark/config.sh 取板端信息（环境变量优先）。
-CFG := ../../tests/benchmark/config.sh
-cfgval = $(shell bash -c 'source $(CFG) >/dev/null 2>&1; printf "%s" "$$$(1)"')
 BOARD_IP ?= $(or $(call cfgval,REMOTE_IP),192.168.3.67)
 BOARD_USER ?= $(or $(call cfgval,REMOTE_USER),root)
 BOARD_PASS ?= $(or $(call cfgval,REMOTE_PASS),bianbu)
@@ -35,6 +36,7 @@ BPF_CFLAGS += -I. -I$(KERNEL_SRC)/tools/lib -I$(BUILDROOT_OUT)/host/include
 USER_CFLAGS := -g -O2 -Wall -Wextra -I. -I$(STAGING_DIR)/usr/include -I$(BUILDROOT_OUT)/host/include
 USER_LDLIBS := $(LIBBPF_A) -lelf -lz
 
+.DELETE_ON_ERROR:
 .PHONY: all clean fetch-btf deploy target-libbpf host-bpftool strip
 
 all: rvv_sched_cost

@@ -1,4 +1,8 @@
-ROOT := ../../..
+# 统一从 tests/benchmark/config.sh 取配置（环境变量优先）。
+CFG := ../../tests/benchmark/config.sh
+cfgval = $(shell bash -c 'source $(CFG) >/dev/null 2>&1; printf "%s" "$$$(1)"')
+
+ROOT ?= $(or $(call cfgval,TOOLCHAIN_ROOT),../../..)
 BUILD := build
 KERNEL := $(ROOT)/jupiter-buildroot/bsp-src/linux-6.6
 HOST := $(ROOT)/jupiter-buildroot/output/k1_v2/host
@@ -7,10 +11,6 @@ CLANG ?= clang
 BPFTOOL ?= $(KERNEL)/tools/bpf/bpftool/bpftool
 CROSS_CC ?= $(HOST)/bin/riscv64-unknown-linux-gnu-gcc
 HOST_CC ?= cc
-
-# 统一从 tests/benchmark/config.sh 取板端信息（环境变量优先）。
-CFG := ../../tests/benchmark/config.sh
-cfgval = $(shell bash -c 'source $(CFG) >/dev/null 2>&1; printf "%s" "$$$(1)"')
 BOARD_IP ?= $(or $(call cfgval,REMOTE_IP),192.168.3.67)
 BOARD_USER ?= $(or $(call cfgval,REMOTE_USER),root)
 BOARD_PASS ?= $(or $(call cfgval,REMOTE_PASS),bianbu)
@@ -30,6 +30,7 @@ USER_FLAGS := -g -O2 -Wall -Wextra -Werror -I. -I$(BUILD) -I$(DYNAMIC_CPU) -I$(S
 USER_LIBS := $(SYSROOT)/usr/lib/libbpf.a $(SYSROOT)/usr/lib/libelf.a -lz
 HOST_FLAGS := -g -O2 -Wall -Wextra -Werror -I. -I$(DYNAMIC_CPU) -I$(TESTS)
 
+.DELETE_ON_ERROR:
 .PHONY: all host check-llama fetch-btf
 
 check-llama:

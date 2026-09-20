@@ -10,6 +10,12 @@ export REMOTE_PASS="${REMOTE_PASS:-bianbu}"
 export REMOTE_PORT="${REMOTE_PORT:-9090}"
 
 # ========================================
+# 工具链 / 内核源码根目录（其中包含 jupiter-buildroot）
+# ========================================
+# 默认仓库上三级（相对本文件所在目录）；jupiter-buildroot 在别处时改这里。
+export TOOLCHAIN_ROOT="${TOOLCHAIN_ROOT:-../../../}"
+
+# ========================================
 # LLM配置
 # ========================================
 export LLM_THREADS=8          # 单 token / generation 计算线程数 (-t)
