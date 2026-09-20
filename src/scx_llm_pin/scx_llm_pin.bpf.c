@@ -2,7 +2,11 @@
 /*
  * scx_llm_pin - RVV-aware sched_ext scheduler for LLM inference workloads.
  */
+#ifdef SCX_VMLINUX_HEADER
+#include SCX_VMLINUX_HEADER
+#else
 #include "vmlinux.h"
+#endif
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
@@ -17,11 +21,22 @@ char LICENSE[] SEC("license") = "GPL";
 #define BPF_ANY 0
 #endif
 
-// 导入 sched_ext kfuncs
+// sched_ext renamed the dispatch/consume helpers in newer kernels. Keep the
+// policy source shared while resolving the actual kfunc name at build time.
+#ifdef SCX_API_DSQ_INSERT
+void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id, u64 slice,
+			u64 enq_flags) __ksym;
+bool scx_bpf_dsq_move_to_local(u64 dsq_id) __ksym;
+#define scx_bpf_dispatch scx_bpf_dsq_insert
+#define scx_bpf_consume scx_bpf_dsq_move_to_local
+#else
 void scx_bpf_dispatch(struct task_struct *p, u64 dsq_id, u64 slice,
 		      u64 enq_flags) __ksym;
 bool scx_bpf_consume(u64 dsq_id) __ksym;
+#endif
+#ifndef SCX_API_DSQ_INSERT
 void scx_bpf_switch_all(void) __ksym;
+#endif
 s32 scx_bpf_pick_idle_cpu(const cpumask_t *cpus_allowed, u64 flags) __ksym;
 s32 scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
 void scx_bpf_kick_cpu(s32 cpu, u64 flags) __ksym;
@@ -162,13 +177,21 @@ struct {
 	__type(value, struct team_gang_state);
 } team_gang_state_map SEC(".maps");
 
-// 0=没有 vector worker，1/2=team 0/1。
+// 0=没有 vector worker，1..8=team 0..7。
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 8);
 	__type(key, __u32);
 	__type(value, __u32);
 } running_team_by_cpu SEC(".maps");
+
+// Keep the mask in generated BPF: older verifiers lose scalar bounds across
+// helpers taking stack keys, even when LLVM proves the original bounds.
+static __always_inline __u32 bounded_team(__u32 team)
+{
+    asm volatile("%0 &= 7" : "+r"(team));
+    return team;
+}
 
 static __always_inline __u32 task_tgid(struct task_struct *p)
 {
@@ -178,26 +201,22 @@ static __always_inline __u32 task_tgid(struct task_struct *p)
 	return (__u32)tgid;
 }
 
-// 返回 0/1 表示目标模型，-1 表示非目标任务。
+// Model identity is resolved from a bounded runtime team table.
 static __always_inline s32 llm_team_id(struct task_struct *p,
-				       const struct llm_pin_config *cfg)
+                                       const struct llm_pin_config *cfg)
 {
-	__u32 tgid;
-
-	if (!cfg || !cfg->target_tgid)
-		return -1;
-	tgid = task_tgid(p);
-	if (tgid == cfg->target_tgid)
-		return 0;
-	if (cfg->target_tgid2 && tgid == cfg->target_tgid2)
-		return 1;
-	return -1;
+    __u32 tgid = task_tgid(p);
+    if (!cfg) return -1;
+    for (__u32 i = 0; i < RVV_LEASE_CONTROL_TEAMS; i++)
+        if (i < cfg->team_count && cfg->teams[i].tgid == tgid) return i;
+    return -1;
 }
 
 static __always_inline __u32 team_target_tgid(
-	const struct llm_pin_config *cfg, __u32 team)
+    const struct llm_pin_config *cfg, __u32 team)
 {
-	return team == 0 ? cfg->target_tgid : cfg->target_tgid2;
+    return team < RVV_LEASE_CONTROL_TEAMS && team < cfg->team_count ?
+        cfg->teams[bounded_team(team)].tgid : 0;
 }
 
 static __always_inline bool is_rvv_dirty_strategy(__u32 strategy)
@@ -223,11 +242,11 @@ static __always_inline bool user_preference_active(
 	__u32 team_plus1;
 
 	if (!cfg || cfg->user_control_mode != RVV_LEASE_CONTROL_ACTIVE ||
-	    !cfg->target_tgid2 || !cfg->user_preferred_until_ns ||
+	    cfg->team_count < 2 || !cfg->user_preferred_until_ns ||
 	    cfg->user_preferred_until_ns <= now)
 		return false;
 	team_plus1 = cfg->user_preferred_team_plus1;
-	if (!team_plus1 || team_plus1 > RVV_LEASE_CONTROL_TEAMS)
+	if (!team_plus1 || team_plus1 > cfg->team_count)
 		return false;
 	*preferred_team = team_plus1 - 1;
 	return true;
@@ -244,6 +263,11 @@ static __always_inline __u32 task_pid(struct task_struct *p)
 static __always_inline unsigned long read_vs_state(struct task_struct *task,
 						   bool *ok)
 {
+#ifdef SCX_ARCH_X86
+	(void)task;
+	*ok = false;
+	return 0;
+#else
 	struct pt_regs *regs;
 	unsigned long status;
 
@@ -255,6 +279,7 @@ static __always_inline unsigned long read_vs_state(struct task_struct *task,
 	status = BPF_CORE_READ(regs, status);
 	*ok = true;
 	return status & RVV_SR_VS;
+#endif
 }
 
 static __always_inline bool cpu_in_mask(s32 cpu, __u32 cpu_mask)
@@ -277,129 +302,80 @@ static __always_inline struct rvv_task_class *get_rvv_task_class(__u32 tid)
 	return bpf_map_lookup_elem(&rvv_task_classes, &tid);
 }
 
-struct lease_worker_snapshot {
-	__u32 tid;
-	__u32 tgid;
-	__u32 ith;
-	__u32 n_threads;
-	__u64 session_id;
-};
-
-static __always_inline bool read_lease_worker_slot(
-	const struct rvv_lease_worker_page *page, __u32 index,
-	struct lease_worker_snapshot *out)
+static __attribute__((noinline)) bool worker_slot_matches(
+    const struct rvv_lease_worker_page *page, __u32 tid, __u32 ith,
+    __u64 epoch, __u32 count)
 {
-	const struct rvv_lease_worker_slot *slot;
-	__u32 sequence;
-
-	if (!page || index >= RVV_LEASE_CONTROL_WORKERS)
-		return false;
-	slot = &page->workers[index];
-	sequence = slot->sequence;
-	if (!sequence || (sequence & 1U))
-		return false;
-	out->tid = slot->tid;
-	out->tgid = slot->tgid;
-	out->ith = slot->ith;
-	out->n_threads = slot->n_threads;
-	out->session_id = slot->session_id;
-	return sequence == slot->sequence;
+    ith &= RVV_LEASE_MAX_ACTIVE_WORKERS - 1;
+    const struct rvv_lease_worker_slot *slot = &page->workers[ith];
+    __u32 seq = slot->sequence;
+    if (!seq || (seq & 1)) return false;
+    bool match = slot->tid == tid && slot->tgid == page->header.target_tgid &&
+        slot->ith == ith && slot->n_threads == count &&
+        slot->session_id == page->header.session_id && slot->membership_epoch == epoch;
+    asm volatile("" ::: "memory");
+    return match && seq == slot->sequence;
 }
 
-// 2=complete page and explicit non-member, 1=registered worker,
-// 0=valid but incomplete page, -1=invalid/unavailable page.
-static __always_inline int apply_user_worker_hint(
-	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
-	struct rvv_task_class *state, __u32 tid, __u32 team)
+// Returns member (1), complete non-member (2), incomplete (0), unavailable (-1),
+// or an invalid runtime worker count (-2). Read the hint and slots coherently.
+static __attribute__((noinline)) int apply_user_worker_hint(
+    const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
+    struct rvv_task_class *state, __u32 tid, __u32 team)
 {
-	struct rvv_lease_worker_page *page;
-	struct lease_worker_snapshot slot = {};
-	__u32 allowed_mask;
-	__u32 target_tgid;
-	__u32 key = team;
-	__u32 cpu;
-	__u32 valid_slots = 0;
-
-	if (!cfg || !state || team >= RVV_LEASE_CONTROL_TEAMS ||
-	    cfg->user_control_mode == RVV_LEASE_CONTROL_OFF)
-		return -1;
-	target_tgid = team_target_tgid(cfg, team);
-	if (stats)
-		__sync_fetch_and_add(&stats->user_hint_classification_reads, 1);
-	page = bpf_map_lookup_elem(&user_worker_map, &key);
-	if (!page || page->header.magic != RVV_LEASE_CONTROL_MAGIC ||
-	    page->header.abi_version != RVV_LEASE_CONTROL_ABI_VERSION ||
-	    !page->header.active || page->header.team_id != team ||
-	    page->header.target_tgid != target_tgid ||
-	    page->header.max_workers != RVV_LEASE_CONTROL_WORKERS ||
-	    !cfg->user_session_id ||
-	    page->header.session_id != cfg->user_session_id) {
-		if (stats)
-			__sync_fetch_and_add(&stats->user_hint_fallbacks, 1);
-		return -1;
-	}
-
-#define TRY_WORKER_SLOT(index) do {                                           \
-		if (!read_lease_worker_slot(page, (index), &slot))               \
-			break;                                                    \
-		if (slot.tgid != target_tgid || slot.ith != (index) ||            \
-		    slot.n_threads != RVV_LEASE_CONTROL_WORKERS ||                \
-		    slot.session_id != cfg->user_session_id) {                    \
-			if (slot.tid == tid && stats)                               \
-				__sync_fetch_and_add(&stats->user_hint_invalid_workers, 1); \
-			break;                                                        \
-		}                                                                  \
-		valid_slots++;                                                     \
-		if (slot.tid != tid)                                             \
-			break;                                                    \
-		state->user_ith_plus1 = (index) + 1;                               \
-		state->user_session_id = slot.session_id;                          \
-		state->user_hint_excluded = 0;                                     \
-		if (stats)                                                         \
-			__sync_fetch_and_add(&stats->user_hint_valid_workers, 1);     \
-		if (cfg->user_control_mode == RVV_LEASE_CONTROL_OBSERVE) {         \
-			if (stats)                                                     \
-				__sync_fetch_and_add(&stats->user_hint_observed_workers, 1); \
-			return 1;                                                     \
-		}                                                                  \
-		if (stats)                                                         \
-			__sync_fetch_and_add(&stats->user_hint_active_workers, 1);     \
-		if (!cfg->user_cpu_map_enabled)                                    \
-			return 1;                                                     \
-		cpu = cfg->user_cpu_map[(index)];                                  \
-		allowed_mask = LLM_CPU_MASK;                                      \
-		if (!cpu_in_mask((s32)cpu, allowed_mask)) {                        \
-			if (stats)                                                     \
-				__sync_fetch_and_add(&stats->user_hint_invalid_workers, 1); \
-			return -1;                                                    \
-		}                                                                  \
-		state->assigned_cpu_plus1 = cpu + 1;                               \
-		state->user_cpu_forced = 1;                                       \
-		if (stats)                                                         \
-			__sync_fetch_and_add(&stats->user_hint_active_assignments, 1); \
-		return 1;                                                          \
-	} while (0)
-
-	TRY_WORKER_SLOT(0);
-	TRY_WORKER_SLOT(1);
-	TRY_WORKER_SLOT(2);
-	TRY_WORKER_SLOT(3);
-	TRY_WORKER_SLOT(4);
-	TRY_WORKER_SLOT(5);
-	TRY_WORKER_SLOT(6);
-	TRY_WORKER_SLOT(7);
-#undef TRY_WORKER_SLOT
-
-	if (stats)
-		__sync_fetch_and_add(&stats->user_hint_member_misses, 1);
-	if (valid_slots == RVV_LEASE_CONTROL_WORKERS) {
-		state->user_hint_excluded = 1;
-		state->user_session_id = cfg->user_session_id;
-		if (stats)
-			__sync_fetch_and_add(&stats->user_hint_excluded_tasks, 1);
-		return 2;
-	}
-	return 0;
+    struct rvv_lease_worker_page *page;
+    __u32 found = 0, found_ith = 0, seq, count, registered;
+    __u64 epoch;
+    if (team >= RVV_LEASE_CONTROL_TEAMS || team >= cfg->team_count ||
+        cfg->user_control_mode == RVV_LEASE_CONTROL_OFF) return -1;
+    page = bpf_map_lookup_elem(&user_worker_map, &team);
+    if (!page || !page->header.active ||
+        page->header.magic != RVV_LEASE_CONTROL_MAGIC ||
+        page->header.abi_version != RVV_LEASE_CONTROL_ABI_VERSION ||
+        page->header.team_id != team ||
+        page->header.max_workers != RVV_LEASE_CONTROL_WORKERS ||
+        !page->header.worker_limit ||
+        page->header.worker_limit > RVV_LEASE_MAX_ACTIVE_WORKERS ||
+        page->header.target_tgid != cfg->teams[bounded_team(team)].tgid ||
+        !cfg->user_session_id ||
+        page->header.session_id != cfg->user_session_id)
+        return -1;
+    if (stats) __sync_fetch_and_add(&stats->user_hint_classification_reads, 1);
+    seq = page->team_hint.sequence;
+    if (!seq || (seq & 1)) return 0;
+    count = page->team_hint.active_workers;
+    epoch = page->team_hint.membership_epoch;
+    registered = page->header.registered_mask;
+    // IDLE retains the last registration. No graph is using these workers.
+    if (!count && page->team_hint.phase == RVV_LEASE_PHASE_IDLE) return 0;
+    if (!count || count > RVV_LEASE_MAX_ACTIVE_WORKERS ||
+        count > page->header.worker_limit) {
+        if (stats) __sync_fetch_and_add(&stats->user_hint_invalid_workers, 1);
+        return -2;
+    }
+    if (!epoch) return 0;
+    for (__u32 i = 0; i < RVV_LEASE_MAX_ACTIVE_WORKERS; i++) {
+        if (i >= count) break;
+        if (worker_slot_matches(page, tid, i, epoch, count)) {
+            found = 1; found_ith = i; break;
+        }
+    }
+    asm volatile("" ::: "memory");
+    if (seq != page->team_hint.sequence) return 0;
+    if (found) {
+        state->user_ith_plus1 = found_ith + 1;
+        state->user_session_id = cfg->user_session_id;
+        state->membership_epoch = epoch;
+        state->user_hint_excluded = 0;
+        if (stats) {
+            __sync_fetch_and_add(&stats->user_hint_valid_workers, 1);
+            if (cfg->user_control_mode == RVV_LEASE_CONTROL_OBSERVE)
+                __sync_fetch_and_add(&stats->user_hint_observed_workers, 1);
+            else __sync_fetch_and_add(&stats->user_hint_active_workers, 1);
+        }
+        return 1;
+    }
+    return (registered & ((1U << count) - 1)) == ((1U << count) - 1) ? 2 : 0;
 }
 
 static __always_inline void record_vector_thread(
@@ -410,8 +386,10 @@ static __always_inline void record_vector_thread(
 	__sync_fetch_and_add(&stats->rvv_vector_threads, 1);
 	if (team == 0)
 		__sync_fetch_and_add(&stats->rvv_vector_threads_team0, 1);
-	else
+	else if (team == 1)
 		__sync_fetch_and_add(&stats->rvv_vector_threads_team1, 1);
+	if (team < RVV_LEASE_CONTROL_TEAMS)
+		__sync_fetch_and_add(&stats->teams[bounded_team(team)].vector_threads, 1);
 	if (primary_hint)
 		__sync_fetch_and_add(&stats->user_hint_primary_workers, 1);
 }
@@ -424,116 +402,53 @@ static __always_inline void unrecord_vector_thread(
 	__sync_fetch_and_sub(&stats->rvv_vector_threads, 1);
 	if (team == 0)
 		__sync_fetch_and_sub(&stats->rvv_vector_threads_team0, 1);
-	else
+	else if (team == 1)
 		__sync_fetch_and_sub(&stats->rvv_vector_threads_team1, 1);
+	if (team < RVV_LEASE_CONTROL_TEAMS)
+		__sync_fetch_and_sub(&stats->teams[bounded_team(team)].vector_threads, 1);
 }
 
 static __always_inline bool classify_rvv_vector_task(struct task_struct *p,
-						     const struct llm_pin_config *cfg,
-						     struct llm_pin_stats *stats,
-						     __u32 team)
+    const struct llm_pin_config *cfg, struct llm_pin_stats *stats, __u32 team)
 {
-	struct rvv_task_class *state;
-	__u32 tid = task_pid(p);
-	unsigned long vs;
-	bool ok = false;
-	__u32 threshold;
-	__u64 now;
-	int hint_result = 0;
-
-	if (!is_rvv_dirty_strategy(cfg->strategy) ||
-	    team >= RVV_LEASE_CONTROL_TEAMS)
-		return false;
-
-	state = get_rvv_task_class(tid);
-	if (!state)
-		return false;
-	if (!state->team_id_plus1)
-		state->team_id_plus1 = team + 1;
-	else if (state->team_id_plus1 != team + 1)
-		return false;
-
-	now = bpf_ktime_get_ns();
-	if (state->is_vector && !state->user_hint_primary &&
-	    cfg->user_control_mode != RVV_LEASE_CONTROL_OFF &&
-	    now >= state->user_hint_retry_after_ns) {
-		hint_result = apply_user_worker_hint(cfg, stats, state, tid, team);
-		if (hint_result == 1) {
-			state->user_hint_primary = 1;
-			return true;
-		}
-		if (hint_result == 2) {
-			if (state->assigned_cpu_plus1)
-				release_vector_cpu(tid, team,
-					(s32)state->assigned_cpu_plus1 - 1);
-			state->is_vector = 0;
-			state->dirty_score = 0;
-			state->assigned_cpu_plus1 = 0;
-			state->user_cpu_forced = 0;
-			state->user_hint_retry_after_ns = now + RVV_HINT_RETRY_NS;
-			unrecord_vector_thread(stats, team);
-			if (stats)
-				__sync_fetch_and_add(&stats->user_hint_demotions, 1);
-			return false;
-		}
-		state->user_hint_retry_after_ns = now + RVV_HINT_RETRY_NS;
-	}
-	if (!state->is_vector && state->user_hint_excluded &&
-	    state->user_session_id == cfg->user_session_id &&
-	    now < state->user_hint_retry_after_ns)
-		return false;
-	if (!state->is_vector && cfg->user_control_mode != RVV_LEASE_CONTROL_OFF &&
-	    now >= state->user_hint_retry_after_ns) {
-		hint_result = apply_user_worker_hint(cfg, stats, state, tid, team);
-		if (hint_result == 1) {
-			state->is_vector = 1;
-			state->user_hint_primary = 1;
-			record_vector_thread(stats, team, true);
-			return true;
-		}
-		if (hint_result == 2) {
-			state->user_hint_retry_after_ns = now + RVV_HINT_RETRY_NS;
-			return false;
-		}
-		if (hint_result == 0) {
-			if (!state->user_hint_first_seen_ns)
-				state->user_hint_first_seen_ns = now;
-			if (now - state->user_hint_first_seen_ns <
-			    RVV_HINT_REGISTRATION_GRACE_NS) {
-				state->user_hint_retry_after_ns = now + RVV_HINT_RETRY_NS;
-				if (stats)
-					__sync_fetch_and_add(&stats->user_hint_deferred_tasks, 1);
-				return false;
-			}
-		}
-		state->user_hint_retry_after_ns = now + RVV_HINT_RETRY_NS;
-	}
-
-	vs = read_vs_state(p, &ok);
-	if (ok && vs == RVV_SR_VS_DIRTY) {
-		if (state->dirty_score < 0xffffffffU)
-			state->dirty_score++;
-		if (stats)
-			__sync_fetch_and_add(&stats->rvv_dirty_samples, 1);
-	}
-
-	threshold = cfg->dirty_threshold ? cfg->dirty_threshold : 2;
-	if (!state->is_vector && state->dirty_score >= threshold) {
-		if (hint_result != 1)
-			hint_result = apply_user_worker_hint(cfg, stats, state, tid, team);
-		if (hint_result == 2) {
-			state->dirty_score = 0;
-			state->user_hint_retry_after_ns = now + RVV_HINT_RETRY_NS;
-			return false;
-		}
-		if (hint_result != 1 && stats)
-			__sync_fetch_and_add(&stats->user_hint_fallbacks, 1);
-		state->is_vector = 1;
-		state->user_hint_primary = hint_result == 1;
-		record_vector_thread(stats, team, hint_result == 1);
-	}
-
-	return state->is_vector;
+    __u32 tid = task_pid(p);
+    if (team >= RVV_LEASE_CONTROL_TEAMS) return false;
+    struct rvv_task_class *state = get_rvv_task_class(tid);
+    if (!state) return false;
+    state->team_id_plus1 = team + 1;
+    int hint = apply_user_worker_hint(cfg, stats, state, tid, team);
+    if (hint == 2 || hint == -2) {
+        if (state->is_vector) unrecord_vector_thread(stats, team);
+        if (state->assigned_cpu_plus1)
+            release_vector_cpu(tid, team, state->assigned_cpu_plus1 - 1);
+        state->is_vector = 0;
+        state->user_hint_primary = 0;
+        state->assigned_cpu_plus1 = 0;
+        state->dirty_score = 0;
+        return false;
+    }
+    if (hint == 1) {
+        if (!state->is_vector) record_vector_thread(stats, team, true);
+        state->is_vector = 1;
+        state->user_hint_primary = 1;
+        return true;
+    }
+    // A partial generation must not treat stale ith/TID assignments as current.
+    // Send it through the ordinary scheduler until its registration is visible.
+    if (cfg->user_control_mode != RVV_LEASE_CONTROL_OFF && hint == 0)
+        return false;
+    bool ok = false;
+    unsigned long vs = read_vs_state(p, &ok);
+    if (ok && vs == RVV_SR_VS_DIRTY) {
+        if (state->dirty_score < 0xffffffffU) state->dirty_score++;
+        if (stats) __sync_fetch_and_add(&stats->rvv_dirty_samples, 1);
+    }
+    if (!state->is_vector && state->dirty_score >= cfg->dirty_threshold) {
+        state->is_vector = 1;
+        state->user_hint_primary = 0;
+        record_vector_thread(stats, team, false);
+    }
+    return state->is_vector;
 }
 
 static __always_inline void remember_selected_cpu(struct task_struct *p, s32 cpu)
@@ -734,7 +649,7 @@ static __attribute__((noinline)) void record_phase_mixed(
 	__sync_fetch_and_add(&stats->phase_hint_mixed, 1);
 }
 
-static __always_inline bool read_team_phase(
+static __attribute__((noinline)) bool read_team_phase(
 	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
 	__u32 team, __u64 now, struct team_phase_snapshot *out)
 {
@@ -752,6 +667,9 @@ static __always_inline bool read_team_phase(
 	if (!page || page->header.magic != RVV_LEASE_CONTROL_MAGIC ||
 	    page->header.abi_version != RVV_LEASE_CONTROL_ABI_VERSION ||
 	    !page->header.active || page->header.team_id != team ||
+	    page->header.max_workers != RVV_LEASE_CONTROL_WORKERS ||
+	    !page->header.worker_limit ||
+	    page->header.worker_limit > RVV_LEASE_MAX_ACTIVE_WORKERS ||
 	    page->header.target_tgid != team_target_tgid(cfg, team) ||
 	    page->header.session_id != cfg->user_session_id) {
 		if (stats)
@@ -771,9 +689,9 @@ static __always_inline bool read_team_phase(
 	out->expires_ns = hint->expires_ns;
 	if (sequence != hint->sequence || hint->session_id != cfg->user_session_id ||
 	    out->phase > RVV_LEASE_PHASE_MIXED ||
-	    out->active_workers > RVV_LEASE_CONTROL_WORKERS ||
+	    out->active_workers > RVV_LEASE_MAX_ACTIVE_WORKERS ||
 	    (out->phase != RVV_LEASE_PHASE_IDLE &&
-	     out->active_workers != RVV_LEASE_CONTROL_WORKERS) ||
+	     !out->active_workers) ||
 	    (out->phase != RVV_LEASE_PHASE_IDLE &&
 	     (!out->expires_ns || out->expires_ns <= now)) ||
 	    (out->phase != RVV_LEASE_PHASE_IDLE && cfg->phase_hint_timeout_ns &&
@@ -818,82 +736,32 @@ static __always_inline void clear_phase_lease_cpu_state(s32 cpu)
 	state->valid_until_ns = 0;
 }
 
-static __always_inline bool resolve_phase_lease_team(
-	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
-	s32 cpu, __u64 now, __u32 *preferred_team)
+static __always_inline bool team_latency_phase(
+    const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
+    __u32 team, __u64 now)
 {
-	struct team_phase_snapshot phase0 = {};
-	struct team_phase_snapshot phase1 = {};
-	struct phase_lease_cpu_state *state;
-	__u64 valid_until;
-	__u32 signature;
-	__u32 key;
-	bool latency0;
-	bool latency1;
-
-	if (!is_phase_lease_mode(cfg) || cpu < 0 || cpu >= 8 ||
-	    !read_team_phase(cfg, stats, 0, now, &phase0) ||
-	    !read_team_phase(cfg, stats, 1, now, &phase1)) {
-		clear_phase_lease_cpu_state(cpu);
-		return false;
-	}
-	latency0 = latency_phase(phase0.phase);
-	latency1 = latency_phase(phase1.phase);
-	if (latency0 == latency1) {
-		clear_phase_lease_cpu_state(cpu);
-		return false;
-	}
-
-	*preferred_team = latency0 ? 0 : 1;
-	valid_until = latency0 ? phase0.expires_ns : phase1.expires_ns;
-	if (cfg->vector_local_window_ns &&
-	    valid_until > now + cfg->vector_local_window_ns)
-		valid_until = now + cfg->vector_local_window_ns;
-	signature = phase0.phase | (phase1.phase << 8);
-	key = (__u32)cpu;
-	state = bpf_map_lookup_elem(&phase_lease_cpu_state_map, &key);
-	if (state) {
-		if (state->preferred_team_plus1 != *preferred_team + 1 ||
-		    state->phase_signature != signature) {
-			if (stats)
-				__sync_fetch_and_add(&stats->phase_lease_engagements, 1);
-		}
-		state->preferred_team_plus1 = *preferred_team + 1;
-		state->phase_signature = signature;
-		state->valid_until_ns = valid_until;
-	}
-	return true;
+    struct team_phase_snapshot phase = {};
+    return read_team_phase(cfg, stats, team, now, &phase) && latency_phase(phase.phase);
 }
 
 static __always_inline bool try_phase_lease_wakeup_preempt(
-	struct task_struct *p, __u32 task_team, s32 cpu,
-	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
-	__u64 now, __u64 slice, __u64 enq_flags)
+    struct task_struct *p, __u32 task_team, s32 cpu,
+    const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
+    __u64 now, __u64 slice, __u64 enq_flags)
 {
-	__u32 preferred_team;
-	__u32 *running_team;
-	__u32 cpu_key;
-
-	if (!cfg->phase_wakeup_preempt_enabled ||
-	    !(enq_flags & SCX_ENQ_WAKEUP) || !is_phase_lease_mode(cfg) ||
-	    task_team >= RVV_LEASE_CONTROL_TEAMS || cpu < 0 || cpu >= 8)
-		return false;
-	if (!resolve_phase_lease_team(cfg, stats, cpu, now, &preferred_team) ||
-	    preferred_team != task_team)
-		return false;
-	if (stats)
-		__sync_fetch_and_add(&stats->phase_lease_wakeup_candidates, 1);
-
-	cpu_key = (__u32)cpu;
-	running_team = bpf_map_lookup_elem(&running_team_by_cpu, &cpu_key);
-	if (!running_team || *running_team != (task_team ^ 1U) + 1)
-		return false;
-
-	scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice,
-			 enq_flags | SCX_ENQ_PREEMPT);
-	if (stats)
-		__sync_fetch_and_add(&stats->phase_lease_wakeup_preempts, 1);
-	return true;
+    if (!cfg->phase_wakeup_preempt_enabled || !(enq_flags & SCX_ENQ_WAKEUP) ||
+        !is_phase_lease_mode(cfg) || cpu < 0 || cpu >= 8 ||
+        !team_latency_phase(cfg, stats, task_team, now)) return false;
+    __u32 key = cpu;
+    __u32 *running = bpf_map_lookup_elem(&running_team_by_cpu, &key);
+    if (!running || !*running || *running == task_team + 1 ||
+        *running > cfg->team_count) return false;
+    __u32 other = *running - 1;
+    if (team_latency_phase(cfg, stats, other, now)) return false;
+    if (stats) __sync_fetch_and_add(&stats->phase_lease_wakeup_candidates, 1);
+    scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice, enq_flags | SCX_ENQ_PREEMPT);
+    if (stats) __sync_fetch_and_add(&stats->phase_lease_wakeup_preempts, 1);
+    return true;
 }
 
 static __always_inline void clear_gang_state(void)
@@ -911,7 +779,7 @@ static __always_inline void clear_gang_state(void)
 	bpf_spin_unlock(&state->lock);
 }
 
-// Returns true when dual-team gang scheduling is active. kick_all is set only
+// The legacy always-gang mode remains a two-team policy. kick_all is set only
 // by the CPU which starts a gang or changes the shared active team.
 static __always_inline bool resolve_gang_team(
 	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
@@ -928,6 +796,12 @@ static __always_inline bool resolve_gang_team(
 	bool advance;
 
 	*kick_all = false;
+    if (cfg && cfg->team_gang_mode == LLM_TEAM_GANG_OBSERVE) {
+        struct team_phase_snapshot observed = {};
+        for (__u32 t = 0; t < RVV_LEASE_CONTROL_TEAMS; t++)
+            if (t < cfg->team_count) read_team_phase(cfg, stats, t, now, &observed);
+        return false;
+    }
 	if (!cfg || (cfg->team_gang_mode != LLM_TEAM_GANG_OBSERVE &&
 		     cfg->team_gang_mode != LLM_TEAM_GANG_ALWAYS) ||
 	    !cfg->target_tgid2 || !read_team_phase(cfg, stats, 0, now, &phase0) ||
@@ -979,6 +853,125 @@ static __always_inline bool resolve_gang_team(
 		__sync_fetch_and_add(&stats->gang_team_switches, 1);
 	return true;
 }
+
+#ifdef SCX_ARCH_X86
+static __always_inline bool pair_has_active_team(
+	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
+	__u32 pair, __u64 now)
+{
+	struct team_phase_snapshot first = {};
+	struct team_phase_snapshot second = {};
+	__u32 base = pair << 1;
+	bool first_active;
+	bool second_active;
+
+	if (base + 1 >= cfg->team_count)
+		return false;
+	first_active = read_team_phase(cfg, stats, base, now, &first) &&
+		first.phase != RVV_LEASE_PHASE_IDLE;
+	second_active = read_team_phase(cfg, stats, base + 1, now, &second) &&
+		second.phase != RVV_LEASE_PHASE_IDLE;
+	return first_active || second_active;
+}
+
+/*
+ * Run one adjacent pair at a time.  The even team owns CPU 0..3 and the odd
+ * team owns the sibling lane CPU 4..7.  Pair selection is shared by all CPUs,
+ * so four workers from each selected team remain runnable together while SMT
+ * performs the fine-grained sharing inside each physical core.
+ */
+static __always_inline bool resolve_x86_pair_gang(
+	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
+	__u64 now, s32 cpu, __u32 *active_team, bool *kick_all)
+{
+	struct team_gang_state *state;
+	__u32 active_pairs = 0;
+	__u32 pair_count;
+	__u32 old_pair;
+	__u32 selected = 0;
+	__u32 old_team_plus1;
+	__u32 key = 0;
+	bool reset;
+	bool advance;
+
+	*kick_all = false;
+	if (!cfg || cfg->team_gang_mode != LLM_TEAM_GANG_PAIR ||
+	    cpu < 0 || cpu >= 8 || cfg->team_count < 2 ||
+	    (cfg->team_count & 1U))
+		return false;
+	pair_count = cfg->team_count >> 1;
+
+	#pragma unroll
+	for (__u32 pair = 0; pair < RVV_LEASE_CONTROL_TEAMS / 2; pair++) {
+		if (pair < pair_count && pair_has_active_team(cfg, stats, pair, now))
+			active_pairs |= 1U << pair;
+	}
+	if (!active_pairs) {
+		clear_gang_state();
+		return false;
+	}
+
+	state = bpf_map_lookup_elem(&team_gang_state_map, &key);
+	if (!state)
+		return false;
+	bpf_spin_lock(&state->lock);
+	old_pair = state->cycle_slot;
+	old_team_plus1 = state->active_team_plus1;
+	reset = !state->engaged || old_pair >= pair_count ||
+		!(active_pairs & (1U << old_pair)) ||
+		!state->quantum_deadline_ns;
+	advance = !reset && now >= state->quantum_deadline_ns;
+	if (reset) {
+		#pragma unroll
+		for (__u32 pair = 0; pair < RVV_LEASE_CONTROL_TEAMS / 2; pair++) {
+			if (pair < pair_count && (active_pairs & (1U << pair))) {
+				selected = pair;
+				break;
+			}
+		}
+	} else {
+		selected = old_pair;
+		if (advance) {
+			#pragma unroll
+			for (__u32 step = 0; step < RVV_LEASE_CONTROL_TEAMS / 2; step++) {
+				__u32 candidate = selected + 1;
+
+				if (candidate >= pair_count)
+					candidate = 0;
+				selected = candidate;
+				if (active_pairs & (1U << candidate))
+					break;
+			}
+		}
+	}
+	if (reset || advance) {
+		state->engaged = 1;
+		state->cycle_slot = selected;
+		state->active_team_plus1 = (selected << 1) + 1;
+		state->phase_signature = active_pairs;
+		state->quantum_deadline_ns = now + cfg->gang_quantum_ns;
+		state->generation++;
+	}
+	*active_team = (selected << 1) + (cpu >= 4 ? 1 : 0);
+	*kick_all = reset ||
+		(advance && old_team_plus1 != state->active_team_plus1);
+	bpf_spin_unlock(&state->lock);
+
+	if (stats && reset) {
+		__sync_fetch_and_add(&stats->gang_engagements, 1);
+		__sync_fetch_and_add(&stats->x86_pair_gang_engagements, 1);
+	}
+	if (stats && (reset || advance)) {
+		__sync_fetch_and_add(&stats->gang_quanta, 1);
+		__sync_fetch_and_add(&stats->x86_pair_gang_quanta, 1);
+	}
+	if (stats && advance && old_team_plus1 != (selected << 1) + 1) {
+		__sync_fetch_and_add(&stats->gang_team_switches, 1);
+		__sync_fetch_and_add(&stats->x86_pair_gang_switches, 1);
+	}
+	return true;
+}
+#endif
 
 static __always_inline void kick_all_gang_cpus(struct llm_pin_stats *stats)
 {
@@ -1062,6 +1055,84 @@ static __always_inline void release_vector_cpu(__u32 tid, __u32 team, s32 cpu)
 		__sync_val_compare_and_swap(owner, tid, 0);
 }
 
+#ifdef SCX_ARCH_X86
+/*
+ * The i5-10200H exposes four physical cores as sibling pairs 0/4, 1/5,
+ * 2/6 and 3/7.  Keep a latency phase on the first logical CPU of each core.
+ * While any team is in a latency phase, keep every vector worker on the
+ * primary lanes. The phase-lease dispatch pass then gives prefill strict
+ * priority without sibling-side AVX2 contention. Once both teams decode, split
+ * them across the two SMT lanes by team parity. If only one team is active it
+ * gets the primary lane on all four cores.
+ */
+static __attribute__((noinline)) s32 select_x86_smt_cpu(
+	const struct llm_pin_config *cfg, struct llm_pin_stats *stats,
+	__u32 team, __u32 ith, __u32 allowed_mask)
+{
+	struct team_phase_snapshot self = {};
+	bool other_active = false;
+	bool other_latency = false;
+	__u64 now;
+	s32 cpu;
+
+	if (ith >= 4)
+		return -1;
+	if (cfg->team_gang_mode == LLM_TEAM_GANG_PAIR) {
+		cpu = (s32)ith + ((team & 1U) ? 4 : 0);
+		if (!cpu_in_mask(cpu, allowed_mask))
+			return -1;
+		if (stats) {
+			if (cpu < 4)
+				__sync_fetch_and_add(&stats->x86_smt_primary_selections, 1);
+			else
+				__sync_fetch_and_add(&stats->x86_smt_sibling_selections, 1);
+		}
+		return cpu;
+	}
+	if (cfg->x86_smt_mode != LLM_X86_SMT_ADAPTIVE)
+		return -1;
+	now = bpf_ktime_get_ns();
+	if (!read_team_phase(cfg, stats, team, now, &self))
+		return -1;
+
+	#pragma unroll
+	for (__u32 other = 0; other < RVV_LEASE_CONTROL_TEAMS; other++) {
+		struct team_phase_snapshot phase = {};
+
+		if (other >= cfg->team_count)
+			break;
+		if (other == team ||
+		    !read_team_phase(cfg, stats, other, now, &phase) ||
+		    phase.phase == RVV_LEASE_PHASE_IDLE)
+			continue;
+		other_active = true;
+		if (latency_phase(phase.phase))
+			other_latency = true;
+	}
+
+	if (latency_phase(self.phase) || !other_active)
+		cpu = (s32)ith;
+	else if (other_latency)
+		cpu = (s32)ith;
+	else
+		cpu = (team & 1U) ? (s32)ith + 4 : (s32)ith;
+
+	if (!cpu_in_mask(cpu, allowed_mask))
+		return -1;
+	if (stats) {
+		if (cpu < 4)
+			__sync_fetch_and_add(&stats->x86_smt_primary_selections, 1);
+		else
+			__sync_fetch_and_add(&stats->x86_smt_sibling_selections, 1);
+		if (latency_phase(self.phase))
+			__sync_fetch_and_add(&stats->x86_smt_latency_primary, 1);
+		else if (other_active)
+			__sync_fetch_and_add(&stats->x86_smt_decode_shared, 1);
+	}
+	return cpu;
+}
+#endif
+
 static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
 						      const struct llm_pin_config *cfg,
 						      struct llm_pin_stats *stats,
@@ -1069,42 +1140,38 @@ static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
 {
 	struct rvv_task_class *state;
 	__u32 tid = task_pid(p);
-	__u32 allowed_mask = LLM_CPU_MASK;
+	__u32 allowed_mask;
+    if (team >= RVV_LEASE_CONTROL_TEAMS) return prev_cpu;
+    const struct cpumask *mask = BPF_CORE_READ(p, cpus_ptr);
+    unsigned long bits = 0;
+    bpf_probe_read_kernel(&bits, sizeof(bits), &mask->bits[0]);
+    allowed_mask = cfg->teams[bounded_team(team)].cpu_mask & (__u32)bits & LLM_CPU_MASK;
 	s32 assigned_cpu;
 
 	state = get_rvv_task_class(tid);
 	if (!state)
 		return select_cpu_from_mask(allowed_mask, prev_cpu);
 
-	if (cfg->user_control_mode == RVV_LEASE_CONTROL_ACTIVE &&
-	    cfg->user_cpu_map_enabled &&
-	    state->user_session_id == cfg->user_session_id) {
-		__u32 user_ith_plus1 = state->user_ith_plus1;
-
-		if (user_ith_plus1 >= 1 &&
-		    user_ith_plus1 <= RVV_LEASE_CONTROL_WORKERS) {
-			__u32 ith = user_ith_plus1 - 1;
-			s32 user_cpu = (s32)cfg->user_cpu_map[ith];
-
-			if (cpu_in_mask(user_cpu, allowed_mask)) {
-				if (!state->user_cpu_forced ||
-				    state->assigned_cpu_plus1 != (__u32)user_cpu + 1) {
-					if (!state->user_cpu_forced &&
-					    state->assigned_cpu_plus1)
-						release_vector_cpu(
-								tid, team,
-								(s32)state->assigned_cpu_plus1 - 1);
-					if (stats)
-						__sync_fetch_and_add(
-							&stats->user_hint_active_assignments,
-							1);
-				}
-				state->assigned_cpu_plus1 = (__u32)user_cpu + 1;
-				state->user_cpu_forced = 1;
-				return user_cpu;
-			}
-		}
-	}
+    if (cfg->user_control_mode == RVV_LEASE_CONTROL_ACTIVE &&
+        state->user_hint_primary && state->user_ith_plus1 >= 1 &&
+        state->user_ith_plus1 <= RVV_LEASE_MAX_ACTIVE_WORKERS) {
+        __u32 ith = (state->user_ith_plus1 - 1) & (RVV_LEASE_MAX_CPUS - 1);
+        s32 cpu;
+#ifdef SCX_ARCH_X86
+		cpu = !cfg->user_cpu_map_enabled ?
+			select_x86_smt_cpu(cfg, stats, team, ith,
+						     allowed_mask) : -1;
+		if (cpu < 0)
+#endif
+			cpu = cfg->user_cpu_map_enabled ? cfg->user_cpu_map[ith] :
+				cfg->teams[bounded_team(team)].cpu_order[ith];
+        if (!cpu_in_mask(cpu, allowed_mask)) return -1;
+        if (!state->user_cpu_forced && state->assigned_cpu_plus1)
+            release_vector_cpu(tid, team, state->assigned_cpu_plus1 - 1);
+        state->assigned_cpu_plus1 = cpu + 1;
+        state->user_cpu_forced = 1;
+        return cpu;
+    }
 
 	if (state->user_cpu_forced) {
 		state->assigned_cpu_plus1 = 0;
@@ -1134,20 +1201,6 @@ static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
 	}
 
 	return select_cpu_from_mask(allowed_mask, prev_cpu);
-}
-
-static __always_inline __u32 vector_unique_target(void)
-{
-	return 8;
-}
-
-static __always_inline __u64 vector_threads_for_team(
-	const struct llm_pin_stats *stats, __u32 team)
-{
-	if (!stats)
-		return 0;
-	return team == 0 ? stats->rvv_vector_threads_team0 :
-			   stats->rvv_vector_threads_team1;
 }
 
 static __always_inline s32 select_rvv_vector_cpu(struct task_struct *p,
@@ -1208,7 +1261,7 @@ s32 BPF_PROG(scx_llm_pin_select_cpu, struct task_struct *p, s32 prev_cpu,
 				__sync_fetch_and_add(&stats->llm_scheduled, 1);
 				__sync_fetch_and_add(&stats->llm_pinned, 1);
 			}
-			return cpu;
+			return cpu >= 0 ? cpu : prev_cpu;
 		}
 
 		if (stats)
@@ -1255,29 +1308,18 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 								 (__u32)team);
 			remember_selected_cpu(p, selected_cpu);
 
-			if (selected_cpu < 0 || selected_cpu >= 8)
-				selected_cpu = (s32)bpf_get_smp_processor_id();
-			if (selected_cpu < 0 || selected_cpu >= 8)
-				selected_cpu = 0;
-			now = bpf_ktime_get_ns();
-
-			if (cfg->vector_local_window_ns && stats &&
-			    vector_threads_for_team(stats, (__u32)team) <
-				    vector_unique_target()) {
-				start_vector_local_lease(
-					cfg, stats, (__u32)team, selected_cpu,
-					now, false);
-				__sync_fetch_and_add(&stats->rvv_vector_identify_barrier_dispatches,
-						     1);
-				scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
-						 enq_flags);
-				return;
-			}
+            if (selected_cpu < 0 || selected_cpu >= 8) {
+                scx_bpf_dispatch(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+                return;
+            }
+            now = bpf_ktime_get_ns();
 
 			if (cfg->team_gang_mode == LLM_TEAM_GANG_OBSERVE ||
 			    cfg->team_gang_mode == LLM_TEAM_GANG_ALWAYS)
 				gang_engaged = resolve_gang_team(
 					cfg, stats, now, &gang_team, &gang_kick);
+			else if (cfg->team_gang_mode == LLM_TEAM_GANG_PAIR)
+				gang_engaged = true;
 			if (gang_kick)
 				kick_all_gang_cpus(stats);
 			if (gang_engaged) {
@@ -1323,9 +1365,11 @@ void BPF_PROG(scx_llm_pin_enqueue, struct task_struct *p, u64 enq_flags)
 				if (team == 0)
 					__sync_fetch_and_add(
 						&stats->rvv_vector_dsq_dispatches_team0, 1);
-				else
+				else if (team == 1)
 					__sync_fetch_and_add(
 						&stats->rvv_vector_dsq_dispatches_team1, 1);
+                if (team < RVV_LEASE_CONTROL_TEAMS)
+                    __sync_fetch_and_add(&stats->teams[bounded_team(team)].enqueues, 1);
 			}
 			dsq_id = vector_dsq_id((__u32)team, selected_cpu);
 			if (is_phase_lease_mode(cfg))
@@ -1372,8 +1416,9 @@ static __always_inline bool consume_vector_team(
 		__sync_fetch_and_add(&stats->rvv_vector_dsq_consumes, 1);
 		if (team == 0)
 			__sync_fetch_and_add(&stats->rvv_vector_dsq_consumes_team0, 1);
-		else
+		else if (team == 1)
 			__sync_fetch_and_add(&stats->rvv_vector_dsq_consumes_team1, 1);
+        __sync_fetch_and_add(&stats->teams[bounded_team(team)].consumes, 1);
 	}
 	return true;
 }
@@ -1404,137 +1449,99 @@ static __always_inline bool try_phase_lease_safety_team(
 }
 
 static __always_inline bool consume_phase_lease_safety(
-	s32 cpu, const struct llm_pin_config *cfg,
-	struct llm_pin_stats *stats, __u64 now)
+    s32 cpu, const struct llm_pin_config *cfg, struct llm_pin_stats *stats, __u64 now)
 {
-	__u64 threshold;
-	__u64 since0;
-	__u64 since1;
-	__u32 first;
-
-	if (!is_phase_lease_mode(cfg) || cpu < 0 || cpu >= 8)
-		return false;
-	threshold = cfg->prefill_starvation_ns;
-	if (!threshold)
-		threshold = 1000ULL * 1000 * 1000;
-	since0 = vector_pending_since(0, cpu);
-	since1 = vector_pending_since(1, cpu);
-	if (!phase_lease_pending_overdue(since0, now, threshold) &&
-	    !phase_lease_pending_overdue(since1, now, threshold))
-		return false;
-	if (!phase_lease_pending_overdue(since1, now, threshold))
-		first = 0;
-	else if (!phase_lease_pending_overdue(since0, now, threshold))
-		first = 1;
-	else
-		first = since0 <= since1 ? 0 : 1;
-
-	if (try_phase_lease_safety_team(cpu, first, cfg, stats, now, threshold))
-		return true;
-	return try_phase_lease_safety_team(cpu, first ^ 1U, cfg, stats,
-					   now, threshold);
+    if (!is_phase_lease_mode(cfg) || cpu < 0 || cpu >= 8) return false;
+    __u64 oldest = now;
+    __u32 selected = RVV_LEASE_CONTROL_TEAMS;
+    for (__u32 t = 0; t < RVV_LEASE_CONTROL_TEAMS; t++) {
+        if (t >= cfg->team_count) break;
+        __u64 since = vector_pending_since(t, cpu);
+        if (phase_lease_pending_overdue(since, now, cfg->prefill_starvation_ns) &&
+            since < oldest) { oldest = since; selected = t; }
+    }
+    return selected < RVV_LEASE_CONTROL_TEAMS &&
+        try_phase_lease_safety_team(cpu, selected, cfg, stats, now, cfg->prefill_starvation_ns);
 }
 
 SEC("struct_ops/scx_llm_pin_dispatch")
 void BPF_PROG(scx_llm_pin_dispatch, s32 cpu, struct task_struct *prev)
 {
-	struct llm_pin_config *cfg;
-	struct llm_pin_stats *stats;
-	__u32 *next_team;
-	__u32 cpu_key;
-	__u32 first_team;
-	__u32 preferred_team;
-	__u32 phase_team;
-	__u32 gang_team = 0;
-	__u64 now;
-	bool gang_kick = false;
-	u32 key = 0;
-
-	cfg = bpf_map_lookup_elem(&config_map, &key);
-	stats = bpf_map_lookup_elem(&stats_map, &key);
-	now = bpf_ktime_get_ns();
-	if (cfg && is_rvv_dirty_strategy(cfg->strategy) &&
-	    consume_phase_lease_safety(cpu, cfg, stats, now))
-		return;
-	if (scx_bpf_consume(SCX_DSQ_GLOBAL))
-		return;
-
-	if (cpu < 0 || cpu >= 8)
-		return;
-	if (!cfg || !is_rvv_dirty_strategy(cfg->strategy))
-		return;
-	if ((cfg->team_gang_mode == LLM_TEAM_GANG_OBSERVE ||
-	     cfg->team_gang_mode == LLM_TEAM_GANG_ALWAYS) &&
-	    resolve_gang_team(cfg, stats, now, &gang_team, &gang_kick)) {
-		if (gang_kick)
-			kick_all_gang_cpus(stats);
-		if (consume_vector_team(cpu, gang_team, cfg, stats, false)) {
-			if (stats)
-				__sync_fetch_and_add(&stats->gang_selected_consumes, 1);
-			return;
+    __u32 key = 0, cpu_key = cpu;
+    struct llm_pin_config *cfg = bpf_map_lookup_elem(&config_map, &key);
+    struct llm_pin_stats *stats = bpf_map_lookup_elem(&stats_map, &key);
+    __u64 now = bpf_ktime_get_ns();
+    if (cfg && consume_phase_lease_safety(cpu, cfg, stats, now)) return;
+#ifndef SCX_API_DSQ_INSERT
+    if (scx_bpf_consume(SCX_DSQ_GLOBAL)) return;
+#endif
+    if (!cfg || !is_rvv_dirty_strategy(cfg->strategy) || cpu < 0 || cpu >= 8 ||
+        !cfg->team_count || cfg->team_count > RVV_LEASE_CONTROL_TEAMS) return;
+    __u32 *cursor = bpf_map_lookup_elem(&vector_next_team, &cpu_key);
+    __u32 start = cursor ? *cursor : 0;
+    if (start >= cfg->team_count) start = 0;
+    __u32 preferred = 0;
+    bool kick = false;
+	bool pair_forced = false;
+    bool forced = user_preference_active(cfg, now, &preferred);
+#ifdef SCX_ARCH_X86
+	if (cfg->team_gang_mode == LLM_TEAM_GANG_PAIR) {
+		pair_forced = resolve_x86_pair_gang(
+			cfg, stats, now, cpu, &preferred, &kick);
+		forced = pair_forced;
+	}
+#endif
+	if (!pair_forced && resolve_gang_team(cfg, stats, now, &preferred, &kick))
+		forced = true;
+    if (kick) kick_all_gang_cpus(stats);
+	if (forced && consume_vector_team(cpu, preferred, cfg, stats, true)) {
+		if (pair_forced && stats) {
+			if (cpu < 4)
+				__sync_fetch_and_add(&stats->x86_pair_gang_primary_consumes, 1);
+			else
+				__sync_fetch_and_add(&stats->x86_pair_gang_sibling_consumes, 1);
 		}
+		return;
+	}
+	if (pair_forced) {
 		if (stats)
-			__sync_fetch_and_add(&stats->gang_empty_fallbacks, 1);
-		if (consume_vector_team(cpu, gang_team ^ 1U, cfg, stats, false) && stats)
-			__sync_fetch_and_add(&stats->gang_fallback_consumes, 1);
+			__sync_fetch_and_add(&stats->x86_pair_gang_empty_consumes, 1);
 		return;
 	}
-	if (user_preference_active(cfg, now, &preferred_team)) {
-		if (consume_vector_team(cpu, preferred_team, cfg, stats, true)) {
-			if (stats)
-				__sync_fetch_and_add(
-					&stats->user_preference_dsq_consumes, 1);
-			return;
-		}
-		if (stats)
-			__sync_fetch_and_add(&stats->user_preference_empty_fallbacks, 1);
-		consume_vector_team(cpu, preferred_team ^ 1U, cfg, stats, true);
-		return;
-	}
-	if (resolve_phase_lease_team(cfg, stats, cpu, now, &phase_team)) {
-		cpu_key = (__u32)cpu;
-		next_team = bpf_map_lookup_elem(&vector_next_team, &cpu_key);
-		if (consume_vector_team(cpu, phase_team, cfg, stats, true)) {
-			if (stats)
-				__sync_fetch_and_add(
-					&stats->phase_lease_preferred_consumes, 1);
-			if (next_team)
-				*next_team = phase_team ^ 1U;
-			return;
-		}
-		if (stats)
-			__sync_fetch_and_add(&stats->phase_lease_empty_fallbacks, 1);
-		if (consume_vector_team(cpu, phase_team ^ 1U, cfg, stats, true)) {
-			if (stats)
-				__sync_fetch_and_add(
-					&stats->phase_lease_fallback_consumes, 1);
-			if (next_team)
-				*next_team = phase_team;
-		}
-		return;
-	}
-
-	if (!cfg->target_tgid2) {
-		consume_vector_team(cpu, 0, cfg, stats, true);
-		return;
-	}
-
-	cpu_key = (__u32)cpu;
-	next_team = bpf_map_lookup_elem(&vector_next_team, &cpu_key);
-	first_team = next_team ? (*next_team & 1U) : 0;
-	if (consume_vector_team(cpu, first_team, cfg, stats, true)) {
-		if (next_team)
-			*next_team = first_team ^ 1U;
-		return;
-	}
-	first_team ^= 1U;
-	if (consume_vector_team(cpu, first_team, cfg, stats, true) && next_team)
-		*next_team = first_team ^ 1U;
+    clear_phase_lease_cpu_state(cpu);
+    // A separate priority pass makes all runnable prefill teams eligible.
+    // The rotating start is shared with the ordinary pass; empty queues skip.
+    for (__u32 pass = 0; pass < 2; pass++) {
+        if (!pass && !is_phase_lease_mode(cfg)) continue;
+        for (__u32 off = 0; off < RVV_LEASE_CONTROL_TEAMS; off++) {
+            if (off >= cfg->team_count) break;
+            __u32 t = start + off;
+            if (t >= cfg->team_count) t -= cfg->team_count;
+            if (t >= RVV_LEASE_CONTROL_TEAMS) continue;
+            if (!pass && !team_latency_phase(cfg, stats, t, now)) continue;
+            if (!consume_vector_team(cpu, t, cfg, stats, true)) continue;
+            if (cursor) *cursor = t + 1 == cfg->team_count ? 0 : t + 1;
+            if (!pass) {
+                struct phase_lease_cpu_state *lease =
+                    bpf_map_lookup_elem(&phase_lease_cpu_state_map, &cpu_key);
+                if (lease) {
+                    lease->preferred_team_plus1 = t + 1;
+                    lease->valid_until_ns = now + cfg->vector_slice_ns;
+                }
+                if (stats) {
+                    __sync_fetch_and_add(&stats->phase_lease_preferred_consumes, 1);
+                    __sync_fetch_and_add(&stats->phase_lease_engagements, 1);
+                }
+            }
+            return;
+        }
+    }
 }
 
 SEC("struct_ops/scx_llm_pin_running")
 void BPF_PROG(scx_llm_pin_running, struct task_struct *p)
 {
+	struct llm_pin_config *cfg;
 	struct team_gang_state *gang;
 	struct phase_lease_cpu_state *phase_lease;
 	struct llm_pin_stats *stats;
@@ -1558,6 +1565,9 @@ void BPF_PROG(scx_llm_pin_running, struct task_struct *p)
 	state->running = 1;
 
 	stats = bpf_map_lookup_elem(&stats_map, &key);
+	cfg = bpf_map_lookup_elem(&config_map, &key);
+    if (stats && team_plus1 && team_plus1 <= RVV_LEASE_CONTROL_TEAMS)
+        __sync_fetch_and_add(&stats->teams[bounded_team(team_plus1 - 1)].runs, 1);
 	phase_lease = bpf_map_lookup_elem(&phase_lease_cpu_state_map, &cpu);
 	now = bpf_ktime_get_ns();
 	if (stats && phase_lease && phase_lease->preferred_team_plus1 &&
@@ -1572,15 +1582,27 @@ void BPF_PROG(scx_llm_pin_running, struct task_struct *p)
 	if (!stats || !gang || !gang->engaged || !gang->active_team_plus1)
 		return;
 	__sync_fetch_and_add(&stats->gang_running_samples, 1);
-	if (team_plus1 == gang->active_team_plus1)
+	__u32 expected_team_plus1 = gang->active_team_plus1;
+	if (cfg && cfg->team_gang_mode == LLM_TEAM_GANG_PAIR && cpu >= 4)
+		expected_team_plus1++;
+	if (team_plus1 == expected_team_plus1)
 		__sync_fetch_and_add(&stats->gang_active_team_runs, 1);
-	else
+	else {
 		__sync_fetch_and_add(&stats->gang_wrong_team_runs, 1);
+		if (cfg && cfg->team_gang_mode == LLM_TEAM_GANG_PAIR)
+			__sync_fetch_and_add(&stats->x86_pair_gang_wrong_runs, 1);
+	}
 }
 
 SEC("struct_ops/scx_llm_pin_stopping")
 void BPF_PROG(scx_llm_pin_stopping, struct task_struct *p, bool runnable)
 {
+#ifdef SCX_ARCH_X86
+	struct llm_pin_config *cfg;
+	struct llm_pin_stats *stats;
+	s32 team;
+	__u32 key = 0;
+#endif
 	struct rvv_task_class *state;
 	__u32 tid = task_pid(p);
 	__u32 cpu = (__u32)bpf_get_smp_processor_id();
@@ -1589,6 +1611,24 @@ void BPF_PROG(scx_llm_pin_stopping, struct task_struct *p, bool runnable)
 	(void)runnable;
 	if (cpu >= 8)
 		return;
+
+#ifdef SCX_ARCH_X86
+	/*
+	 * The runtime publishes its OpenMP worker slot after the worker has
+	 * already been woken and enqueued.  x86 has no architectural VS-style
+	 * dirty bit to identify that first enqueue, so sample the explicit ABI
+	 * again after the task has actually executed.  A preempted worker is then
+	 * placed on its team DSQ by the following enqueue callback.
+	 */
+	cfg = bpf_map_lookup_elem(&config_map, &key);
+	stats = bpf_map_lookup_elem(&stats_map, &key);
+	if (cfg && cfg->enabled && is_rvv_dirty_strategy(cfg->strategy)) {
+		team = llm_team_id(p, cfg);
+		if (team >= 0)
+			classify_rvv_vector_task(p, cfg, stats, (__u32)team);
+	}
+#endif
+
 	state = bpf_map_lookup_elem(&rvv_task_classes, &tid);
 	if (!state || !state->is_vector)
 		return;
@@ -1603,7 +1643,9 @@ s32 BPF_PROG(scx_llm_pin_init)
 {
 	s32 ret;
 
+#ifndef SCX_API_DSQ_INSERT
 	scx_bpf_switch_all();
+#endif
 
 	#pragma unroll
 	for (u32 team = 0; team < RVV_LEASE_CONTROL_TEAMS; team++) {
@@ -1649,6 +1691,10 @@ void BPF_PROG(scx_llm_pin_disable, struct task_struct *p)
 					bpf_ktime_get_ns(), NULL, false);
 		}
 	}
+    __u32 zero = 0;
+    struct llm_pin_stats *stats = bpf_map_lookup_elem(&stats_map, &zero);
+    if (state->is_vector && state->team_id_plus1)
+        unrecord_vector_thread(stats, state->team_id_plus1 - 1);
 	bpf_map_delete_elem(&selected_cpu_map, &tid);
 	bpf_map_delete_elem(&rvv_task_classes, &tid);
 }
