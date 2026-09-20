@@ -17,6 +17,7 @@ enum llm_team_gang_mode {
 	LLM_TEAM_GANG_OBSERVE = 1,
 	LLM_TEAM_GANG_ALWAYS = 3,
 	LLM_TEAM_GANG_PREFILL_LEASE = 4,
+	LLM_TEAM_GANG_PAIR = 5,
 };
 
 enum llm_vector_local_wakeup_mode {
@@ -25,14 +26,37 @@ enum llm_vector_local_wakeup_mode {
 	LLM_VECTOR_LOCAL_WAKEUP_EXCLUSIVE = 2,
 };
 
+enum llm_x86_smt_mode {
+	LLM_X86_SMT_OFF = 0,
+	LLM_X86_SMT_ADAPTIVE = 1,
+};
+
 #define RVV_SR_VS		0x00000600UL
 #define RVV_SR_VS_OFF		0x00000000UL
 #define RVV_SR_VS_INITIAL	0x00000200UL
 #define RVV_SR_VS_CLEAN		0x00000400UL
 #define RVV_SR_VS_DIRTY		0x00000600UL
 
+struct llm_team_config {
+	__u32 tgid;
+	__u32 threads;
+	__u32 threads_batch;
+	__u32 cpu_mask;
+	__u32 cpu_order[RVV_LEASE_MAX_CPUS];
+};
+
+struct llm_team_stats {
+	__u64 vector_threads;
+	__u64 enqueues;
+	__u64 consumes;
+	__u64 runs;
+};
+
 // 共享配置结构，用户态和 BPF 之间通信
 struct llm_pin_config {
+	__u32 team_count;
+	__u32 reserved;
+	struct llm_team_config teams[RVV_LEASE_CONTROL_TEAMS];
 	__u32 target_tgid;        // 目标进程 TGID（llama-server）
 	__u32 target_tgid2;       // 可选的第二个 llama-server TGID
 	__u32 enabled;            // 是否启用绑定策略
@@ -42,7 +66,7 @@ struct llm_pin_config {
 	__u64 vector_local_window_ns; // vector DSQ 放行后的 local 快速窗口
 	__u32 user_control_mode; // enum rvv_lease_control_mode
 	__u32 user_cpu_map_enabled; // 1=显式 ith->CPU；0=保留 lease 自然唯一分配
-	__u32 user_preferred_team_plus1; // 0=禁用；1/2=team 0/1
+	__u32 user_preferred_team_plus1; // 0=禁用；1..8=team 0..7
 	__u32 phase_wakeup_preempt_enabled; // preferred wakeup 是否定向抢占
 	__u32 user_cpu_map[RVV_LEASE_CONTROL_WORKERS]; // OpenMP ith -> CPU
 	__u64 user_preferred_until_ns; // CLOCK_MONOTONIC 绝对过期时间
@@ -53,10 +77,13 @@ struct llm_pin_config {
 	__u64 gang_quantum_ns;
 	__u64 phase_hint_timeout_ns;
 	__u64 prefill_starvation_ns; // Max runnable wait before one safety slice
+	__u32 x86_smt_mode; // enum llm_x86_smt_mode
+	__u32 reserved_x86;
 };
 
 // 统计信息
 struct llm_pin_stats {
+	struct llm_team_stats teams[RVV_LEASE_CONTROL_TEAMS];
 	__u64 llm_scheduled;      // LLM 线程调度次数
 	__u64 llm_pinned;         // LLM 线程被固定到指定 CPU 的次数
 	__u64 system_scheduled;   // 系统线程调度次数
@@ -130,6 +157,17 @@ struct llm_pin_stats {
 	__u64 phase_lease_wakeup_preempts;
 	__u64 vector_exclusive_lease_handoffs;
 	__u64 vector_exclusive_lease_denials;
+	__u64 x86_smt_primary_selections;
+	__u64 x86_smt_sibling_selections;
+	__u64 x86_smt_latency_primary;
+	__u64 x86_smt_decode_shared;
+	__u64 x86_pair_gang_engagements;
+	__u64 x86_pair_gang_quanta;
+	__u64 x86_pair_gang_switches;
+	__u64 x86_pair_gang_primary_consumes;
+	__u64 x86_pair_gang_sibling_consumes;
+	__u64 x86_pair_gang_empty_consumes;
+	__u64 x86_pair_gang_wrong_runs;
 };
 
 struct rvv_task_class {
@@ -144,6 +182,7 @@ struct rvv_task_class {
 	__u32 user_hint_excluded;
 	__u32 reserved32;
 	__u64 user_session_id;
+	__u64 membership_epoch;
 	__u64 user_hint_retry_after_ns;
 	__u64 user_hint_first_seen_ns;
 };

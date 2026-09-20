@@ -7,9 +7,11 @@
 #endif
 
 #define RVV_LEASE_CONTROL_MAGIC       0x524c4354U
-#define RVV_LEASE_CONTROL_ABI_VERSION 3U
-#define RVV_LEASE_CONTROL_WORKERS     8U
-#define RVV_LEASE_CONTROL_TEAMS       2U
+#define RVV_LEASE_CONTROL_ABI_VERSION 4U
+#define RVV_LEASE_CONTROL_WORKERS     32U
+#define RVV_LEASE_CONTROL_TEAMS       8U
+#define RVV_LEASE_MAX_CPUS            8U
+#define RVV_LEASE_MAX_ACTIVE_WORKERS  8U
 #define RVV_LEASE_WORKER_PAGE_SIZE    4096U
 #define RVV_LEASE_CONTROL_DEFAULT_DIR "/sys/fs/bpf/scx_rvv_dirty_lease"
 #define RVV_LEASE_CONFIG_MAP_NAME     "config"
@@ -45,7 +47,8 @@ struct rvv_lease_worker_header {
 	__u64 session_id;
 	__u64 policy_epoch;
 	__u64 hint_epoch;
-	__u64 reserved64;
+	__u32 worker_limit;
+	__u32 registered_mask;
 } __attribute__((aligned(64)));
 
 struct rvv_lease_worker_slot {
@@ -56,7 +59,8 @@ struct rvv_lease_worker_slot {
 	__u32 n_threads;
 	__u32 flags;
 	__u64 session_id;
-	__u64 reserved64[4];
+	__u64 membership_epoch;
+	__u64 reserved64[3];
 } __attribute__((aligned(64)));
 
 struct rvv_lease_team_hint {
@@ -66,7 +70,7 @@ struct rvv_lease_team_hint {
 	__u32 flags;
 	__u32 prompt_tokens;
 	__u32 decode_tokens;
-	__u32 reserved32[2];
+	__u64 membership_epoch;
 	__u64 phase_epoch;
 	__u64 begin_ns;
 	__u64 expires_ns;
