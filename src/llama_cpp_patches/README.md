@@ -7,7 +7,13 @@ BPF map。
 
 ## 补丁文件
 
-`0001-llama-publish-sched_ext-worker-and-phase-hints.patch` 完成以下修改：
+补丁必须按 **`0001` → `0002` → `llama-dynamic.patch`** 的顺序应用，三者是增量
+关系而不是可替换关系：`0001`/`0002` 建立并升级 lease-hint 基础接口（最终 ABI v4），
+`llama-dynamic.patch` 在 **已打好 `0001`+`0002` 的源码树**上追加“动态线程 /
+persistent grant”runtime。它不能单独应用——其 diff 上下文里已经包含
+`scx-barrier-hint-client.*`、`scx-rvv-lease-control.h`（ABI v4）。
+
+`0001-llama-publish-sched_ext-worker-and-phase-hints.patch`（git-am 格式）完成以下修改：
 
 - 增加一次性的 `llama_set_sched_hint()` C API，阶段包括 `AUTO`、`IDLE`、
   `PREFILL`、`DECODE` 和 `MIXED`。
@@ -15,12 +21,28 @@ BPF map。
   数量分类，再把提示传给对应的 `llama_decode()`。
 - llama_context 将提示传到 GGML CPU backend；每次 graph 结束后恢复 `IDLE`，避免
   过期状态影响后续调度。
-- Linux OpenMP backend 注册 8 个 worker 的 `TID/TGID/ith`，并发布 graph、node、
+- Linux OpenMP backend 注册 worker 的 `TID/TGID/ith`，并发布 graph、node、
   barrier 和 team phase 状态。
 - BPF map 不存在、ABI 不匹配或未启用时自动保持 no-op，推理仍可继续运行。
 
-该 patch 包含当前 llama.cpp 工作树的全部 11 个相关文件修改，共 897 行新增、
-5 行删除。
+`0002-ggml-support-variable-sched-ext-worker-membership.patch`（git-am 格式）进一步完成：
+
+- ABI v4 为每个模型预留 32 个 worker 信息槽，并支持最多 8 个模型页。
+- K1 第一版仍将每个 graph 的实际 worker 数限制为 1–8。
+- 每个 graph 发布实际 OpenMP team 宽度、membership epoch 和注册位图。
+- 支持 `-t != -tb`；旧 epoch 中的槽位不会被视为当前 graph 成员。
+- 单线程 graph 也发布主线程身份，超限配置只禁用该 graph 的 hint 优化。
+
+`llama-dynamic.patch`（纯 unified diff，非 git-am 格式）在 v4 基础上完成：
+
+- 新增 `dynamic-client.c/.h`、`dynamic-worker-team.c/.h`、`dynamic-grant-client.c/.h`
+  与 `dynamic-control.h`，把动态线程宽度与 CPU 授权通过 Unix socket 交给用户态
+  controller（`experiments/dynamic_threads` 对应 `src/dynamic_threads`）。
+- 修改 `ggml-cpu.c/.cpp`、`include/llama.h`、`src/llama-context.*`、
+  `tools/server/server-context.cpp`、`ggml/src/ggml-cpu/CMakeLists.txt`，接入
+  persistent grant 的 begin/end/register/unregister 生命周期。
+- 必须先应用 `0001`+`0002`，再用 `git apply` 应用本补丁；`scx-rvv-lease-control.h`
+  与 `src/scx_llm_pin/scx_rvv_lease_control.h` 保持逐字节一致。
 
 ## 上游来源
 
@@ -59,27 +81,32 @@ Copyright (c) 2023-2026 The ggml authors
 
 ```bash
 export LLAMA_SRC=/path/to/llama.cpp
-export PATCH_DIR=/path/to/experiments/llama_cpp_patches
+export PATCH_DIR=/path/to/src/llama_cpp_patches
 ```
 
-从准确基线创建独立分支并应用：
+从准确基线创建独立分支，先按 git-am 顺序应用 `0001`、`0002`，再以纯 diff 方式
+应用 `llama-dynamic.patch`：
 
 ```bash
 git -C "$LLAMA_SRC" status --short
 git -C "$LLAMA_SRC" switch -c sched-ext-hints \
     678d43d7205cffc3a8a026cb60b1de3868cc70a2
 git -C "$LLAMA_SRC" am --3way \
-    "$PATCH_DIR/0001-llama-publish-sched_ext-worker-and-phase-hints.patch"
+    "$PATCH_DIR/0001-llama-publish-sched_ext-worker-and-phase-hints.patch" \
+    "$PATCH_DIR/0002-ggml-support-variable-sched-ext-worker-membership.patch"
+git -C "$LLAMA_SRC" apply --3way "$PATCH_DIR/llama-dynamic.patch"
 ```
 
 检查最终源码：
 
 ```bash
-git -C "$LLAMA_SRC" log -1 --oneline
-git -C "$LLAMA_SRC" diff --check HEAD~1..HEAD
-test "$(git -C "$LLAMA_SRC" rev-parse 'HEAD^{tree}')" = \
-    f560bb73bc657ec728e9d6a980ea1e20c9c7f378
+git -C "$LLAMA_SRC" log -2 --oneline
+git -C "$LLAMA_SRC" diff --check
 ```
+
+说明：`llama-dynamic.patch` 是纯 unified diff（无 `From`/`Subject`），所以用
+`git apply` 而不是 `git am`；它假定 `0001`/`0002` 已应用，直接对干净上游应用会
+因上下文缺失而失败。
 
 出现冲突时可以修复后继续，或者取消应用：
 
@@ -229,7 +256,7 @@ curl --fail "http://<board-host>:$SERVER_PORT/health"
 双模型 harness 通过 `--runtime-bin-dir` 选择该目录，不会再次上传 runtime：
 
 ```bash
-cd "$PATCH_DIR/../benchmark/dual_model"
+cd "$PATCH_DIR/../../tests/benchmark/dual_model"
 ./run.sh \
     --llm-path "$LLAMA_REMOTE" \
     --runtime-bin-dir "$REMOTE_RUNTIME" \
@@ -245,12 +272,12 @@ worker 和 phase。若部署验证失败，停止测试 server，并把 `--runti
 
 ## Dirty Lease 接口
 
-当前 `scx_llm_pin` 主路径使用 dirty-lease ABI v3。llama-server 启动时必须把
+当前 `scx_llm_pin` 主路径使用 dirty-lease ABI v4。llama-server 启动时必须把
 `GGML_SCX_LEASE_HINT_PATH` 指向调度器 pin 的 `workers` map：
 
 ```bash
 export GGML_SCX_LEASE_HINT_PATH=/sys/fs/bpf/scx_rvv_dirty_lease/workers
-llama-server -m /path/to/model.gguf -t 8 -tb 8 -np 4
+llama-server -m /path/to/model.gguf -t 4 -tb 8 -np 4
 ```
 
 推荐启动顺序：
@@ -260,11 +287,13 @@ llama-server -m /path/to/model.gguf -t 8 -tb 8 -np 4
    loader 创建并 pin map。
 3. llama.cpp 在后续 graph 开始时重试连接；连接成功后 stderr 会出现
    `GGML_SCX_LEASE_HINT connected`。
-4. 使用 `rvv_lease_ctl status` 检查 8 个 worker、TGID、team 和 phase。
+4. 使用 `rvv_lease_ctl status` 检查当前 membership 的 worker 数、TGID、team 和
+   phase。prefill/decode 使用不同线程数时，注册位图应随 graph 宽度变化。
 
-双 llama-server 场景中，调度器为两个 TGID 建立两页 worker 数据；每个进程会按
-自身 TGID 选择对应页。`scx-rvv-lease-control.h` 必须与
-`experiments/scx_llm_pin/scx_rvv_lease_control.h` 保持逐字节一致。
+N 模型场景中，调度器按 TGID 建立最多八页 worker 数据；每个进程会按自身 TGID
+选择对应页。每页虽然预留 32 个信息槽，当前 K1 配置仍只接受 1–8 个活跃 worker。
+`scx-rvv-lease-control.h` 必须与
+`src/scx_llm_pin/scx_rvv_lease_control.h` 保持逐字节一致。
 
 ## Barrier Hint 兼容接口
 
@@ -293,7 +322,7 @@ unset GGML_SCX_GANG_HINT_PATH
 - patch 能从准确基线通过 `git am --3way` 应用，最终 tree 与参考值一致。
 - `cmake --build ... --target llama-server` 完成，OpenMP 与 RVV 均启用。
 - llama-server 在不设置 hint 环境变量时能正常完成请求。
-- `observe/active` 模式下日志出现 lease map connected，8 个 worker 注册完整。
+- `observe/active` 模式下日志出现 lease map connected，当前 graph 的 worker 注册完整。
 - `rvv_lease_ctl status` 中 phase 能在 `PREFILL/DECODE/MIXED/IDLE` 之间变化。
 - 调度器退出或 map 失效后推理继续运行，不发生 server crash。
 - 调度测试期间没有 sched_ext watchdog、stall、BUG 或 Oops。

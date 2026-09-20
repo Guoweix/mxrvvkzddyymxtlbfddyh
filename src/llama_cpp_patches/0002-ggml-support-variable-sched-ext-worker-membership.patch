@@ -1,0 +1,184 @@
+From 7a1a623522668a957ec1f5b9f736b786b65cb69f Mon Sep 17 00:00:00 2001
+From: Build <build@local>
+Date: Fri, 11 Sep 2026 12:00:00 +0800
+Subject: [PATCH 2/2] ggml: support variable sched_ext worker membership
+
+Publish the actual OpenMP team width for every graph and tag its worker
+records with a membership epoch.  This lets the scheduler distinguish a
+prefill team from a smaller decode team without treating stale slots as
+current members.
+
+Reserve room for 32 worker records and eight model teams while keeping the
+K1 runtime limit at eight active workers per model.
+---
+ ggml/src/ggml-cpu/ggml-cpu.c                 |  9 +++++--
+ ggml/src/ggml-cpu/scx-barrier-hint-client.c  | 30 ++++++++++++++++++++---
+ ggml/src/ggml-cpu/scx-rvv-lease-control.h    | 13 ++++++----
+ 3 files changed, 42 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/scx-rvv-lease-control.h b/ggml/src/ggml-cpu/scx-rvv-lease-control.h
+--- a/ggml/src/ggml-cpu/scx-rvv-lease-control.h
++++ b/ggml/src/ggml-cpu/scx-rvv-lease-control.h
+@@ -7,9 +7,11 @@
+ #endif
+ 
+ #define RVV_LEASE_CONTROL_MAGIC       0x524c4354U
+-#define RVV_LEASE_CONTROL_ABI_VERSION 3U
+-#define RVV_LEASE_CONTROL_WORKERS     8U
+-#define RVV_LEASE_CONTROL_TEAMS       2U
++#define RVV_LEASE_CONTROL_ABI_VERSION 4U
++#define RVV_LEASE_CONTROL_WORKERS     32U
++#define RVV_LEASE_CONTROL_TEAMS       8U
++#define RVV_LEASE_MAX_CPUS            8U
++#define RVV_LEASE_MAX_ACTIVE_WORKERS  8U
+ #define RVV_LEASE_WORKER_PAGE_SIZE    4096U
+ #define RVV_LEASE_CONTROL_DEFAULT_DIR "/sys/fs/bpf/scx_rvv_dirty_lease"
+ #define RVV_LEASE_CONFIG_MAP_NAME     "config"
+@@ -45,7 +47,8 @@ struct rvv_lease_worker_header {
+ 	__u64 session_id;
+ 	__u64 policy_epoch;
+ 	__u64 hint_epoch;
+-	__u64 reserved64;
++	__u32 worker_limit;
++	__u32 registered_mask;
+ } __attribute__((aligned(64)));
+ 
+ struct rvv_lease_worker_slot {
+@@ -56,7 +59,8 @@ struct rvv_lease_worker_slot {
+ 	__u32 n_threads;
+ 	__u32 flags;
+ 	__u64 session_id;
+-	__u64 reserved64[4];
++	__u64 membership_epoch;
++	__u64 reserved64[3];
+ } __attribute__((aligned(64)));
+ 
+ struct rvv_lease_team_hint {
+@@ -66,7 +70,7 @@ struct rvv_lease_team_hint {
+ 	__u32 flags;
+ 	__u32 prompt_tokens;
+ 	__u32 decode_tokens;
+-	__u32 reserved32[2];
++	__u64 membership_epoch;
+ 	__u64 phase_epoch;
+ 	__u64 begin_ns;
+ 	__u64 expires_ns;
+diff --git a/ggml/src/ggml-cpu/scx-barrier-hint-client.c b/ggml/src/ggml-cpu/scx-barrier-hint-client.c
+--- a/ggml/src/ggml-cpu/scx-barrier-hint-client.c
++++ b/ggml/src/ggml-cpu/scx-barrier-hint-client.c
+@@ -37,6 +37,7 @@ struct ggml_scx_lease_client {
+     uint64_t retry_after_ns;
+     uint64_t connected_session_id;
+     uint64_t next_phase_epoch;
++    uint64_t membership_epoch;
+     uint32_t tgid;
+     bool configured;
+     char path[256];
+@@ -278,9 +279,29 @@ static bool connect_lease_map(void) {
+ }
+ 
+ void ggml_scx_lease_hint_graph_begin(int n_threads) {
+-    if (n_threads == (int) RVV_LEASE_CONTROL_WORKERS) {
+-        connect_lease_map();
++    if (!connect_lease_map()) {
++        return;
++    }
++    struct rvv_lease_worker_page * page = g_lease_client.page;
++    struct rvv_lease_team_hint * hint = &page->team_hint;
++    uint32_t seq = __atomic_load_n(&hint->sequence, __ATOMIC_RELAXED);
++    if (seq & 1U) seq++;
++    __atomic_store_n(&hint->sequence, seq + 1, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    __atomic_store_n(&page->header.registered_mask, 0, __ATOMIC_RELEASE);
++    hint->membership_epoch = ++g_lease_client.membership_epoch;
++    hint->active_workers = (uint32_t) n_threads;
++    if (n_threads < 1 || n_threads > (int) page->header.worker_limit) {
++        static bool warned;
++        if (!warned) {
++            fprintf(stderr, "GGML_SCX_LEASE_HINT invalid worker count=%d limit=%u\n",
++                    n_threads, page->header.worker_limit);
++            warned = true;
++        }
++        hint->flags = 0;
++        hint->expires_ns = 0;
+     }
++    __atomic_store_n(&hint->sequence, seq + 2, __ATOMIC_RELEASE);
+ }
+ 
+ void ggml_scx_lease_hint_register(uint32_t tid, int ith, int n_threads) {
+@@ -288,7 +309,8 @@ void ggml_scx_lease_hint_register(uint32_t tid, int ith, int n_threads) {
+     struct rvv_lease_worker_slot * slot;
+     uint32_t sequence;
+ 
+-    if (page == NULL || !tid || n_threads != (int) RVV_LEASE_CONTROL_WORKERS ||
++    if (page == NULL || !tid || n_threads < 1 || n_threads > (int) page->header.worker_limit ||
++            n_threads > (int) RVV_LEASE_MAX_ACTIVE_WORKERS ||
+             ith < 0 || ith >= n_threads ||
+             !__atomic_load_n(&page->header.active, __ATOMIC_ACQUIRE)) {
+         return;
+@@ -298,7 +320,8 @@ void ggml_scx_lease_hint_register(uint32_t tid, int ith, int n_threads) {
+     if (!(sequence & 1U) && slot->tid == tid &&
+             slot->tgid == g_lease_client.tgid && slot->ith == (uint32_t) ith &&
+             slot->n_threads == (uint32_t) n_threads &&
+-            slot->session_id == page->header.session_id) {
++            slot->session_id == page->header.session_id &&
++            slot->membership_epoch == g_lease_client.membership_epoch) {
+         return;
+     }
+     if (sequence & 1U) {
+@@ -311,8 +334,10 @@ void ggml_scx_lease_hint_register(uint32_t tid, int ith, int n_threads) {
+     slot->ith = (uint32_t) ith;
+     slot->n_threads = (uint32_t) n_threads;
+     slot->flags = 0;
++    slot->membership_epoch = g_lease_client.membership_epoch;
+     slot->session_id = page->header.session_id;
+     __atomic_store_n(&slot->sequence, sequence + 2, __ATOMIC_RELEASE);
++    __atomic_fetch_or(&page->header.registered_mask, 1U << ith, __ATOMIC_RELEASE);
+ }
+ 
+ static void publish_lease_phase(
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3381,7 +3381,6 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpla
+ 
+ #ifdef GGML_USE_OPENMP
+ #if defined(__gnu_linux__)
+-    ggml_scx_lease_hint_graph_begin(n_threads);
+     threadpool->barrier_hint_graph_epoch =
+             ggml_scx_barrier_hint_graph_begin(n_threads);
+ #endif
+@@ -3392,6 +3391,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpla
+             {
+                 // update the number of threads from the actual number of threads that we got from OpenMP
+                 n_threads = omp_get_num_threads();
++#if defined(__gnu_linux__)
++                ggml_scx_lease_hint_graph_begin(n_threads);
++#endif
+                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
+             }
+ 
+@@ -3400,9 +3402,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpla
+ 
+ #if defined(__gnu_linux__)
+             struct ggml_compute_state * hint_worker = &threadpool->workers[ith];
+-            if (!hint_worker->barrier_hint_tid) {
+-                hint_worker->barrier_hint_tid = (uint32_t) syscall(SYS_gettid);
+-            }
++            hint_worker->barrier_hint_tid = (uint32_t) syscall(SYS_gettid);
+             ggml_scx_lease_hint_register(
+                     hint_worker->barrier_hint_tid,
+                     ith,
+@@ -3437,6 +3437,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpla
+         }
+     } else {
+         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
++#if defined(__gnu_linux__)
++        ggml_scx_lease_hint_graph_begin(1);
++        ggml_scx_lease_hint_register((uint32_t) syscall(SYS_gettid), 0, 1);
++#endif
+         ggml_graph_compute_thread(&threadpool->workers[0]);
+     }
+ #if defined(__gnu_linux__)
+-- 
+2.51.0
