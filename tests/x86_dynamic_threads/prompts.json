@@ -1,0 +1,22 @@
+[
+  {
+    "id": "fixed-1",
+    "target_tokens": 128,
+    "prompt": "A hospital operates a small appointment service on an eight-core computer. Explain how a CPU scheduler should balance fast responses, total throughput, and fair access when several patient requests arrive together. Discuss worker wakeups, shared queues, cache locality, and synchronization delays. Propose three measurements that would distinguish an application bottleneck from an operating-system scheduling problem, and state the assumptions behind the comparison."
+  },
+  {
+    "id": "fixed-2",
+    "target_tokens": 128,
+    "prompt": "An online map service calculates several routes at once on an eight-core processor. Analyze how thread placement, migration, cache reuse, barriers, and background kernel work can change the latency of the first route and the sustained rate of later results. Design a controlled experiment with repeatable inputs, precise timestamps, and safety checks, then explain how throughput and fairness should be interpreted together."
+  },
+  {
+    "id": "fixed-3",
+    "target_tokens": 128,
+    "prompt": "A factory inspection program processes camera observations with parallel CPU workers on an eight-core machine. Describe what happens when two independent jobs compete for all cores while their workers repeatedly compute, synchronize, sleep, and wake. Identify the effects of long time slices and fixed CPU placement, and outline a measurement plan covering response latency, completed work, runqueue delay, context switches, and system stability."
+  },
+  {
+    "id": "fixed-4",
+    "target_tokens": 128,
+    "prompt": "A scientific data server runs two concurrent simulations using vector instructions and shared worker teams on eight CPU cores. Explain how uneven progress between workers can create barrier delays even when aggregate utilization is high. Compare a general fair scheduler with a phase-aware policy, considering locality, starvation, kernel responsiveness, and reproducibility. Finish with practical acceptance criteria for deciding whether the specialized policy provides a real improvement."
+  }
+]

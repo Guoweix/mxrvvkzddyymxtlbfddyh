@@ -34,6 +34,16 @@ export LLAMA_CPU_SRC="${LLAMA_CPU_SRC:-../experiments/dynamic_threads/llama.cpp/
 export DT_LLAMA_BIN="${DT_LLAMA_BIN:-../experiments/dynamic_threads/llama.cpp/build-dynamic-riscv/bin}"
 
 # ========================================
+# x86_dynamic_threads（x86 迁移）
+# ========================================
+# 已应用 0001→0002→llama-dynamic 的 x86 llama.cpp ggml-cpu（编译 phase_probe）。
+export DT_X86_LLAMA_CPU_SRC="${DT_X86_LLAMA_CPU_SRC:-../experiments/x86_dynamic_threads/llama/ggml/src/ggml-cpu}"
+# x86 llama-server 与共享库目录（run_dual_model_x86/run_multi_x86 本机启动）。
+export DT_X86_LLAMA_BIN="${DT_X86_LLAMA_BIN:-../experiments/x86_dynamic_threads/llama/build-x86/bin/llama-server}"
+export DT_X86_LIBDIR="${DT_X86_LIBDIR:-../experiments/x86_dynamic_threads/llama/build-x86/bin}"
+export DT_X86_MODEL="${DT_X86_MODEL:-../riscv-linux/host-share/Llama-3.2-3B-Instruct-Q4_K_M.gguf}"
+
+# ========================================
 # rvv_sched_cost 调度观测（独立工具）
 # ========================================
 export RVV_TRACE="${RVV_TRACE:-0}"

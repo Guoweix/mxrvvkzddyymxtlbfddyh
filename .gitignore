@@ -6,3 +6,8 @@ src/dynamic_threads/build
 tests/dynamic_threads/__pycache__
 tests/dynamic_threads/results
 tests/dynamic_threads/*.log
+src/x86_dynamic_threads/build
+src/x86_dynamic_threads/llama
+tests/x86_dynamic_threads/__pycache__
+tests/x86_dynamic_threads/results
+tests/x86_dynamic_threads/*.log
