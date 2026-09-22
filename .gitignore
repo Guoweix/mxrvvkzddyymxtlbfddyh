@@ -11,8 +11,3 @@ src/x86_dynamic_threads/llama
 tests/x86_dynamic_threads/__pycache__
 tests/x86_dynamic_threads/results
 tests/x86_dynamic_threads/*.log
-demo/*/tests/results
-demo/*/tests/__pycache__
-demo/*/tests/*.log
-demo/*/*.log
-demo/*/bin/vmlinux.btf
