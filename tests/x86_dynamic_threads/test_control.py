@@ -15,7 +15,8 @@ import time
 import unittest
 
 HERE = Path(__file__).resolve().parent
-BUILD = HERE.parent / "build"
+# 源码与构建产物在 src/x86_dynamic_threads（tests 与 src 分目录）。
+BUILD = HERE.parent.parent / "src" / "x86_dynamic_threads" / "build"
 WIRE = struct.Struct("=8I4Q12I")
 MAGIC, VERSION = 0x44544752, 4
 

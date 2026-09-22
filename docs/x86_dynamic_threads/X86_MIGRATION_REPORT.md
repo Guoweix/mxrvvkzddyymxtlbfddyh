@@ -43,7 +43,10 @@
 
 - persistent 1000 graph：**1 REQUEST/GRANT、1 MEMBERS、1 UNMEMBERS、1 RELEASE、
   1 REVOKE**；`wrong_cpu=0 stale_identity=0`。
-- x86 单测：`test_control/persistent/decode_guard/shrink/multi_metrics` 23 项通过。
+- 测试口径：x86 沿用其既有验证方式（`--check-config` 风格 + 运行时 runner），
+  **不套用 RISC-V 的分配语义单测**。`make test` 覆盖架构无关的
+  `test_transport`/`test_allocation`/`test_worker_team` 与协议/指标单测
+  `test_control`/`test_multi_metrics`（均通过）。
 
 ## M3 SMT 感知与相位感知 ✅
 

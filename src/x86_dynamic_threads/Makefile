@@ -25,7 +25,7 @@ USER_FLAGS := -g -O2 -Wall -Wextra -Werror -I. -I$(BUILD) -I$(TESTS)
 USER_LIBS := $(shell pkg-config --libs libbpf) -lpthread
 
 .DELETE_ON_ERROR:
-.PHONY: all host check-llama clean
+.PHONY: all host test check-llama clean
 
 all: $(BUILD)/dt_controller $(BUILD)/dt_probe $(BUILD)/dt_persistent_probe
 
@@ -85,6 +85,14 @@ $(BUILD)/vmlinux.h: $(VMLINUX_BTF) $(BPFTOOL) | $(BUILD)
 
 $(BUILD):
 	mkdir -p $@
+
+# x86 的验证入口：架构无关的 C 单测 + 协议/指标 Python 单测。
+# （分配语义相关的 RISC-V 单测不适用于 x86 SMT 分配，未纳入。）
+test: host
+	$(BUILD)/test_transport
+	$(BUILD)/test_allocation
+	$(BUILD)/test_worker_team
+	cd $(TESTS) && python3 -m unittest test_control test_multi_metrics
 
 clean:
 	rm -rf $(BUILD)
