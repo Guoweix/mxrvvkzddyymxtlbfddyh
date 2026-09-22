@@ -2,7 +2,7 @@
 
 **INFERSCHED**（Inference Scheduler）是一套面向 RISC-V 平台的 Linux 调度方案：
 基于 `sched_ext`（eBPF）与一个用户态控制器，**指导并编排共置的多个 LLM 推理
-进程**（llama.cpp / llama-server）在八核 CPU 上的线程数与核心分配，改善多实例
+进程**（llama.cpp / llama-server）在多核 CPU 上的线程数与核心分配，改善多实例
 竞争时的首 token 延迟（TTFT）、解码吞吐（TPS）与尾延迟。
 
 仓库提供一套可复现的实验环境：K1 Linux 6.6 的 sched_ext 补丁、llama.cpp 运行时
@@ -14,14 +14,10 @@
   的调度器、cgroup、BTF、libbpf 和驱动构建兼容代码。
 - **动态线程与 CPU 授权**：控制器按需为处于活跃期的推理进程授予 worker 宽度与
   CPU 掩码，并通过独立 sched_ext 程序把成员线程放置到授权核心。
-- **持续授权（persistent grant）**：稳定期跨 graph 持续持有授权，仅在分配变化时
-  协调，避免逐 graph 反复握手；支持异步 GRANT/REVOKE 与安全交接。
 - **阶段感知分配**：prefill 优先、decode 保底核心，按 `PREFILL/DECODE/MIXED`
   相位在 graph 边界安全交接。
-- **任务身份校验**：以 `start_boottime` 校验成员身份，避免 worker TID 复用导致的
-  误放置。
 - **多进程共置**：支持最多 8 个独立 llama-server 同时驻留与调度。
-- **可重复 benchmark 与门禁**：`run_benchmark` / `run_control_gate` /
+- ** benchmark **：`run_benchmark` / `run_control_gate` /
   `run_multi_benchmark` 覆盖 CFS、动态授权与多进程场景。
 
 ## 项目结构
@@ -55,6 +51,16 @@ graph 边界请求一次授权（worker 宽度与 CPU 掩码）。控制器仲�
 per-CPU DSQ，否则落入 global DSQ；`running` 回调事后校验实际运行核。eBPF 仅做
 放置，策略与仲裁全部留在用户态控制器。
 
+打补丁后的 llama.cpp 在原有推理流程之上接入了一个可移植的运行时适配层，使其能够
+接受用户态控制器的调度指示。它按 continuous-batching 的 batch 组成区分
+`PREFILL/DECODE/MIXED` 相位并逐 graph 传给 `llama_context`，并在每个 graph 边界依据
+控制器下发的授权动态调整本次计算实际使用的 OpenMP 工作线程数量，再按授权中的
+CPU 掩码修改这些线程的核心亲和性，随后上报实际 TID（`MEMBERS`）供 eBPF 放置；
+计算结束撤销成员（`UNMEMBERS`）并恢复原亲和性。首个请求使进程转为活跃、最后一个
+请求释放后转为空闲，稳定期授权跨 graph 持续持有，仅在分配变化时收到异步
+`GRANT/REVOKE`。未设置 `GGML_DYNAMIC_THREADS_SOCKET` 时整层为 no-op，行为与原生
+llama.cpp 完全一致。
+
 ### Phase-Aware Dirty Lease
 
 <p align="center">
@@ -74,7 +80,7 @@ UNMEMBERS →（恢复 affinity）→ RELEASE`。稳定期不逐 graph 重复握
 时触发异步 `GRANT/REVOKE`。eBPF 侧以任务的 `start_boottime` 校验成员身份，防止
 worker 线程销毁/重建后数值 TID 复用导致的误放置。
 
-下图展示 per-CPU DSQ 的消费与入队路径：受管 worker 只从自己目标 CPU 的 DSQ 运行；
+上图展示 per-CPU DSQ 的消费与入队路径：受管 worker 只从自己目标 CPU 的 DSQ 运行；
 local 为空时，普通任务仍由 global DSQ 提供服务，保证非推理任务不被饿死。
 
 ### 实验数据对比
