@@ -35,7 +35,7 @@
 
 <p align="center">
   <a href="docs/images/architecture.svg">
-    <img src="docs/images/architecture.svg" width="1200" alt="RVV-aware sched_ext 用户态与 Linux 内核通信架构">
+    <img src="docs/images/architecture.svg" width="1200" alt="INFERSCHED 框架：用户态控制器与 CPU 授权、BPF maps、sched_ext 调度路径与 RISC-V/K1 硬件平台">
   </a>
 </p>
 
@@ -63,11 +63,6 @@ llama.cpp 完全一致。
 
 ### Phase-Aware Dirty Lease
 
-<p align="center">
-  <a href="docs/images/phase-aware-lease.svg">
-    <img src="docs/images/phase-aware-lease.svg" width="1200" alt="Phase-aware lease 中 CPU i 的 DSQ 消费顺序与 vector worker 入队路径">
-  </a>
-</p>
 
 当前策略在“持续授权（persistent grant）”之上做相位感知分配。控制器为每个处于
 活跃期的推理进程维持一份跨 graph 复用的 grant，并在实例之间划分 CPU：默认
@@ -80,8 +75,6 @@ UNMEMBERS →（恢复 affinity）→ RELEASE`。稳定期不逐 graph 重复握
 时触发异步 `GRANT/REVOKE`。eBPF 侧以任务的 `start_boottime` 校验成员身份，防止
 worker 线程销毁/重建后数值 TID 复用导致的误放置。
 
-上图展示 per-CPU DSQ 的消费与入队路径：受管 worker 只从自己目标 CPU 的 DSQ 运行；
-local 为空时，普通任务仍由 global DSQ 提供服务，保证非推理任务不被饿死。
 
 ### 实验数据对比
 
