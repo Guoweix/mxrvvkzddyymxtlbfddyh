@@ -1,0 +1,7 @@
+{
+  "models": [
+    {"id": "A", "port": 9191, "model": "/mnt/llm/llama/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf", "threads": 8, "threads_batch": 8, "requests": 1},
+    {"id": "B", "port": 9192, "model": "/mnt/llm/llama/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf", "threads": 4, "threads_batch": 4, "requests": 1},
+    {"id": "C", "port": 9193, "model": "/mnt/llm/llama/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf", "threads": 2, "threads_batch": 2, "requests": 1}
+  ]
+}
