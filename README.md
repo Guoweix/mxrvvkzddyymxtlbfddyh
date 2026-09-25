@@ -1,158 +1,167 @@
 # INFERSCHED：面向 RISC-V 的 LLM 推理调度器
 
-**INFERSCHED**（Inference Scheduler）是一套面向 RISC-V 平台的 Linux 调度方案：
-基于 `sched_ext`（eBPF）与一个用户态控制器，**指导并编排共置的多个 LLM 推理
-进程**（llama.cpp / llama-server）在多核 CPU 上的线程数与核心分配，改善多实例
-竞争时的首 token 延迟（TTFT）、解码吞吐（TPS）与尾延迟。
+本项目面向 Milk-V Jupiter / SpacemiT K1 八核 RISC-V 平台，研究 Linux
+`sched_ext` 对 llama.cpp CPU 推理工作负载的调度优化。项目使用 eBPF 调度器识别
+执行 RVV 向量计算的 worker，并结合 CPU 分配、vector DSQ、长时间片以及
+llama.cpp 提供的 prefill/decode 阶段提示，改善多线程和多模型竞争时的调度行为。
 
-仓库提供一套可复现的实验环境：K1 Linux 6.6 的 sched_ext 补丁、llama.cpp 运行时
-补丁、独立的 sched_ext 调度器与用户态控制器，以及 benchmark 与门禁脚本。
+仓库提供一套可复现的实验环境，包括 K1 Linux 6.6 的 sched_ext 补丁、llama.cpp
+用户态提示补丁、RVV-aware eBPF 调度器、低开销观测工具和 benchmark。
 
 ## 核心能力
 
 - **K1 sched_ext 内核支持**：将 sched_ext 移植到 K1 厂商 Linux 6.6，并补齐厂商树
   的调度器、cgroup、BTF、libbpf 和驱动构建兼容代码。
-- **动态线程与 CPU 授权**：控制器按需为处于活跃期的推理进程授予 worker 宽度与
-  CPU 掩码，并通过独立 sched_ext 程序把成员线程放置到授权核心。
-- **阶段感知分配**：prefill 优先、decode 保底核心，按 `PREFILL/DECODE/MIXED`
-  相位在 graph 边界安全交接。
-- **多进程共置**：支持最多 8 个独立 llama-server 同时驻留与调度。
-- ** benchmark **：`run_benchmark` / `run_control_gate` /
-  `run_multi_benchmark` 覆盖 CFS、动态授权与多进程场景。
+- **RVV worker 识别**：根据任务的 RISC-V Vector 上下文状态和可配置 dirty 命中
+  阈值识别向量计算线程。
+- **`rvv_dirty_local` 单策略**：为向量 worker 分配互不重复的 CPU，使用
+  per-team/per-CPU vector DSQ 和长时间片；每消费一次 VDSQ 打开 500ms local
+  窗口，普通任务与向量任务在该窗口内在 local DSQ 混排；向远端 VDSQ 投递后按需
+  `kick` 目标 CPU，避免空闲核上的任务饿死。
+- **自动 phase-aware**：无有效 hint 时回退到上述默认；一旦从 ABI v4 worker page
+  读到有效 phase hint，即启用 PREFILL/MIXED 优先消费、preferred wakeup 定向抢占
+  和 prefill 安全片。无需策略/模式开关。
+- **用户态调度提示**：llama.cpp 可通过 mmapable BPF map 注册 OpenMP worker，
+  并发布 `PREFILL`、`DECODE`、`MIXED` 和 `IDLE` 阶段。
+- **x86/SMT 移植**：`src/x86_scx_llm_pin` 用 ABI v4 hint 替代 RISC-V `sstatus.VS`
+  分类，并把 2×4 worker 固定 spread 到 4C/8T 的 0-3/4-7。
+- **调度观测**：采集 RVV save/restore 候选、上下文切换、wake-to-run 延迟、
+  futex wait/wake 和 blocked time。
+- **可重复 benchmark**：`tests/benchmark` 提供 CFS、dynamic、scx-llm-pin、
+  cfs-affinity 策略，覆盖 dual-async、dual-sync、multi 三种场景，并支持本地
+  x86 运行。
 
 ## 项目结构
 
 | 目录 | 内容 |
 |---|---|
 | [`src/kernel_patches/`](src/kernel_patches/) | K1 Linux 6.6 sched_ext 移植、厂商树适配和可选 RVV lazy restore |
-| [`src/llama_cpp_patches/`](src/llama_cpp_patches/) | llama.cpp 补丁链：lease-hint 基础（0001/0002）与动态线程/persistent grant runtime |
-| [`src/dynamic_threads/`](src/dynamic_threads/) | 主调度器：sched_ext 策略、用户态控制器、CPU 分配器与 worker 生命周期 |
+| [`src/llama_cpp_patches/`](src/llama_cpp_patches/) | llama.cpp OpenMP worker 注册和 prefill/decode phase hint |
+| [`src/scx_llm_pin/`](src/scx_llm_pin/) | 主调度器：RVV-aware sched_ext，单策略 `rvv_dirty_local` + 自动 phase-aware |
+| [`src/x86_scx_llm_pin/`](src/x86_scx_llm_pin/) | 同策略的 x86/SMT 自包含移植（ABI v4 hint 分类 + spread 放置） |
 | [`src/rvv_sched_cost/`](src/rvv_sched_cost/) | RVV、调度延迟和 futex CO-RE eBPF 观测工具 |
-| [`tests/dynamic_threads/`](tests/dynamic_threads/) | 主测试：benchmark、控制/llama 门禁、多进程测试、单元测试与共享模块 |
-| [`tests/config.sh`](tests/config.sh) | 唯一配置入口（板端连接、工具链根、llama.cpp 路径） |
+| [`src/dynamic_threads/`](src/dynamic_threads/) | 动态授权调度控制器（见附录） |
+| [`src/x86_dynamic_threads/`](src/x86_dynamic_threads/) | x86 动态授权控制器（见附录） |
+| [`tests/benchmark/`](tests/benchmark/) | 统一 Python benchmark（三场景，策略 CFS/dynamic/scx-llm-pin/cfs-affinity） |
+| [`tests/config.sh`](tests/config.sh) | 板卡、工具链与运行时路径的统一配置来源 |
 
 ## 工作方式
 
 <p align="center">
   <a href="docs/images/architecture.svg">
-    <img src="docs/images/architecture.svg" width="1200" alt="INFERSCHED 框架：用户态控制器与 CPU 授权、BPF maps、sched_ext 调度路径与 RISC-V/K1 硬件平台">
+    <img src="docs/images/architecture.svg" width="1200" alt="RVV-aware sched_ext 用户态与 Linux 内核通信架构">
   </a>
 </p>
 
-主调度器 `src/dynamic_threads` 由一个用户态控制器 `dt_controller` 与一段独立的
-sched_ext eBPF 程序（`control.bpf.c`）组成。`dt_controller` 通过 libbpf 加载并附加
-struct_ops，同时在 Unix domain socket（`SOCK_SEQPACKET`）上接受来自 patched
-llama-server 的连接；运行时用 `GGML_DYNAMIC_THREADS_SOCKET` 指定该 socket，在
-graph 边界请求一次授权（worker 宽度与 CPU 掩码）。控制器仲裁后写回 grant，运行时
-把实际的 OpenMP worker TID 上报（`MEMBERS`），控制器写入 `members` BPF map。
+`scx_llm_pin` loader 通过 libbpf 加载 eBPF 程序、初始化并 pin `config/workers`
+maps，最后把 struct_ops 附加到 Linux sched_ext。patched llama-server 使用
+`BPF_OBJ_GET + mmap` 写入 OpenMP worker 身份和推理 phase；`rvv_lease_ctl` 使用
+BPF map lookup/update syscall 读取运行状态或在线调整 slice、vector window 和
+dirty 阈值（`rvv_lease_ctl status` / `set` / `reset`）。
 
-内核调度核心调用 eBPF 的 `select_cpu`、`enqueue`、`dispatch` 和 `running` callbacks。
-`enqueue` 时按 TID 查 `members`→`grants` 两张表：命中则把任务投递到目标 CPU 的
-per-CPU DSQ，否则落入 global DSQ；`running` 回调事后校验实际运行核。eBPF 仅做
-放置，策略与仲裁全部留在用户态控制器。
-
-打补丁后的 llama.cpp 在原有推理流程之上接入了一个可移植的运行时适配层，使其能够
-接受用户态控制器的调度指示。它按 continuous-batching 的 batch 组成区分
-`PREFILL/DECODE/MIXED` 相位并逐 graph 传给 `llama_context`，并在每个 graph 边界依据
-控制器下发的授权动态调整本次计算实际使用的 OpenMP 工作线程数量，再按授权中的
-CPU 掩码修改这些线程的核心亲和性，随后上报实际 TID（`MEMBERS`）供 eBPF 放置；
-计算结束撤销成员（`UNMEMBERS`）并恢复原亲和性。首个请求使进程转为活跃、最后一个
-请求释放后转为空闲，稳定期授权跨 graph 持续持有，仅在分配变化时收到异步
-`GRANT/REVOKE`。未设置 `GGML_DYNAMIC_THREADS_SOCKET` 时整层为 no-op，行为与原生
-llama.cpp 完全一致。
+内核调度核心调用 eBPF 的 `select_cpu`、`enqueue`、`dispatch`、`running` 和
+`stopping` callbacks。eBPF 调度器结合 BPF maps 与 `task_struct` 中的 RISC-V
+Vector 状态完成 RVV worker 识别、CPU 分配和 DSQ 选择，再通过 sched_ext kfunc
+把任务交回 Linux 调度核心执行。
 
 ### Phase-Aware Dirty Lease
 
+<p align="center">
+  <a href="docs/images/phase-aware-lease.svg">
+    <img src="docs/images/phase-aware-lease.svg" width="1200" alt="Phase-aware lease 中 CPU i 的 DSQ 消费顺序与 vector worker 入队路径">
+  </a>
+</p>
 
-当前策略在“持续授权（persistent grant）”之上做相位感知分配。控制器为每个处于
-活跃期的推理进程维持一份跨 graph 复用的 grant，并在实例之间划分 CPU：默认
-prefill 优先、decode 保底至少 1 核，避免解码被 prefill 长时间饿死。相位
-（`PREFILL/DECODE/MIXED`）在 graph 边界上报，控制器在边界处安全交接——先撤销不再
-需要的核心，再授予新的核心，期间保持成员身份一致。
+Phase-Aware Dirty Lease 是当前完整策略名称。它把 RVV worker 稳定映射到 CPU，
+使用 100 ms vector slice 和 per-team/per-CPU VDSQ 保持同组 worker 连续推进，再
+根据 llama.cpp 发布的 `PREFILL/MIXED` phase 选择优先运行的 team。
 
-授权生命周期为 `ACTIVITY → ACQUIRE →（运行时设置 affinity）→ MEMBERS → 计算 →
-UNMEMBERS →（恢复 affinity）→ RELEASE`。稳定期不逐 graph 重复握手，仅在分配变化
-时触发异步 `GRANT/REVOKE`。eBPF 侧以任务的 `start_boottime` 校验成员身份，防止
-worker 线程销毁/重建后数值 TID 复用导致的误放置。
+图从左到右展示 CPU、local DSQ、来源 DSQ 和任务；箭头按真实数据流从右向左。
+CPU i 最终只从自己的 local DSQ 运行任务。local 为空时，sched_ext 核心先把
+global DSQ 的普通任务转入 local；只有 global 没有提供任务时，BPF dispatch 才从
+vector DSQ 消费一个 worker 到 local。图中 `VECTOR DSQs (CPU i)` 内的 A/B 是源码
+中的两条独立队列 `VDSQ(A,i)` 和 `VDSQ(B,i)`，不是共享 FIFO。
 
+local 窗口在 `--vector-local-window-ms > 0`（默认 500ms）时始终启用：每消费一次
+VDSQ，该 team 的向量任务在随后窗口内改走 local DSQ，与普通任务混排。BPF 优先消费
+处于 `PREFILL/MIXED` 的 team，首选队列为空时回退到另一 team；preferred worker
+唤醒且同核正在运行另一 team 的 V worker 时可定向抢占。向远端 VDSQ 投递后按需
+`kick` 目标 CPU。等待达到 1 秒的 runnable V worker 由 pending safety 兜底，普通
+任务、helper 和内核任务仍通过 global DSQ 获得服务。以上 phase-aware 分支只在读到
+有效 hint 时启用；否则全部回退到 `rvv_dirty_local` 默认。
 
 ### 实验数据对比
 
-以下正式 campaign 使用两个 llama-server，各 8 个 worker 共享 CPU0-7；prompt 均
-构造为 128 input token，每请求固定输出 256 token。异步场景下 A 侧 incumbent
-请求到达 token-4 后，按 1 秒间隔向 B 侧注入等量请求。
+以下正式 campaign 使用两个 llama-server 各 8 个 worker 共享 CPU0-7。四个默认
+prompt 文本不同，但均构造为 128 input token；每请求固定输出 256 token。A 侧
+incumbent 请求达到 token-4 后，按 1 秒间隔向 B 侧注入等量请求。
 
-c=2/4/8 各重复 3 个有效轮次。Aggregate TPS 为跨轮 mean ± sample SD；injected
-TTFT 的 mean、sample SD 与 nearest-rank p95 直接从各轮 TTFT 样本汇总（incumbent
-的 TTFT 很小，p95 实际由 injected 决定）。ITL p95 为逐 token 间隔的 p95（跨轮
-mean，越小越好）；Token-rate Jain 为两模型 token 速率的 Jain 公平指数（1 表示
-完全公平）。策略分别为 Linux 默认 CFS、动态授权（equal 分配）与动态授权 +
-相位感知（prefill 优先、decode 保底）。
+c=2/4/8 分别运行 60/30/15 个有效轮次，因此每个策略与并发组合都包含 60 个
+injected TTFT 样本。TPS 为跨轮 mean +/- sample SD；TTFT mean、sample SD 和
+nearest-rank p95 均直接从 60 个 injected 单请求汇总。
 
 #### c=2
 
-| 策略 | Aggregate TPS (mean +/- SD) | Injected TTFT (mean +/- SD) | Injected TTFT p95 | ITL p95 | Token-rate Jain |
-|---|---:|---:|---:|---:|---:|
-| CFS | 1.5878 +/- 0.0142 | 22.495 +/- 0.317 s | 22.495 s | 1435.9 ms | 0.9993 |
-| 动态授权（equal） | 2.7472 +/- 0.0007 (+73.0%) | 26.594 +/- 0.052 s (+18.2%) | 26.594 s (+18.2%) | 718.0 ms | 0.9900 |
-| 动态授权 + 相位感知 | 2.7705 +/- 0.0102 (+74.5%) | 13.015 +/- 0.039 s (-42.1%) | 13.015 s (-42.1%) | 717.7 ms | 0.9999 |
+| 策略 | Aggregate TPS (mean +/- SD) | Injected TTFT (mean +/- SD) | Injected TTFT p95 |
+|---|---:|---:|---:|
+| CFS | 1.6300 +/- 0.0340 | 22.786 +/- 0.291 s | 23.195 s |
+| Dirty Lease (`observe`) | 2.5347 +/- 0.0227 (+55.5%) | 15.956 +/- 0.483 s (-30.0%) | 16.747 s (-27.8%) |
+| Phase-Aware Dirty Lease | 2.5250 +/- 0.0168 (+54.9%) | 13.904 +/- 0.181 s (-39.0%) | 14.253 s (-38.6%) |
 
 #### c=4
 
-| 策略 | Aggregate TPS (mean +/- SD) | Injected TTFT (mean +/- SD) | Injected TTFT p95 | ITL p95 | Token-rate Jain |
-|---|---:|---:|---:|---:|---:|
-| CFS | 1.7621 +/- 0.0715 | 33.023 +/- 0.272 s | 44.169 s | 2823.9 ms | 0.9994 |
-| 动态授权（equal） | 2.8515 +/- 0.0007 (+61.8%) | 39.551 +/- 0.045 s (+19.8%) | 52.769 s (+19.5%) | 1331.4 ms | 0.9917 |
-| 动态授权 + 相位感知 | 2.7990 +/- 0.0006 (+58.8%) | 19.337 +/- 0.040 s (-41.4%) | 25.601 s (-42.0%) | 1338.9 ms | 1.0000 |
+| 策略 | Aggregate TPS (mean +/- SD) | Injected TTFT (mean +/- SD) | Injected TTFT p95 |
+|---|---:|---:|---:|
+| CFS | 2.0701 +/- 0.0244 | 36.513 +/- 12.556 s | 49.724 s |
+| Dirty Lease (`observe`) | 2.6995 +/- 0.0176 (+30.4%) | 26.975 +/- 9.353 s (-26.1%) | 37.767 s (-24.0%) |
+| Phase-Aware Dirty Lease | 2.7056 +/- 0.0122 (+30.7%) | 21.173 +/- 7.076 s (-42.0%) | 28.677 s (-42.3%) |
 
 #### c=8
 
-| 策略 | Aggregate TPS (mean +/- SD) | Injected TTFT (mean +/- SD) | Injected TTFT p95 | ITL p95 | Token-rate Jain |
-|---|---:|---:|---:|---:|---:|
-| CFS | 3.2988 +/- 0.0109 | 73.076 +/- 0.171 s | 90.610 s | 2550.5 ms | 0.9960 |
-| 动态授权（equal） | 4.3140 +/- 0.0040 (+30.8%) | 80.528 +/- 0.080 s (+10.2%) | 99.918 s (+10.3%) | 1619.8 ms | 0.9779 |
-| 动态授权 + 相位感知 | 4.3023 +/- 0.0020 (+30.4%) | 41.125 +/- 0.037 s (-43.7%) | 51.380 s (-43.3%) | 1638.7 ms | 1.0000 |
+| 策略 | Aggregate TPS (mean +/- SD) | Injected TTFT (mean +/- SD) | Injected TTFT p95 |
+|---|---:|---:|---:|
+| CFS | 3.2008 +/- 0.0288 | 76.130 +/- 30.395 s | 96.264 s |
+| Dirty Lease (`observe`) | 4.0109 +/- 0.0195 (+25.3%) | 50.988 +/- 20.191 s (-33.0%) | 65.434 s (-32.0%) |
+| Phase-Aware Dirty Lease | 4.0210 +/- 0.0080 (+25.6%) | 43.983 +/- 17.556 s (-42.2%) | 55.395 s (-42.5%) |
 
-`equal` 指动态授权按实例均分 CPU、不做相位优先；相位感知策略在 prefill 阶段优先
-分配 CPU，并为 decode 保底至少 1 核。相对 CFS，相位感知策略在 c=2/4/8 下分别
-提升 Aggregate TPS 约 74.5%、58.8% 和 30.4%，将 injected TTFT p95 分别降低约
-42.1%、42.0% 和 43.3%，并把 ITL p95 从 1435.9 / 2823.9 / 2550.5 ms 降到约
-717.7 / 1338.9 / 1638.7 ms（约减半）。仅做 equal 分配虽同样提升 TPS 与降低 ITL，
-却会抬高 injected TTFT（c=2/4/8 分别 +18.2%、+19.5%、+10.3%），且其 token-rate
-Jain（0.978–0.992）略低于 CFS；相位感知则三者兼顾：TTFT 大幅下降、ITL 减半、
-Jain 接近 1.000，说明相位感知是同时改善吞吐、延迟与公平性的关键。
+`observe` 读取并校验 worker/phase hint，但不根据 phase 改变调度；完整策略通过
+`prefill-lease` 选择 preferred team，并允许满足条件的 preferred wakeup 定向抢占。
+Phase-Aware Dirty Lease 相对 CFS 在 c=2/4/8 下分别提升 TPS 约 54.9%、30.7% 和
+25.6%，并将 injected TTFT p95 分别降低约 38.6%、42.3% 和 42.5%。相对 Observe，
+Phase-Aware 的 TPS 变化不超过 0.4%，但 p95 进一步降低约 14.9%、24.1% 和 15.3%。
 
 ## 环境准备
 
 ### 硬件与主机依赖
 
-- Milk-V Jupiter 或其他采用 SpacemiT K1 的八核 RISC-V/RVV 1.0 板卡，运行包含
-  sched_ext 的内核（见下文内核补丁）。
+- Milk-V Jupiter 或其他采用 SpacemiT K1 的八核 RISC-V/RVV 1.0 板卡。
 - x86-64 Linux 构建主机。
-- Git、Repo、Make、CMake、Python 3、OpenSSH 与 `sshpass`。
-- 支持 `-target bpf` 的 Clang，以及 host `bpftool`（随 Buildroot 构建）。
-- 支持 RVV 1.0 intrinsic 和 OpenMP 的 RISC-V GCC 交叉工具链，用于构建 llama.cpp。
-- 板端需已挂载 bpffs：`mount -t bpf bpf /sys/fs/bpf`（重启后需重新挂载）。
+- Git、Repo、Make、CMake、Python 3、Clang、bpftool 构建依赖、OpenSSH 和
+  `sshpass`。
+- 支持 `-target bpf` 的 Clang。
+- 支持 RVV 1.0 intrinsic 和 OpenMP 的 RISC-V GCC 14 交叉工具链，用于构建
+  llama.cpp。
 
-所有路径与板端连接信息集中在 [`tests/config.sh`](tests/config.sh)（相对路径以
-仓库根目录为基准）：
+以下变量用于描述源码、输出目录和板卡连接信息：
 
 ```bash
-# tests/config.sh 中按环境修改
-TOOLCHAIN_ROOT=..                 # 含 jupiter-buildroot 的目录（相对仓库根）
-LLAMA_CPU_SRC=../...              # 已打补丁的 llama.cpp ggml-cpu 目录
-DT_LLAMA_BIN=../...               # 该 llama.cpp 构建出的 runtime bin
-REMOTE_IP=192.168.3.67            # 板端 IP / 用户 / 密码
-REMOTE_USER=root
-REMOTE_PASS=bianbu
+export PROJECT_ROOT=/path/to/riscv-rvv
+export REPO_ROOT="$PROJECT_ROOT/mxrvvkzddyymxtlbfddyh"
+export TOOLCHAIN_ROOT="$PROJECT_ROOT"          # 含 jupiter-buildroot
+export BIANBU_ROOT="$PROJECT_ROOT/jupiter-buildroot"
+export BOARD_IP="<board-ip>"
+export BOARD_USER="<board-user>"
+export BOARD_PASS="<board-password>"
 ```
 
-Makefile 与测试脚本都从该文件读取配置，通常无需再设置环境变量。
+板卡连接、工具链与运行时路径也可以直接写进 [`tests/config.sh`](tests/config.sh)
+（`REMOTE_*`、`TOOLCHAIN_ROOT`、`LLM_PATH`、`DT_LLAMA_BIN` 等）。所有 Makefile 与
+benchmark 都从该文件读取，且环境变量优先。
 
 ## 从 Buildroot 构建完整实验环境
 
-这一节给出从原厂 Buildroot 到可运行实验环境的关键步骤（命令均在仓库根目录执行）。
-补丁来源、许可证、完整构建选项和回退方法分别记录在
+这一节给出从原厂 Buildroot 到可运行实验环境的关键步骤。补丁来源、许可证、完整
+构建选项和回退方法分别记录在
 [`src/kernel_patches/README.md`](src/kernel_patches/README.md) 和
 [`src/llama_cpp_patches/README.md`](src/llama_cpp_patches/README.md)。
 
@@ -161,7 +170,6 @@ Makefile 与测试脚本都从该文件读取配置，通常无需再设置环�
 使用 Milk-V Jupiter 的 `k1-bl-v2.1.y` manifest：
 
 ```bash
-export BIANBU_ROOT=/path/to/jupiter-buildroot
 mkdir -p "$BIANBU_ROOT"
 cd "$BIANBU_ROOT"
 
@@ -192,8 +200,8 @@ git -C "$KERNEL_SRC" switch -c sched-ext-rvv \
     46ef2dae4ac50c7e556137e4cbbdcc024921d9e3
 
 git -C "$KERNEL_SRC" am --3way \
-    src/kernel_patches/0001-sched_ext-port-sched_ext-from-scx-v6.6.4-scx2.patch \
-    src/kernel_patches/0002-riscv-complete-sched_ext-integration-and-add-lazy-ve.patch
+    "$REPO_ROOT/src/kernel_patches/0001-sched_ext-port-sched_ext-from-scx-v6.6.4-scx2.patch" \
+    "$REPO_ROOT/src/kernel_patches/0002-riscv-complete-sched_ext-integration-and-add-lazy-ve.patch"
 ```
 
 第一个补丁移植 sched-ext `v6.6.4-scx2` 发布树中的 sched_ext 框架；第二个补丁
@@ -242,10 +250,7 @@ $BR_OUT/host/bin/riscv64-unknown-linux-gnu-gcc
 ### 4. 应用并构建 llama.cpp 补丁
 
 llama.cpp 补丁以官方提交
-`678d43d7205cffc3a8a026cb60b1de3868cc70a2` 为准确基线，并按
-`0001 → 0002 → llama-dynamic.patch` 顺序应用：`0001`/`0002` 建立并升级
-lease-hint 基础接口（最终 ABI v4），`llama-dynamic.patch` 在其上追加动态线程 /
-persistent grant runtime（`GGML_DYNAMIC_THREADS_SOCKET`）。
+`678d43d7205cffc3a8a026cb60b1de3868cc70a2` 为准确基线：
 
 ```bash
 export LLAMA_SRC=/path/to/llama.cpp
@@ -255,9 +260,7 @@ git -C "$LLAMA_SRC" switch -c sched-ext-hints \
     678d43d7205cffc3a8a026cb60b1de3868cc70a2
 
 git -C "$LLAMA_SRC" am --3way \
-    src/llama_cpp_patches/0001-llama-publish-sched_ext-worker-and-phase-hints.patch \
-    src/llama_cpp_patches/0002-ggml-support-variable-sched-ext-worker-membership.patch
-git -C "$LLAMA_SRC" apply --3way src/llama_cpp_patches/llama-dynamic.patch
+    "$REPO_ROOT/src/llama_cpp_patches/0001-llama-publish-sched_ext-worker-and-phase-hints.patch"
 ```
 
 使用 GCC 14、RVV 和 OpenMP 构建 llama-server：
@@ -301,123 +304,195 @@ test -f "$STAGING_DIR/usr/lib/libelf.a"
 test -f "$BR_OUT/build/linux-custom/vmlinux"
 ```
 
-构建过程使用 host Clang 生成 BPF object、host bpftool 生成 skeleton，并使用
-Buildroot RISC-V 工具链链接板端控制器与探针。工具链根与 patched llama.cpp 目录
-由 [`tests/config.sh`](tests/config.sh) 提供（`TOOLCHAIN_ROOT` / `LLAMA_CPU_SRC`）。
+构建过程使用 host Clang 生成 BPF object，使用 host bpftool 生成 skeleton，并使用
+Buildroot RISC-V 工具链链接板端 loader。
 
-编译主调度器（`make` 会自动从板端抓取 BTF 生成 `vmlinux.h`）：
+`src/` 下的 Makefile 都从 `tests/config.sh` 读取 `TOOLCHAIN_ROOT`（含
+`jupiter-buildroot`）与板卡连接，并内置 `fetch-btf`：从板卡取运行内核的
+`/sys/kernel/btf/vmlinux` 生成 `vmlinux.h`。若工具链不在默认位置，先设置
+`TOOLCHAIN_ROOT` 或修改 `tests/config.sh`。
+
+编译 RVV-aware sched_ext 调度器：
 
 ```bash
-make -C src/dynamic_threads all     # dt_controller 与探针
-make -C src/dynamic_threads host    # host 端单元测试二进制
+cd "$REPO_ROOT/src/scx_llm_pin"
+make clean
+make -j"$(nproc)"
+make test     # 可选：host 单测（team 配置解析 + hint 客户端），不需要板卡
 ```
 
 编译调度与 RVV 观测工具：
 
 ```bash
-make -C src/rvv_sched_cost all
+cd "$REPO_ROOT/src/rvv_sched_cost"
+make clean
+make -j"$(nproc)"
 ```
 
-如需离线构建，可先把板端 `/sys/kernel/btf/vmlinux` 放到
-`src/dynamic_threads/build/vmlinux.btf` 再执行 `make`。更换内核后需用新内核的
-BTF 重新生成 `vmlinux.h`、BPF object 与 skeleton。
+产物为 `src/scx_llm_pin/{scx_llm_pin,rvv_lease_ctl,rvv_team_exec}` 与
+`src/rvv_sched_cost/rvv_sched_cost`。更换内核后，需要重新 `make`，以便用新内核的
+`vmlinux` 重新生成 `vmlinux.h`、BPF object 和 skeleton。
+
+x86 上的同策略调度器是自包含工程（用运行内核 BTF、host clang/libbpf/bpftool）：
+
+```bash
+cd "$REPO_ROOT/src/x86_scx_llm_pin"
+make
+make test
+```
 
 ### 6. 部署并运行调度器
 
-启动包含 sched_ext 补丁的内核后，运行主测试脚本即可自动完成“构建 → 上传
-`dt_controller`/探针 → 启动控制器 → 运行 OpenMP 探针 → 校验 → 清理”：
+启动包含 sched_ext 补丁的内核后，将调度器部署到板卡：
 
 ```bash
-cd tests/dynamic_threads
-python3 run_control_gate.py \
-    --grant-lifetime persistent \
-    --allocation-policy prefill-first \
-    --decode-wait-ms 0 --decode-floor-on-prefill \
-    --iterations 200
+make -C "$REPO_ROOT/src/scx_llm_pin" deploy
 ```
 
-控制器 `dt_controller` 通过 `--socket <path>` 监听 Unix socket，以 `--mode` 选择
-`dynamic`/`fixed4`/`split4` 等策略，以 `--grant-lifetime graph|persistent` 选择授权
-是否跨 graph 复用。运行时（patched llama-server）用
-`GGML_DYNAMIC_THREADS_SOCKET=<path>` 连接该 socket，并在 graph 边界请求授权。
-
-检查 sched_ext 状态与内核日志：
+启动 patched llama-server，并指定 worker/phase hint map：
 
 ```bash
-cat /sys/kernel/debug/sched/ext
+export GGML_SCX_LEASE_HINT_PATH=/sys/fs/bpf/scx_rvv_dirty_lease/workers
+
+/path/to/llama-server \
+    -m /path/to/model.gguf \
+    -t 8 -tb 8 -np 4
+```
+
+取得 llama-server 的 TGID 后，启动调度器（单策略，phase-aware 自动生效）：
+
+```bash
+# 单模型（旧兼容入口，每模型 8 线程）
+/tmp/scx_llm_pin/scx_llm_pin \
+    --tgid <llama-server-tgid> \
+    --vector-slice-ms 100 \
+    --vector-local-window-ms 500 \
+    --dirty-threshold 2
+
+# N 模型：PID:decode_threads:prefill_threads[:cpu_mask]，可重复最多 8 次
+/tmp/scx_llm_pin/scx_llm_pin \
+    --team <pid-A>:8:8:0xff \
+    --team <pid-B>:4:4:0xff \
+    --vector-slice-ms 100 --vector-local-window-ms 500 --dirty-threshold 2
+```
+
+检查 sched_ext 状态、调度器名称和 worker 注册：
+
+```bash
+cat /sys/kernel/sched_ext/state
+cat /sys/kernel/sched_ext/root/ops
+/tmp/scx_llm_pin/rvv_lease_ctl status
 dmesg | tail -80
 ```
 
-调度器运行期间，内核日志中不应出现 sched_ext watchdog、stall、BUG 或 Oops；
-门禁脚本会校验 `wrong_cpu=0`、授权不重叠、成员身份与内核干净。
+`rvv_lease_ctl status` 应显示完整的 worker TID、OpenMP `ith`、CPU 映射和 phase。
+调度器运行期间，内核日志中不应出现 sched_ext watchdog、stall、BUG 或 Oops。
 
 ## Benchmark
 
-主 benchmark 位于
-[`tests/dynamic_threads/run_benchmark.py`](tests/dynamic_threads/run_benchmark.py)，
-以动态授权调度器为主体，按 case × scenario × concurrency × loop 组织实验，并自动
-上传 patched runtime 与 `dt_controller`、执行预热、采集指标、校验内核日志。配置
-统一来自 [`tests/config.sh`](tests/config.sh)，通常无需再设环境变量。
+`tests/benchmark` 是统一的 Python benchmark（`benchmark.py`），覆盖三种场景：
 
-先跑一次小规模短测确认链路：
+| `--scenario` | 请求模型 |
+|---|---|
+| `dual-async` | 双 llama-server，incumbent 先发、到注入 token 后注入第二台 |
+| `dual-sync` | 双 llama-server，全部请求共享同一释放时刻 |
+| `multi` | 1–8 个 llama-server（JSON 配置），同时释放 |
+
+策略 `--strategy`：`cfs`（默认）、`scx-llm-pin`（主策略）、`cfs-affinity`；附录
+中的 `dynamic` 与两个 x86 策略。板卡连接与路径默认从
+[`tests/config.sh`](tests/config.sh) 读取。
 
 ```bash
-cd tests/dynamic_threads
-python3 run_benchmark.py \
-    --cases cfs_baseline,scx_dynamic_persistent_phase \
-    --scenarios asynchronous \
-    --concurrencies 2 --loops 1 --output-tokens 32
+cd "$REPO_ROOT/tests/benchmark"
+
+# 入口与环境自检
+python3 benchmark.py --list-scenarios
+python3 -m unittest discover -s tests
+
+# 板端短测：CFS 基线
+python3 benchmark.py --scenario dual-sync --strategy cfs \
+    --concurrency 2 --loops 1 --output-tokens 16
+
+# 主策略：scx-llm-pin + phase hint
+python3 benchmark.py --scenario dual-sync --strategy scx-llm-pin --user-hint on \
+    --concurrency 2 --loops 1 --output-tokens 16
 ```
 
-可用 case 包括 `cfs_baseline`、`scx_dynamic`、`scx_dynamic_persistent`、
-`scx_dynamic_persistent_phase` 以及 `..._reserve1` 等相位感知变体。多进程场景用
-[`run_multi_benchmark.py`](tests/dynamic_threads/run_multi_benchmark.py)（1–8 个
-独立 llama-server），控制面门禁用
-[`run_control_gate.py`](tests/dynamic_threads/run_control_gate.py)。指标口径与结果
-文件结构见 [`docs/dynamic_threads/README.md`](docs/dynamic_threads/README.md)。
+每次运行写入 `results/<timestamp>_<scenario>_<strategy>_suite/`，包含
+`summary.csv`、`summary.json`、`report.md` 和每轮 `run_metrics.json`；有效性门禁
+覆盖请求完整性、注入顺序、频率/温度/内存、内核日志以及（开启时）RVV trace 和
+调度器事件校验。多 llama 同时到达场景用 `--config` 指定 JSON 模型列表（示例见
+`example.json`）。指标口径与结果结构见 [`tests/benchmark/README.md`](tests/benchmark/README.md)。
 
 ### 双模型 c=4 正式对比
 
-以下样例复现“实验数据对比”表中的 `c=4` 工作负载：两个 llama-server 各 8 个
-worker 共享 CPU0-7，A/B 各承载 2 个请求，A 侧请求输出第 4 个 token 后注入 B 侧
-请求，prompt 均为 128 input token，每请求固定输出 256 token。板端路径已由
-`tests/config.sh` 提供，直接运行：
+以下两个样例复现“实验数据对比”表中的 `c=4` 工作负载：两个服务各使用 8 个
+worker 共享 CPU0-7，A/B 各承载 2 个请求，A 侧请求均输出第 4 个 token 后注入
+B 侧请求，两个不同文本的 prompt 均为 128 input token，每请求固定输出 256 token，
+每种策略重复 30 个有效轮次。先设置板端路径：
 
 ```bash
-cd tests/dynamic_threads
+export LLM_PATH="<board-llama-directory>"
+export REMOTE_RUNTIME_DIR="<board-patched-runtime-directory>"
+export REMOTE_HINT_RUNTIME_DIR="<board-ABI-v4-hinted-runtime-directory>"
+export MODEL_PATH="<board-gguf-model-path>"
 
-# Linux 默认 CFS/EEVDF
-python3 run_benchmark.py \
-    --cases cfs_baseline \
-    --scenarios asynchronous \
-    --concurrencies 4 --loops 3 \
-    --output-tokens 256 --injection-token 4
-
-# 动态授权 + 相位感知（prefill 优先、decode 保底）
-python3 run_benchmark.py \
-    --cases scx_dynamic_persistent_phase \
-    --scenarios asynchronous \
-    --concurrencies 4 --loops 3 \
-    --output-tokens 256 --injection-token 4
+cd "$REPO_ROOT/tests/benchmark"
 ```
 
-每次运行自动执行请求完整性、注入顺序、频率、温度、内核日志与服务存活检查；
-相位感知 case 还会校验授权不重叠、成员身份（`start_boottime`）、`wrong_cpu=0`
-与相位交接。运行结束后可在结果目录的 `campaign.json` 查看各轮 TPS、injected
-TTFT、p95 与门禁结果。
+使用 Linux 默认 CFS/EEVDF 调度器运行 30 轮：
+
+```bash
+python3 benchmark.py \
+    --scenario dual-async \
+    --strategy cfs \
+    --concurrency 4 \
+    --loops 30 \
+    --output-tokens 256 \
+    --injection-token 4 \
+    --arrival-gap-sec 1 \
+    --runtime-bin-dir "$REMOTE_RUNTIME_DIR" \
+    --model-a "$MODEL_PATH" \
+    --model-b "$MODEL_PATH"
+```
+
+使用 scx-llm-pin（Phase-Aware Dirty Lease，需要 ABI v4 hinted runtime）运行相同
+工作负载：
+
+```bash
+python3 benchmark.py \
+    --scenario dual-async \
+    --strategy scx-llm-pin \
+    --user-hint on \
+    --concurrency 4 \
+    --loops 30 \
+    --output-tokens 256 \
+    --injection-token 4 \
+    --arrival-gap-sec 1 \
+    --runtime-bin-dir "$REMOTE_RUNTIME_DIR" \
+    --scx-hint-runtime-bin "$REMOTE_HINT_RUNTIME_DIR" \
+    --model-a "$MODEL_PATH" \
+    --model-b "$MODEL_PATH"
+```
+
+两个命令都会自动执行请求完整性、注入顺序、频率、温度、内核日志和服务存活检查；
+`scx-llm-pin` 还会校验 worker 注册、phase hint、VDSQ 收支、定向抢占和 pending
+safety，无效 attempt 不进入汇总。每次运行结束后可在结果目录的 `report.md` 查看
+Aggregate TPS、逐请求 TTFT、pooled p95 TTFT 和上下文切换。
 
 ## 文档
 
-- [`src/kernel_patches/README.md`](src/kernel_patches/README.md)：内核补丁来源、准确
-  基线、构建、RVV lazy restore 和回退。
-- [`src/llama_cpp_patches/README.md`](src/llama_cpp_patches/README.md)：llama.cpp
-  补丁链（0001 → 0002 → llama-dynamic）、ABI、交叉编译与无调度器运行方式。
-- [`docs/dynamic_threads/README.md`](docs/dynamic_threads/README.md)：主调度器的策略、
-  参数、用户态控制器与故障排查。
-- [`src/rvv_sched_cost/README.md`](src/rvv_sched_cost/README.md)：RVV、调度和 futex
-  指标定义。
-- [`tests/dynamic_threads/`](tests/dynamic_threads/)：主 benchmark、控制/llama 门禁、
-  多进程测试与单元测试；配置见 [`tests/config.sh`](tests/config.sh)。
+- [`src/kernel_patches/README.md`](src/kernel_patches/README.md)：内核补丁来源、准确基线、
+  构建、RVV lazy restore 和回退。
+- [`src/llama_cpp_patches/README.md`](src/llama_cpp_patches/README.md)：llama.cpp hint API、
+  ABI、交叉编译和无调度器运行方式。
+- [`src/scx_llm_pin/README.md`](src/scx_llm_pin/README.md)：主调度策略、参数、用户态控制
+  和故障排查。
+- [`src/x86_scx_llm_pin/README.md`](src/x86_scx_llm_pin/README.md)：x86/SMT 移植与用法。
+- [`src/rvv_sched_cost/README.md`](src/rvv_sched_cost/README.md)：RVV、调度和 futex 指标
+  定义。
+- [`tests/benchmark/README.md`](tests/benchmark/README.md)：统一 benchmark 的场景、策略、
+  指标、有效性检查和报告生成。
 
 ## 上游项目与许可证
 
@@ -426,6 +501,55 @@ TTFT、p95 与门禁结果。
 - llama.cpp：<https://github.com/ggerganov/llama.cpp>
 
 内核补丁遵循 Linux 内核 GPL-2.0-only 许可证。llama.cpp 修改遵循上游 MIT
-License，共享 ABI 头文件使用 `GPL-2.0 OR MIT`。`dynamic_threads` 的 eBPF 调度器
-（`control.bpf.c`）使用 GPL-2.0，用户态控制器与 `rvv_sched_cost` 各文件的许可证以
-其 SPDX 标识为准。补丁来源、版权和许可证边界见对应补丁目录的 README。
+License，共享 ABI 头文件使用 `GPL-2.0 OR MIT`。`scx_llm_pin` BPF 调度器和 loader
+使用 GPL-2.0，`rvv_sched_cost` 各文件的许可证以其 SPDX 标识为准。补丁来源、版权
+和许可证边界见对应补丁目录的 README。
+
+## 附录：dynamic 与 x86 策略
+
+主策略是 `scx-llm-pin`；benchmark 另外支持以下对照策略。
+
+### dynamic（dynamic_threads 动态授权）
+
+`src/dynamic_threads`（RISC-V）与 `src/x86_dynamic_threads`（x86）按 graph 边界
+动态授予 OpenMP team 宽度：patched llama-server 通过 Unix socket 与 `dt_controller`
+协商，控制器用 sched_ext 把授权 worker 放到 custom DSQ。板端用法：
+
+```bash
+cd "$REPO_ROOT/tests/benchmark"
+python3 benchmark.py --scenario multi --config example.json \
+    --strategy dynamic --output-tokens 64 --loops 3
+```
+
+### x86_scx_llm_pin（scx-llm-pin 的 x86 移植）
+
+`src/x86_scx_llm_pin` 用 ABI v4 hint 替代 RISC-V `sstatus.VS` 分类，并把 2×4
+worker 固定 spread 到 4C/8T 的 CPU0-3 / CPU4-7（每个 server `-t 4 -tb 4`，
+`--team PID:4:4:0xff`）。先构建：
+
+```bash
+cd "$REPO_ROOT/src/x86_scx_llm_pin"
+make
+make test
+```
+
+在 x86 主机本地直跑（`--local`，不经 SSH；加载 sched_ext 需要 root）：
+
+```bash
+cd "$REPO_ROOT/tests/benchmark"
+sudo python3 benchmark.py --local --scenario multi --config example.json \
+    --strategy x86-scx-llm-pin --output-tokens 64
+```
+
+### x86_dynamic（x86 动态授权）
+
+`src/x86_dynamic_threads/build/dt_controller` 是 x86 版控制器，同样本地直跑：
+
+```bash
+cd "$REPO_ROOT/tests/benchmark"
+sudo python3 benchmark.py --local --scenario multi --config example.json \
+    --strategy x86-dynamic --output-tokens 64
+```
+
+`example.json` 中的 model 需替换为本机可用的 GGUF；x86 场景建议每个模型
+`threads = threads_batch = 4`。
