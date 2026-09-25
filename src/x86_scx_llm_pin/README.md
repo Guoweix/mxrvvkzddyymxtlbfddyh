@@ -12,7 +12,7 @@ no reference to any sibling repository path, and no cross toolchain.
 | File | Purpose |
 | --- | --- |
 | `scx_llm_pin.bpf.c` | BPF scheduler. RISC-V `sstatus.VS` path under `#ifndef SCX_ARCH_X86`; ABI v4 worker-hint classification and x86 SMT placement under `#ifdef SCX_ARCH_X86`. |
-| `scx_llm_pin.c` | User-space loader, config validation, `--x86-smt`, topology check, stats. |
+| `scx_llm_pin.c` | User-space loader, config validation, spread topology check, stats. |
 | `scx_llm_pin.h` | Shared ABI/config/stats definitions (`rvv_*` names preserved). |
 | `scx_rvv_lease_control.h` | ABI v4 worker page (unchanged, shared with the patched llama runtime). |
 | `team_config.h` | `--team PID:T:TB[:MASK]` parser and unique-CPU planner. |
@@ -40,18 +40,18 @@ make test       # no sched_ext/root: --help, --check-config, skeleton gen
 make clean
 ```
 
-`make test` covers both-team configs, `--x86-smt adaptive`, rejection of
-invalid adaptive configs, the `--tgid/--tgid2` legacy form, `bpftool gen
-skeleton`, and the team-config unit test.
+`make test` covers the two-team config, rejection of invalid spread configs
+(non-`0xff` mask, more than two teams), `bpftool gen skeleton`, and the
+team-config unit test.
 
 ## Usage
 
 The scheduler is attached by the loader itself; `make test` never loads it.
+x86 placement is fixed to spread; there is no placement flag.
 
 ```sh
 # Two llama-server models, 4 workers each (one per physical core):
-sudo ./x86_scx_llm --team <PID0>:4:4:0xff --team <PID1>:4:4:0xff \
-                   --x86-smt adaptive
+sudo ./x86_scx_llm --team <PID0>:4:4:0xff --team <PID1>:4:4:0xff
 ```
 
 Per server the recommended llama.cpp settings are `-t 4 -tb 4`, i.e. four
@@ -60,8 +60,7 @@ workers mapped one-per-physical-core.
 Useful options:
 
 ```
---team PID:T:TB[:MASK]       repeat for 1..8 models
---x86-smt off|adaptive       x86 SMT placement (default: off)
+--team PID:T:TB[:MASK]       repeat for 1..8 models (spread requires exactly 2)
 --vector-slice-ms <ms>       vector worker slice (default 100)
 --vector-local-window-ms <ms> local fast-path window (default 500)
 --phase-hint-timeout-ms <ms> reject stale phase hints (default 300000)
@@ -106,27 +105,28 @@ from the original implementation:
 The RISC-V path (`#ifndef SCX_ARCH_X86`) is untouched and still uses
 `bpf_task_pt_regs()` + `RVV_SR_VS_DIRTY` with the dirty-score threshold.
 
-## SMT placement (`--x86-smt`)
+## SMT placement (fixed spread)
 
-`select_x86_smt_cpu()` picks the logical CPU from the ABI worker slot index
-`ith` (0..3, one per physical core) and the current team phases. `off` (the
-default) keeps the generic unique-CPU claim/round-robin path.
+`select_x86_smt_cpu()` always maps the ABI worker slot index `ith` (0..3, one per
+physical core) with a fixed team split, independent of phase:
 
-| Situation | Placement |
+| Team | CPUs |
 | --- | --- |
-| one active team | that team on CPUs `0..3` |
-| prefill/mixed + decode | both teams on CPUs `0..3` (phase-lease gives prefill priority) |
-| decode + decode | team0 `0..3`, team1 `4..7` |
+| team0 | `0..3` |
+| team1 | `4..7` |
 
-`adaptive` is validated at startup: x86 build, exactly two teams, `T/TB <= 4`,
+For a 2×4 setup on 4C/8T this fills all eight logical CPUs (one worker of each
+team per physical core). The earlier phase-dependent `adaptive` policy and the
+`--x86-smt` flag were removed after measurement showed fixed spread is faster
+for the non-oversubscribed 8-thread case.
+
+Spread is validated at startup: x86 build, exactly two teams, `T/TB <= 4`,
 CPU mask `0xff`, and a live 4C/8T topology check
 (`/sys/devices/system/cpu/cpu*/topology/{physical_package_id,core_id}` must show
-sibling pairs `0/4, 1/5, 2/6, 3/7`). Without valid phase hints the SMT helper
-returns `-1` and the generic placement is used, so adaptive degrades gracefully.
+sibling pairs `0/4, 1/5, 2/6, 3/7`).
 
-x86 placement counters (`x86_smt_primary_selections`, `x86_smt_sibling_selections`,
-`x86_smt_latency_primary`, `x86_smt_decode_shared`) are printed with the rest of
-the stats.
+`x86_smt_primary_selections` / `x86_smt_sibling_selections` are printed with the
+rest of the stats.
 
 ## Differences from the original x86 refactor
 
@@ -137,10 +137,9 @@ than silently dropped:
 * `--strategy`, `--user-control`, `--user-cpu-map`, `--team-gang`,
   `--gang-quantum-us`, `--gang-sample-us`, `--vector-local-wakeup` and
   `--control-dir`: the current design is always hint-classified, always
-  phase-aware and always uses the default control directory. Only the x86 SMT
-  knob remains.
-* `pair-gang` (`LLM_TEAM_GANG_PAIR`) and its four CPUs-per-lane pairing: removed
-  with `--team-gang`. `select_x86_smt_cpu` therefore contains only the adaptive
+  phase-aware and always uses the default control directory.
+* `pair-gang` (`LLM_TEAM_GANG_PAIR`): removed with `--team-gang`, and along with
+  it the x86 placement flag. `select_x86_smt_cpu` contains only the fixed spread
   path; the pair-gang stats are not present.
 * The original `user_hint_*`, `gang_*` and `protected_kernel_*` stats were not
   reintroduced. The ABI/stat field names that do exist (`rvv_*`) are unchanged.

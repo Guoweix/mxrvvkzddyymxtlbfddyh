@@ -37,7 +37,7 @@ persistent grant”runtime。它不能单独应用——其 diff 上下文里已
 
 - 新增 `dynamic-client.c/.h`、`dynamic-worker-team.c/.h`、`dynamic-grant-client.c/.h`
   与 `dynamic-control.h`，把动态线程宽度与 CPU 授权通过 Unix socket 交给用户态
-  controller（`experiments/dynamic_threads` 对应 `src/dynamic_threads`）。
+  controller（`src/dynamic_threads`）。
 - 修改 `ggml-cpu.c/.cpp`、`include/llama.h`、`src/llama-context.*`、
   `tools/server/server-context.cpp`、`ggml/src/ggml-cpu/CMakeLists.txt`，接入
   persistent grant 的 begin/end/register/unregister 生命周期。
@@ -253,16 +253,17 @@ ssh "$BOARD" \
 curl --fail "http://<board-host>:$SERVER_PORT/health"
 ```
 
-双模型 harness 通过 `--runtime-bin-dir` 选择该目录，不会再次上传 runtime：
+benchmark 通过 `--runtime-bin-dir` 选择该目录，不会再次上传 runtime：
 
 ```bash
-cd "$PATCH_DIR/../../tests/benchmark/dual_model"
-./run.sh \
-    --llm-path "$LLAMA_REMOTE" \
+cd "$PATCH_DIR/../../tests/benchmark"
+python3 benchmark.py \
+    --scenario dual-sync \
+    --strategy cfs \
+    --concurrency 4 --loops 1 \
     --runtime-bin-dir "$REMOTE_RUNTIME" \
     --model-a "$MODEL_PATH" --model-b "$MODEL_PATH" \
-    --port-a "<model-a-port>" --port-b "<model-b-port>" \
-    --strategy cfs-shared --concurrency 4 --loops 1
+    --port-a "<model-a-port>" --port-b "<model-b-port>"
 ```
 
 正式启用 dirty lease 后，再检查 server 日志中的

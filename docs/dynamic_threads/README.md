@@ -1,5 +1,10 @@
 # 动态线程与 CPU grant：独立消融实验
 
+> 定位：INFERSCHED 的主调度算法是 `src/scx_llm_pin`（`rvv_dirty_local` + 自动
+> phase-aware）。dynamic_threads 是**附录中的对照/独立消融**方案，不作为主线；
+> benchmark 通过 `--strategy dynamic`（x86 用 `--strategy x86-dynamic --local`）接入。
+> 下文保留其独立实验记录。
+
 本目录实现了 [PLAN.md](PLAN.md) 中的事件驱动方案。它不基于 `scx_llm_pin`，
 没有长时间片、gang 或 loader 请求 map 轮询。llama-server 在命令行上
 始终使用 `-t 8 -tb 8`；实际 OpenMP team 宽度由 graph 边界上的 grant 决定。
@@ -101,7 +106,7 @@ ACQUIRE → 先设置 worker affinity → MEMBERS → graph compute
 控制器和探针：
 
 ```sh
-cd experiments/dynamic_threads
+cd src/dynamic_threads
 make host all
 python3 test_control.py
 python3 test_persistent.py
@@ -116,18 +121,18 @@ RISC-V llama.cpp 使用 Docker 内 GCC/G++ 14。当前构建目录配置为
 
 ```sh
 docker run --rm --network none \
-  -v "$PWD/experiments/dynamic_threads:/work" \
+  -v "$PWD/src/dynamic_threads:/work" \
   -w /work/llama.cpp riscv-nteam-toolchain:local \
   sh -lc 'cmake --build build-dynamic-riscv --target llama-server -j4'
 
-python3 experiments/dynamic_threads/run_llama_gate.py --output-tokens 16
+python3 src/dynamic_threads/run_llama_gate.py --output-tokens 16
 ```
 
 持续模式板端门禁：
 
 ```sh
-python3 experiments/dynamic_threads/run_control_gate.py --grant-lifetime persistent --iterations 1000
-python3 experiments/dynamic_threads/run_llama_gate.py --grant-lifetime persistent --output-tokens 16
+python3 src/dynamic_threads/run_control_gate.py --grant-lifetime persistent --iterations 1000
+python3 src/dynamic_threads/run_llama_gate.py --grant-lifetime persistent --output-tokens 16
 ```
 
 脚本只在板端独立 `/tmp/<run-id>/` 部署 runtime，不覆盖
@@ -158,14 +163,14 @@ python3 run_multi_benchmark.py --process-counts 2,4,8 --loops 1 --output-tokens 
 快速编排 smoke：
 
 ```sh
-python3 experiments/dynamic_threads/run_benchmark.py \
+python3 src/dynamic_threads/run_benchmark.py \
   --cases cfs_baseline,scx_dynamic --scenarios simultaneous --smoke
 ```
 
 正式默认配置正是计划中的两场景、c=2/4/8、三次重复和每请求 256 输出 token：
 
 ```sh
-python3 experiments/dynamic_threads/run_benchmark.py
+python3 src/dynamic_threads/run_benchmark.py
 ```
 
 七组依次为 `cfs_baseline`、`scx_minimal`、`scx_fixed8`、`scx_fixed4`、
@@ -187,7 +192,7 @@ ABI v4 N-team dirty-lease scheduler，后者启动本实验 persistent prefill-f
 两者的 c=2 异步小对照：
 
 ```sh
-python3 experiments/dynamic_threads/run_benchmark.py \
+python3 src/dynamic_threads/run_benchmark.py \
   --cases scx_dynamic_persistent_phase,scx_dynamic_persistent_phase_guard \
   --scenarios asynchronous --smoke --decode-wait-ms 2000
 ```
@@ -195,7 +200,7 @@ python3 experiments/dynamic_threads/run_benchmark.py \
 本轮对照使用以下命令，`--interleave` 会交替各次重复的 case 顺序：
 
 ```sh
-python3 experiments/dynamic_threads/run_benchmark.py \
+python3 src/dynamic_threads/run_benchmark.py \
   --cases scx_dynamic,scx_dynamic_persistent --interleave \
   --scenarios asynchronous --concurrencies 2 --loops 3 --output-tokens 256
 ```

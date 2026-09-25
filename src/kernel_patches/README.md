@@ -30,7 +30,7 @@ K1 原厂 Linux 6.6 基线没有 sched_ext 实现。该补丁完成以下内核�
   `CONFIG_DEBUG_INFO_BTF`，供 CO-RE eBPF 调度器使用。
 
 该补丁只提供内核调度框架，不包含具体 LLM 调度策略。实际策略由
-`experiments/scx_llm_pin/` 中的用户态程序和 BPF struct_ops 调度器加载；未加载
+`src/scx_llm_pin/` 中的用户态程序和 BPF struct_ops 调度器加载；未加载
 sched_ext 调度器时，系统仍按默认 Linux 调度路径运行。
 
 ### 上游来源

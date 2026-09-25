@@ -60,17 +60,20 @@
 先根据当前环境设置仓库、板卡和远端输出路径：
 
 ```sh
-export EXPERIMENTS_ROOT="$(git rev-parse --show-toplevel)"
-export BOARD_IP="<board-ip>"
+export REPO_ROOT="$(git rev-parse --show-toplevel)"
+export BOARD_IP="<board-ip>"        # 可选，默认取 tests/config.sh 的 REMOTE_IP
 export BOARD_USER="<board-user>"
 export BOARD_PASS="<board-password>"
 export RVV_REMOTE_BIN="/tmp/rvv_sched_cost"
 export RVV_RESULT_JSON="/tmp/rvv_sched_cost.json"
 
-cd "$EXPERIMENTS_ROOT/rvv_sched_cost"
-make fetch-btf BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PASS"
+cd "$REPO_ROOT/src/rvv_sched_cost"
+make fetch-btf      # 从板卡取 /sys/kernel/btf/vmlinux 生成 vmlinux.h
 make
 ```
+
+工具链与板卡连接默认从 `../../tests/config.sh` 读取（`TOOLCHAIN_ROOT`、`REMOTE_*`），
+环境变量优先。
 
 如果目标端 libbpf/elfutils 尚未在 Buildroot staging 中生成，`make` 会调用：
 

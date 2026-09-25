@@ -64,18 +64,21 @@ vector DSQ 之间按 CPU 轮转，空队列直接跳过。普通系统任务走 
 要求内核启用 sched_ext 和 BTF，并使用仓库中的 Buildroot RISC-V 工具链：
 
 ```bash
-export EXPERIMENTS_ROOT="$(git rev-parse --show-toplevel)"
-export BOARD_IP="<board-ip>"
+export REPO_ROOT="$(git rev-parse --show-toplevel)"
+export BOARD_IP="<board-ip>"        # 可选，默认取 tests/config.sh 的 REMOTE_IP
 export BOARD_USER="<board-user>"
 export BOARD_PASS="<board-password>"
 
-cd "$EXPERIMENTS_ROOT/scx_llm_pin"
-make fetch-btf BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PASS"
+cd "$REPO_ROOT/src/scx_llm_pin"
+make fetch-btf      # 从板卡取 /sys/kernel/btf/vmlinux 生成 vmlinux.h
 make
-make deploy BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PASS"
+make deploy
 ```
 
-也可以由 `benchmark/benchmark.sh` 自动部署已编译的二进制。
+工具链与板卡连接默认从 `../../tests/config.sh` 读取（`TOOLCHAIN_ROOT`、`REMOTE_*`），
+环境变量优先。
+
+板端部署也可由顶层 `benchmark` 入口完成，见 [`tests/benchmark`](../../tests/benchmark/)。
 
 ## 基本用法
 
@@ -120,16 +123,17 @@ make deploy BOARD_IP="$BOARD_IP" BOARD_USER="$BOARD_USER" BOARD_PASS="$BOARD_PAS
 
 ```bash
 make
+make test          # host 单测，不需要板卡
 ./scx_llm_pin --help
 
-cd ../benchmark
-./benchmark.sh --list-strategies
-./benchmark.sh --concurrency-levels 2 --loops 1 \
-  --total-tokens 16 --warmup-requests 2 --warmup-tokens 1
+cd ../../tests/benchmark
+python3 benchmark.py --list-scenarios
+python3 benchmark.py --scenario dual-sync --strategy scx-llm-pin --user-hint on \
+    --concurrency 2 --loops 1 --output-tokens 16
 ```
 
-需要 RVV 上下文切换和 futex 观测时，通过 `benchmark/config.sh` 中的
-`RVV_TRACE*` 配置启用 `../rvv_sched_cost/rvv_sched_cost`。
+需要 RVV 上下文切换和 futex 观测时，在 benchmark 上加 `--rvv-trace`（可配
+`--rvv-upload` 上传 `src/rvv_sched_cost`）。
 
 ## 故障排查
 
