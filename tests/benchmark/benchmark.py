@@ -31,6 +31,10 @@ REPO_DIR = SCRIPT_DIR.parent.parent
 WORK_DIR = REPO_DIR.parent / "experiments"
 DYNAMIC_DIR = WORK_DIR / "dynamic_threads"
 SCX_DIR = REPO_DIR / "src" / "scx_llm_pin"
+X86_RUNTIME_BIN = WORK_DIR / "x86_dynamic_threads" / "llama" / "build-x86" / "bin"
+X86_MODEL = REPO_DIR.parent / "riscv-linux" / "host-share" / DEFAULT_MODEL_FILENAME
+X86_DYNAMIC_CONTROLLER = REPO_DIR / "src" / "x86_dynamic_threads" / "build" / "dt_controller"
+X86_SCX_LLM_BIN = REPO_DIR / "src" / "x86_scx_llm_pin" / "x86_scx_llm"
 
 CONFIG_SH_KEYS = {
     "REMOTE_IP": "host",
@@ -88,11 +92,18 @@ def build_parser():
     parser.add_argument("--scenario", choices=SCENARIOS)
     parser.add_argument(
         "--strategy",
-        choices=("cfs", "dynamic", "scx-llm-pin", "cfs-affinity"),
+        choices=("cfs", "dynamic", "scx-llm-pin", "cfs-affinity", "x86-dynamic",
+                 "x86-scx-llm-pin"),
         default="cfs",
         help="scheduling strategy: cfs, dynamic (experiments/dynamic_threads), "
-        "scx-llm-pin (experiments/scx_llm_pin), or cfs-affinity "
-        "(worker affinity + long base slice + short GOMP spin)",
+        "scx-llm-pin (experiments/scx_llm_pin), cfs-affinity "
+        "(worker affinity + long base slice + short GOMP spin), or the x86 "
+        "local ports x86-dynamic / x86-scx-llm-pin",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="run against this host instead of a remote board (skips ssh/scp)",
     )
     parser.add_argument(
         "--config-sh",
@@ -118,7 +129,12 @@ def build_parser():
     parser.add_argument("--quiet-sec", type=float, default=5.0)
     parser.add_argument("--sample-interval", type=float, default=1.0)
     parser.add_argument("--min-frequency-khz", type=int, default=1_600_000)
-    parser.add_argument("--max-temperature-millic", type=int, default=85_000)
+    parser.add_argument(
+        "--max-temperature-millic",
+        type=int,
+        default=None,
+        help="platform thermal ceiling; defaults to 85000 (board) and 110000 (--local x86)",
+    )
     parser.add_argument("--min-available-memory-kib", type=int, default=1_048_576)
     parser.add_argument("--prompts-file", default=str(DEFAULT_PROMPTS))
 
@@ -191,6 +207,30 @@ def build_parser():
     aff = parser.add_argument_group("cfs-affinity strategy")
     aff.add_argument("--cfs-affinity-slice-ms", type=int, default=100)
     aff.add_argument("--cfs-affinity-spincount", default="1000")
+
+    x86 = parser.add_argument_group("x86 local strategies")
+    x86.add_argument(
+        "--x86-runtime-bin",
+        default=str(X86_RUNTIME_BIN),
+        help="x86 llama-server runtime directory (contains llama-server + libs)",
+    )
+    x86.add_argument(
+        "--x86-model",
+        default=str(X86_MODEL),
+        help="x86 GGUF model path",
+    )
+    x86.add_argument(
+        "--x86-dynamic-controller",
+        default=str(X86_DYNAMIC_CONTROLLER),
+        help="x86 dt_controller binary",
+    )
+    x86.add_argument(
+        "--x86-scx-llm-bin",
+        default=str(X86_SCX_LLM_BIN),
+        help="x86 scx_llm_pin loader binary",
+    )
+    x86.add_argument("--x86-threads", type=int, default=4)
+    x86.add_argument("--x86-control-dir", default="/sys/fs/bpf/scx_rvv_dirty_lease")
 
     trace = parser.add_argument_group("rvv trace")
     trace.add_argument(
@@ -276,7 +316,10 @@ def resolve_args(args):
     if args.rvv_remote_dir is None:
         args.rvv_remote_dir = ""
     if args.scenario != "multi":
-        default_model = f"{args.llm_path}/models/{DEFAULT_MODEL_FILENAME}"
+        if args.local:
+            default_model = args.x86_model
+        else:
+            default_model = f"{args.llm_path}/models/{DEFAULT_MODEL_FILENAME}"
         args.model_a = args.model_a or default_model
         args.model_b = args.model_b or default_model
     if args.scenario == "dual-async":
@@ -321,7 +364,15 @@ def main():
         print(json.dumps({"models": models}, indent=2))
         return 0
 
-    apply_config_defaults(args)
+    if args.local:
+        if args.host is None:
+            args.host = "127.0.0.1"
+        if args.scenario != "multi" and args.port_a is None:
+            args.port_a = 9090
+    else:
+        apply_config_defaults(args)
+    if args.max_temperature_millic is None:
+        args.max_temperature_millic = 110_000 if args.local else 85_000
     resolve_args(args)
     if not Path(args.prompts_file).is_file():
         raise SystemExit(f"prompts file does not exist: {args.prompts_file}")
@@ -333,9 +384,20 @@ def main():
             raise SystemExit(f"dynamic controller not built: {args.dynamic_controller}")
     if args.strategy == "scx-llm-pin" and not Path(args.scx_llm_pin_bin).is_file():
         raise SystemExit(f"scx_llm_pin binary not built: {args.scx_llm_pin_bin}")
-    for command in ("sshpass", "ssh", "scp"):
-        if shutil.which(command) is None:
-            raise SystemExit(f"missing required command: {command}")
+    if args.strategy == "x86-dynamic":
+        runtime = Path(args.x86_runtime_bin) / "llama-server"
+        if not runtime.is_file():
+            raise SystemExit(f"x86 dynamic runtime not built: {runtime}")
+        if not Path(args.x86_dynamic_controller).is_file():
+            raise SystemExit(
+                f"x86 dynamic controller not built: {args.x86_dynamic_controller}"
+            )
+    if args.strategy == "x86-scx-llm-pin" and not Path(args.x86_scx_llm_bin).is_file():
+        raise SystemExit(f"x86 scx_llm binary not built: {args.x86_scx_llm_bin}")
+    if not args.local:
+        for command in ("sshpass", "ssh", "scp"):
+            if shutil.which(command) is None:
+                raise SystemExit(f"missing required command: {command}")
 
     raise SystemExit(SuiteRunner(args).run())
 

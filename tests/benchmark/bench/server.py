@@ -20,6 +20,29 @@ class ServerManager:
     def _argv(self, port, model_path, threads, threads_batch, requests, overrides):
         base = self.args.llm_path
         runtime_bin = overrides.get("runtime_bin") or self.args.runtime_bin_dir or f"{base}/bin"
+        if overrides.get("direct"):
+            return [
+                f"{runtime_bin}/llama-server",
+                "-m",
+                model_path,
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(port),
+                "-ngl",
+                "0",
+                "-t",
+                str(threads),
+                "-tb",
+                str(threads_batch),
+                "-c",
+                str(self.args.context),
+                "-np",
+                str(requests),
+                "--cache-ram",
+                "0",
+                *overrides.get("extra_args", ()),
+            ]
         loader = overrides.get("loader") or f"{base}/bin/ld-linux-riscv64-lp64d.so.1"
         library_path = overrides.get("library_path") or (
             f"{runtime_bin}:{base}/bin" if runtime_bin != f"{base}/bin" else runtime_bin
@@ -67,9 +90,11 @@ class ServerManager:
         affinity_code = ""
         if cpu_mask is not None:
             affinity_code = f"os.sched_setaffinity(0, {int(cpu_mask)})\n"
+        env = dict(overrides.get("extra_env", {}))
+        if overrides.get("direct"):
+            env["LD_LIBRARY_PATH"] = overrides.get("library_path") or overrides["runtime_bin"]
         env_code = "".join(
-            f"os.environ[{key!r}]={value!r}\n"
-            for key, value in overrides.get("extra_env", {}).items()
+            f"os.environ[{key!r}]={value!r}\n" for key, value in env.items()
         )
         code = (
             "import json,os\n"

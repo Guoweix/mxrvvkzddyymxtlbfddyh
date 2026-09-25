@@ -762,6 +762,23 @@ static __attribute__((noinline)) s32 select_x86_smt_cpu(
 
 	if (ith >= 4)
 		return -1;
+	if (cfg->x86_smt_mode == LLM_X86_SMT_OFF)
+		return -1;
+	/* spread: always team0 -> CPU 0..3, team1 -> CPU 4..7 (one worker of each
+	 * team per physical core), independent of phase. For a 2x4 setup on
+	 * 4C/8T this fills all logical CPUs. */
+	if (cfg->x86_smt_mode == LLM_X86_SMT_SPREAD) {
+		cpu = (team & 1U) ? (s32)ith + 4 : (s32)ith;
+		if (!cpu_in_mask(cpu, allowed_mask))
+			return -1;
+		if (stats) {
+			if (cpu < 4)
+				__sync_fetch_and_add(&stats->x86_smt_primary_selections, 1);
+			else
+				__sync_fetch_and_add(&stats->x86_smt_sibling_selections, 1);
+		}
+		return cpu;
+	}
 	if (cfg->x86_smt_mode != LLM_X86_SMT_ADAPTIVE)
 		return -1;
 	now = bpf_ktime_get_ns();
@@ -824,7 +841,7 @@ static __always_inline s32 select_unique_vector_cpu(struct task_struct *p,
 		return select_cpu_from_mask(allowed_mask, prev_cpu);
 
 #ifdef SCX_ARCH_X86
-	if (cfg->x86_smt_mode == LLM_X86_SMT_ADAPTIVE &&
+	if (cfg->x86_smt_mode != LLM_X86_SMT_OFF &&
 	    state->user_hint_primary && state->user_ith_plus1 >= 1 &&
 	    state->user_ith_plus1 <= RVV_LEASE_MAX_ACTIVE_WORKERS) {
 		__u32 ith = (state->user_ith_plus1 - 1) & (RVV_LEASE_MAX_CPUS - 1);

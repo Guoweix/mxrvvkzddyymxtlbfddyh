@@ -76,29 +76,6 @@ static int parse_on_off(const char *str, __u32 *enabled)
 	return 0;
 }
 
-static const char *x86_smt_mode_name(__u32 mode)
-{
-	switch (mode) {
-	case LLM_X86_SMT_OFF:
-		return "off";
-	case LLM_X86_SMT_ADAPTIVE:
-		return "adaptive";
-	default:
-		return "unknown";
-	}
-}
-
-static int parse_x86_smt_mode(const char *str, __u32 *mode)
-{
-	if (!strcmp(str, "off"))
-		*mode = LLM_X86_SMT_OFF;
-	else if (!strcmp(str, "adaptive"))
-		*mode = LLM_X86_SMT_ADAPTIVE;
-	else
-		return -EINVAL;
-	return 0;
-}
-
 #ifdef SCX_ARCH_X86
 static int read_cpu_topology_value(unsigned cpu, const char *name, int *value)
 {
@@ -459,7 +436,6 @@ enum {
 	OPT_PHASE_HINT_TIMEOUT_MS,
 	OPT_PREFILL_STARVATION_MS,
 	OPT_PHASE_WAKEUP_PREEMPT,
-	OPT_X86_SMT,
 };
 
 static void usage(const char *prog)
@@ -478,7 +454,7 @@ static void usage(const char *prog)
 		"  --phase-hint-timeout-ms <ms> Reject stale phase hints (default: 300000)\n"
 		"  --prefill-starvation-ms <ms> V DSQ safety wait for prefill/MIXED lease (default: 1000)\n"
 		"  --phase-wakeup-preempt <on|off> Preferred wakeup targeted preemption (default: on)\n"
-		"  --x86-smt <mode>       off|adaptive (x86 i5-10200H 4C/8T; default: off)\n"
+		"  x86 placement is fixed to spread: team0 -> CPU0-3, team1 -> CPU4-7\n"
 		"  --duration <sec>       Run duration in seconds (0 = infinite, default: 0)\n"
 		"  -h, --help             Show this help\n"
 		"\n"
@@ -507,7 +483,7 @@ int main(int argc, char **argv)
 	config.phase_wakeup_preempt_enabled = 1;
 	config.phase_hint_timeout_ns = 300000 * NSEC_PER_MSEC;
 	config.prefill_starvation_ns = 1000 * NSEC_PER_MSEC;
-	config.x86_smt_mode = LLM_X86_SMT_OFF;
+	config.x86_smt_mode = LLM_X86_SMT_SPREAD;
 
 	static struct option long_options[] = {
 		{"team", required_argument, 0, OPT_TEAM},
@@ -520,7 +496,6 @@ int main(int argc, char **argv)
 		{"phase-hint-timeout-ms", required_argument, 0, OPT_PHASE_HINT_TIMEOUT_MS},
 		{"prefill-starvation-ms", required_argument, 0, OPT_PREFILL_STARVATION_MS},
 		{"phase-wakeup-preempt", required_argument, 0, OPT_PHASE_WAKEUP_PREEMPT},
-		{"x86-smt", required_argument, 0, OPT_X86_SMT},
 		{"duration",    required_argument, 0, 'd'},
 		{"help",        no_argument,       0, 'h'},
 		{0, 0, 0, 0}
@@ -572,12 +547,6 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			break;
-		case OPT_X86_SMT:
-			if (parse_x86_smt_mode(optarg, &config.x86_smt_mode)) {
-				fprintf(stderr, "Error: --x86-smt requires off|adaptive\n");
-				return 1;
-			}
-			break;
 		case 'd':
 			duration = atoi(optarg);
 			break;
@@ -623,38 +592,36 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Error: --prefill-starvation-ms must be in 100..4000\n");
 		return 1;
 	}
-	if (config.x86_smt_mode > LLM_X86_SMT_ADAPTIVE) {
+	if (config.x86_smt_mode != LLM_X86_SMT_SPREAD) {
 		fprintf(stderr, "Error: invalid x86 SMT mode\n");
 		return 1;
 	}
-	if (config.x86_smt_mode == LLM_X86_SMT_ADAPTIVE) {
 #ifndef SCX_ARCH_X86
-		fprintf(stderr, "Error: --x86-smt adaptive is available only in the x86 build\n");
-		return 1;
+	fprintf(stderr, "Error: x86 spread placement is available only in the x86 build\n");
+	return 1;
 #else
-		/*
-		 * The current single-strategy design is always hint-classified and
-		 * always phase-aware, so adaptive only needs the 4C/8T shape.
-		 */
-		if (config.team_count != 2) {
-			fprintf(stderr, "Error: --x86-smt adaptive requires exactly two teams\n");
-			return 1;
-		}
-		for (unsigned t = 0; t < config.team_count; t++) {
-			unsigned n = config.teams[t].threads > config.teams[t].threads_batch ?
-				config.teams[t].threads : config.teams[t].threads_batch;
-
-			if (n > 4 || config.teams[t].cpu_mask != 0xff) {
-				fprintf(stderr, "Error: --x86-smt adaptive requires T/TB <= 4 and CPU mask 0xff for every team\n");
-				return 1;
-			}
-		}
-		if (validate_x86_4c8t_topology()) {
-			fprintf(stderr, "Error: --x86-smt adaptive requires sibling pairs 0/4, 1/5, 2/6 and 3/7\n");
-			return 1;
-		}
-#endif
+	/*
+	 * Fixed spread placement: team0 -> CPU0-3, team1 -> CPU4-7, so a 2x4
+	 * setup on 4C/8T fills all logical CPUs. It assumes the sibling layout.
+	 */
+	if (config.team_count != 2) {
+		fprintf(stderr, "Error: x86 spread requires exactly two teams\n");
+		return 1;
 	}
+	for (unsigned t = 0; t < config.team_count; t++) {
+		unsigned n = config.teams[t].threads > config.teams[t].threads_batch ?
+			config.teams[t].threads : config.teams[t].threads_batch;
+
+		if (n > 4 || config.teams[t].cpu_mask != 0xff) {
+			fprintf(stderr, "Error: x86 spread requires T/TB <= 4 and CPU mask 0xff for every team\n");
+			return 1;
+		}
+	}
+	if (validate_x86_4c8t_topology()) {
+		fprintf(stderr, "Error: x86 spread requires sibling pairs 0/4, 1/5, 2/6 and 3/7\n");
+		return 1;
+	}
+#endif
 
 	config.enabled = 1;
 	config.user_session_id = new_control_session_id();
@@ -676,7 +643,7 @@ int main(int argc, char **argv)
 	       (unsigned long long)(config.prefill_starvation_ns / NSEC_PER_MSEC));
 	printf("  Phase wakeup preempt: %s\n",
 	       config.phase_wakeup_preempt_enabled ? "on" : "off");
-	printf("  x86 SMT policy:  %s\n", x86_smt_mode_name(config.x86_smt_mode));
+	printf("  x86 SMT policy:  spread (team0=CPU0-3, team1=CPU4-7)\n");
 	printf("  Control dir:     %s\n", control_dir);
 	printf("  Control session: %llu\n",
 	       (unsigned long long)config.user_session_id);

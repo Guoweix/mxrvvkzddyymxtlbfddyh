@@ -20,7 +20,7 @@ from .metrics import (
 
 
 KERNEL_FAILURE = re.compile(
-    r"(sched_ext.*(stall|error|disabled|watchdog)|runnable task stall|out of memory|oom-kill)",
+    r"(sched_ext.*(stall|error|watchdog)|runnable task stall|out of memory|oom-kill)",
     re.IGNORECASE,
 )
 

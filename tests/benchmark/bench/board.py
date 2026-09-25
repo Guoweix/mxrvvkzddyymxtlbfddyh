@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import subprocess
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 def http_json(url, payload=None, timeout=10):
@@ -164,3 +166,42 @@ class Remote:
         if result.returncode and not optional:
             raise RuntimeError(f"failed to download {remote_path}")
         return result.returncode == 0
+
+
+class Local:
+    """Local-host transport with the same interface as :class:`Remote`.
+
+    Commands run through ``bash -lc`` and files are copied with
+    :func:`shutil.copy2`, which is enough for a single-host benchmark run.
+    """
+
+    def run(self, command, check=True, timeout=None):
+        result = subprocess.run(
+            ["bash", "-lc", command],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        if check and result.returncode:
+            raise RuntimeError(
+                f"local command failed ({result.returncode}): {command}\n"
+                f"{result.stderr.strip()}"
+            )
+        return result
+
+    def upload(self, local_path, remote_path):
+        destination = Path(remote_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_path, destination)
+
+    def download(self, remote_path, local_path, optional=False):
+        source = Path(remote_path)
+        if not source.exists():
+            if optional:
+                return False
+            raise RuntimeError(f"failed to download {remote_path}")
+        destination = Path(local_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        return True

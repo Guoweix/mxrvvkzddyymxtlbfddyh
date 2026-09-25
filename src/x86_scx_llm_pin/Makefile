@@ -59,16 +59,13 @@ $(TARGET): $(USER_OBJ)
 # Does not require sched_ext or root: config validation + skeleton generation.
 test: all
 	./$(TARGET) --help >/dev/null
-	./$(TARGET) --check-config --team 100:4:4:0x0f --team 200:4:4:0x0f >/dev/null
 	./$(TARGET) --check-config --team 100:4:4:0xff --team 200:4:4:0xff >/dev/null
-	./$(TARGET) --check-config --team 100:4:4:0xff --team 200:4:4:0xff --x86-smt adaptive >/dev/null
-	./$(TARGET) --check-config --tgid 100 --tgid2 200 >/dev/null
 	@! ./$(TARGET) --check-config --team 100:4:4:0x0f --team 200:4:4:0x0f \
-		--x86-smt adaptive >/dev/null 2>&1 \
-		|| { echo "FAIL: adaptive accepted a non-0xff CPU mask"; exit 1; }
+		>/dev/null 2>&1 \
+		|| { echo "FAIL: spread accepted a non-0xff CPU mask"; exit 1; }
 	@! ./$(TARGET) --check-config --team 100:4:4:0xff --team 200:4:4:0xff \
-		--team 300:4:4:0xff --x86-smt adaptive >/dev/null 2>&1 \
-		|| { echo "FAIL: adaptive accepted more than two teams"; exit 1; }
+		--team 300:4:4:0xff >/dev/null 2>&1 \
+		|| { echo "FAIL: spread accepted more than two teams"; exit 1; }
 	$(CC) -Wall -Wextra -Werror -I. tests/test_team_config.c -o /tmp/x86_scx_llm_test_team_config
 	/tmp/x86_scx_llm_test_team_config
 	$(BPFTOOL) gen skeleton $(BPF_OBJ) >/dev/null

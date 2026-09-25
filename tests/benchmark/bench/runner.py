@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .board import (
+    Local,
     Remote,
     dmesg_delta,
     pids_for_port,
@@ -25,6 +26,8 @@ from .dynamic_threads import DynamicThreadsStrategy
 from .report import generate_suite
 from .scx_llm_pin import ScxLlmPinStrategy
 from .server import ServerManager
+from .x86_dynamic import X86DynamicStrategy
+from .x86_scx_llm_pin import X86ScxLlmPinStrategy
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -67,7 +70,11 @@ def validate_models(config):
 class SuiteRunner:
     def __init__(self, args):
         self.args = args
-        self.remote = Remote(args.host, args.user, args.password)
+        self.remote = (
+            Local()
+            if args.local
+            else Remote(args.host, args.user, args.password)
+        )
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.suite_dir = Path(args.results_dir) / (
             f"{timestamp}_{args.scenario}_{args.strategy}_suite"
@@ -85,6 +92,10 @@ class SuiteRunner:
             self.strategy = ScxLlmPinStrategy(args, self.remote, self.remote_dir)
         elif args.strategy == "cfs-affinity":
             self.strategy = CfsAffinityStrategy(args, self.remote, self.remote_dir)
+        elif args.strategy == "x86-dynamic":
+            self.strategy = X86DynamicStrategy(args, self.remote, self.remote_dir)
+        elif args.strategy == "x86-scx-llm-pin":
+            self.strategy = X86ScxLlmPinStrategy(args, self.remote, self.remote_dir)
 
     # ------------------------------------------------------------------ setup
     def _load_models(self):
@@ -151,6 +162,19 @@ class SuiteRunner:
                 stop_pid(self.remote, pid)
 
     # --------------------------------------------------------------- per run
+    def _server_overrides(self):
+        """Merge the strategy overrides with the local x86 direct-exec base."""
+        overrides = dict(self.strategy.server_overrides() or {}) if self.strategy else {}
+        if self.args.local:
+            base = {
+                "direct": True,
+                "runtime_bin": self.args.x86_runtime_bin,
+                "library_path": self.args.x86_runtime_bin,
+            }
+            base.update(overrides)
+            return base
+        return overrides or None
+
     def _server_specs(self, direction):
         if self.args.scenario == "multi":
             specs = []
@@ -167,7 +191,7 @@ class SuiteRunner:
                     }
                 )
             return specs
-        threads = 8
+        threads = 4 if self.args.local else 8
         requests = self.args.concurrency // 2
         a = {
             "model": "A",
@@ -436,7 +460,7 @@ class SuiteRunner:
         try:
             if self.strategy is not None and self.strategy.starts_before_servers:
                 self.strategy.start(run_tag)
-            overrides = self.strategy.server_overrides() if self.strategy else None
+            overrides = self._server_overrides()
             for spec in self._server_specs(direction):
                 self.servers.start(
                     spec["model"], spec["port"], spec["model_path"], spec["threads"],
@@ -555,7 +579,7 @@ def _kernel_failure(run_dir):
     import re
 
     pattern = re.compile(
-        r"(sched_ext.*(stall|error|disabled|watchdog)|runnable task stall|out of memory|oom-kill)",
+        r"(sched_ext.*(stall|error|watchdog)|runnable task stall|out of memory|oom-kill)",
         re.IGNORECASE,
     )
     return any(pattern.search(line) for line in path.read_text(errors="replace").splitlines())

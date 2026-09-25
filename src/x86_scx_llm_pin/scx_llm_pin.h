@@ -10,6 +10,7 @@
 enum llm_x86_smt_mode {
 	LLM_X86_SMT_OFF = 0,
 	LLM_X86_SMT_ADAPTIVE = 1,
+	LLM_X86_SMT_SPREAD = 2,
 };
 
 #define RVV_SR_VS		0x00000600UL
