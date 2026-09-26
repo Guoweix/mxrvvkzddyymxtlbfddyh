@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="820" viewBox="0 0 1600 820" role="img" aria-labelledby="title desc">
   <title id="title">Phase-Aware Dirty Lease scheduling path</title>
-  <desc id="desc">Tasks flow from the right into the global or per-team vector queues, then into CPU i's local DSQ, and finally run on CPU i. The two vector queues are grouped visually in one container. Normal vector wakeups return to the vector queues; only startup identification and preferred wakeup preemption can dispatch directly to local.</desc>
+  <desc id="desc">Tasks flow from the right into the global or per-team vector queues, then into CPU i's local DSQ, and finally run on CPU i. The two vector queues are grouped visually in one container. Non-vector LLM tasks, vector tasks inside the 500 ms local window, and preferred wakeup preemption are dispatched directly to local.</desc>
 
   <defs>
     <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
@@ -73,8 +73,8 @@
   <text x="395" y="420" class="small-line">BPF 按 phase consume 一个 worker</text>
 
   <rect x="375" y="452" width="270" height="56" rx="6" fill="#fff8e6" stroke="#b45309"/>
-  <text x="510" y="477" text-anchor="middle" class="small-title">普通 wakeup 不直接进入 LOCAL</text>
-  <text x="510" y="498" text-anchor="middle" class="small-line">重新进入对应 VDSQ</text>
+  <text x="510" y="477" text-anchor="middle" class="small-title">vector wakeup（窗口外）</text>
+  <text x="510" y="498" text-anchor="middle" class="small-line">回到对应 VDSQ；窗口内直接进 LOCAL</text>
 
   <path d="M 335 365 L 295 365" class="teal-edge"/>
   <text x="315" y="350" text-anchor="middle" class="edge-label">run</text>
@@ -84,7 +84,7 @@
     <rect x="760" y="135" width="400" height="165" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="2"/>
   </g>
   <text x="790" y="176" class="node-title">SCX_DSQ_GLOBAL</text>
-  <text x="790" y="207" class="node-line">普通进程、LLM helper、kworker、内核线程</text>
+  <text x="790" y="207" class="node-line">普通进程、kworker、内核线程</text>
   <text x="790" y="234" class="node-line">LOCAL 为空时由 sched_ext 内核先消费</text>
   <rect x="1014" y="252" width="116" height="28" rx="4" fill="#57606a"/>
   <text x="1072" y="271" text-anchor="middle" class="badge" fill="#ffffff">kernel first</text>
@@ -94,7 +94,7 @@
 
   <!-- Vector DSQs: one visual container, two physical queues -->
   <g filter="url(#shadow)">
-    <rect x="760" y="340" width="400" height="290" rx="8" fill="#ffffff" stroke="#087ea4" stroke-width="2.5"/>
+    <rect x="760" y="340" width="400" height="350" rx="8" fill="#ffffff" stroke="#087ea4" stroke-width="2.5"/>
   </g>
   <text x="790" y="380" class="node-title">VECTOR DSQs (CPU i)</text>
   <text x="790" y="405" class="small-line">一个视觉容器；实现中 A/B 是两条独立 FIFO</text>
@@ -110,6 +110,8 @@
   <rect x="790" y="558" width="340" height="58" rx="6" fill="#eef5ff" stroke="#2f6feb" stroke-width="2"/>
   <text x="812" y="583" class="small-title">VDSQ(B, i)</text>
   <text x="812" y="604" class="small-line">B_i normal enqueue + wakeup</text>
+  <text x="960" y="646" text-anchor="middle" class="node-title">⋮</text>
+  <text x="960" y="668" text-anchor="middle" class="small-line">其余 team 的 VDSQ</text>
 
   <path d="M 750 485 C 720 485, 710 420, 685 404" class="teal-edge"/>
   <rect x="682" y="441" width="72" height="42" rx="5" fill="#ffffff" stroke="#afb8c1"/>
@@ -120,7 +122,7 @@
   <g filter="url(#shadow)">
     <rect x="1245" y="155" width="300" height="125" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="2"/>
   </g>
-  <text x="1272" y="194" class="node-title">普通 / helper / kernel</text>
+  <text x="1272" y="194" class="node-title">普通 / kworker / kernel</text>
   <text x="1272" y="226" class="node-line">normal enqueue</text>
   <text x="1272" y="252" class="small-line">进入 SCX_DSQ_GLOBAL</text>
   <path d="M 1235 218 L 1170 218" class="dark-edge"/>
@@ -139,16 +141,5 @@
   <text x="1272" y="572" class="node-line">normal enqueue / wakeup -> B lane</text>
   <path d="M 1235 552 L 1140 587" class="blue-edge"/>
 
-  <!-- Direct-local exceptions -->
-  <g filter="url(#shadow)">
-    <rect x="1245" y="640" width="300" height="88" rx="8" fill="#eef9fb" stroke="#087ea4" stroke-width="2"/>
-  </g>
-  <text x="1272" y="672" class="small-title">仅两类 direct-local 例外</text>
-  <text x="1272" y="696" class="small-line">启动识别；preferred wakeup preempt</text>
-  <text x="1272" y="716" class="small-line">不包含 500ms team-local wakeup</text>
-  <path d="M 1235 687 C 1030 760, 760 735, 650 525" class="teal-edge dashed"/>
-  <rect x="827" y="692" width="142" height="30" rx="5" fill="#ffffff" stroke="#087ea4"/>
-  <text x="898" y="712" text-anchor="middle" class="edge-label">direct LOCAL / PREEMPT</text>
-
-  <text x="800" y="790" text-anchor="middle" class="subtitle">i=0..7；每个 CPU 都有自己的 LOCAL、VDSQ(A,i) 和 VDSQ(B,i)，图中只展示一个 CPU。</text>
+  <text x="800" y="790" text-anchor="middle" class="subtitle">i=0..7；每个 CPU 都有自己的 LOCAL 与每 team 一组 VDSQ(team, i)，图中以 A/B 两个 team、单个 CPU 为例。</text>
 </svg>
