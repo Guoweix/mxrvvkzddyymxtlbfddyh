@@ -4,10 +4,18 @@
 当前只保留一种调度策略 `rvv_dirty_local`：
 
 - 根据 `sstatus.VS=Dirty` 识别 RVV vector worker；
-- 对 vector worker 使用全 8 核唯一 CPU 分配和 per-team/per-CPU vector DSQ；
+- 对 vector worker 使用全 8 核唯一 CPU **绑定**和 per-team/per-CPU vector DSQ，
+  使同一 llama-server 的 worker 稳定地在各自核上推进、不被迁移或被其它 team 顶替；
+  这组 worker 因此在各自分片上以相近节奏到达 graph barrier（组内相位 lockstep），
+  降低 barrier 自旋/futex 等待；
+- 每消费一次 VDSQ 打开 500ms local 窗口（普通任务与向量任务混排）；向远端 VDSQ
+  投递后按需 `kick` 目标 CPU；
 - 目标 LLM 的非 vector 辅助线程进入 local DSQ。
 
-调度器接管全部任务，不再提供其它策略轴或消融模式。
+`PREFILL/DECODE` 是 team 级相位，由同一 server 的 worker 共同经历；phase hint 只用于
+**组间仲裁**（多 server 的 team 同核相撞时优先 PREFILL/MIXED、定向抢占、prefill
+安全片），无有效 hint 时回退默认轮转。100ms slice / 500ms window 是绑定的配套，不是
+策略本质。调度器接管全部任务，不再提供其它策略轴或消融模式。
 
 ## ABI v4：N 模型与可变 worker
 

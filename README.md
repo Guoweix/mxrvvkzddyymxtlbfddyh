@@ -14,13 +14,15 @@ llama.cpp 提供的 prefill/decode 阶段提示，改善多线程和多模型竞
   的调度器、cgroup、BTF、libbpf 和驱动构建兼容代码。
 - **RVV worker 识别**：根据任务的 RISC-V Vector 上下文状态和可配置 dirty 命中
   阈值识别向量计算线程。
-- **`rvv_dirty_local` 单策略**：为向量 worker 分配互不重复的 CPU，使用
-  per-team/per-CPU vector DSQ 和长时间片；每消费一次 VDSQ 打开 500ms local
-  窗口，普通任务与向量任务在该窗口内在 local DSQ 混排；向远端 VDSQ 投递后按需
-  `kick` 目标 CPU，避免空闲核上的任务饿死。
-- **自动 phase-aware**：无有效 hint 时回退到上述默认；一旦从 ABI v4 worker page
-  读到有效 phase hint，即启用 PREFILL/MIXED 优先消费、preferred wakeup 定向抢占
-  和 prefill 安全片。无需策略/模式开关。
+- **`rvv_dirty_local` 单策略：每核唯一定位驱动相位同步推进**：为同一 llama-server
+  的向量 worker 分配互不重复的 CPU 和 per-team/per-CPU vector DSQ，使其稳定地在
+  各自核上推进、不被迁移或被其它 team 顶替；同一 server 的这组 worker 因此以相近
+  节奏到达 graph barrier（组内相位 lockstep），显著降低 barrier 自旋/futex 等待。
+  100ms vector slice 与 500ms local 窗口是这一绑定的配套，不是策略本质。
+- **自动 phase-aware（组间仲裁）**：`PREFILL/DECODE` 是 team 级相位，由同一 server
+  的 worker 共同经历，并非 worker 各自进入。调度器读 ABI v4 phase hint，仅在多个
+  server 的 team 于同一核相撞时仲裁：PREFILL/MIXED 优先消费、preferred wakeup
+  定向抢占、prefill 安全片；无有效 hint 时回退默认轮转。无需策略/模式开关。
 - **用户态调度提示**：llama.cpp 可通过 mmapable BPF map 注册 OpenMP worker，
   并发布 `PREFILL`、`DECODE`、`MIXED` 和 `IDLE` 阶段。
 - **x86/SMT 移植**：`src/x86_scx_llm_pin` 用 ABI v4 hint 替代 RISC-V `sstatus.VS`
@@ -72,9 +74,14 @@ Vector 状态完成 RVV worker 识别、CPU 分配和 DSQ 选择，再通过 sch
   </a>
 </p>
 
-Phase-Aware Dirty Lease 是当前完整策略名称。它把 RVV worker 稳定映射到 CPU，
-使用 100 ms vector slice 和 per-team/per-CPU VDSQ 保持同组 worker 连续推进，再
-根据 llama.cpp 发布的 `PREFILL/MIXED` phase 选择优先运行的 team。
+当前策略的核心是**相位同步推进（phase-locked progression）**，而不是单纯把时间片
+拉长：把同一 llama-server 的 RVV worker 每核唯一定位后，per-team/per-CPU VDSQ 让
+每个 worker 稳定回到自己的 CPU，避免迁移和被其它 team 顶替；于是这组 worker 在各自
+分片上以相近速率推进、在 graph barrier 上同步到达（组内 lockstep），barrier 的
+“最后到达者”不再被落后者拖住，自旋/futex 等待下降。100 ms vector slice 和 500 ms
+local 窗口是这一绑定的配套，不是策略本质。`PREFILL/DECODE` 是 team 级相位，由同一
+server 的 worker 共同经历；phase hint 只用于**组间仲裁**：当多个 server 的 team 在
+同一核相撞时选择优先运行的一方。
 
 图从左到右展示 CPU、local DSQ、来源 DSQ 和任务；箭头按真实数据流从右向左。
 CPU i 最终只从自己的 local DSQ 运行任务。local 为空时，sched_ext 核心先把
@@ -129,6 +136,27 @@ nearest-rank p95 均直接从 60 个 injected 单请求汇总。
 Phase-Aware Dirty Lease 相对 CFS 在 c=2/4/8 下分别提升 TPS 约 54.9%、30.7% 和
 25.6%，并将 injected TTFT p95 分别降低约 38.6%、42.3% 和 42.5%。相对 Observe，
 Phase-Aware 的 TPS 变化不超过 0.4%，但 p95 进一步降低约 14.9%、24.1% 和 15.3%。
+
+#### 上下文切换对比
+
+“每核唯一定位使 worker 稳定驻留、相位同步推进”的一个直接体现是上下文切换大幅下降。
+下表为 `tests/benchmark` 的 dual-sync 短测（2×llama-server 共享 CPU0-7、每请求
+128 input / 64 output、各 3 轮）在板端 RISC-V 上的上下文切换总数：
+
+| 策略 | 上下文切换（3 轮均值） | Aggregate TPS（均值） |
+|---|---:|---:|
+| CFS | 416,758 | 1.284 |
+| CFS + 绑核 + 100ms 长片 + 短 spin | 565,473 | 1.757 |
+| dynamic（graph 边界动态授权） | 4,888 | 1.852 |
+| **scx-llm-pin（本策略）** | **13,645** | **1.861** |
+
+本策略把上下文切换从 CFS 的 40 万级降到 1.3 万级（约 1/30），吞吐随之提升；而
+“短 spin”类做法会让 worker 频繁 futex 睡眠/唤醒，切换反而最多（56.5 万）。dynamic
+的切换最少，但吞吐与本策略基本持平，说明本策略的核心收益来自**稳定绑核下的相位
+同步推进**，而非压缩切换数量本身。
+
+x86（i5-10200H，2×4 线程、64 output、各 3 轮）趋势一致：CFS 约 84.0k，
+`x86-dynamic` 约 3.7k，`x86-scx-llm-pin`（spread）约 2.4k。
 
 ## 环境准备
 
