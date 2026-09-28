@@ -97,6 +97,29 @@ VDSQ，该 team 的向量任务在随后窗口内改走 local DSQ，与普通任
 任务、helper 和内核任务仍通过 global DSQ 获得服务。以上 phase-aware 分支只在读到
 有效 hint 时启用；否则全部回退到 `rvv_dirty_local` 默认。
 
+### 调度对比：CFS 与相位同步推进
+
+<p align="center">
+  <a href="docs/images/scheduling-policy-comparison-redraw.svg">
+    <img src="docs/images/scheduling-policy-comparison-redraw.svg" width="1200" alt="CFS 与 scx-llm-pin 的时间轴调度对比">
+  </a>
+</p>
+
+上图用同一工作负载的时间轴对比两种调度结果。worker 的执行顺序是**计算 → spin →
+futex**，futex 之后才发生上下文切换（红虚线）。
+
+左栏是 CFS：同一 server 的 A0/A1 会竞争同一核、被时间片反复打断，A2/A3 也被
+`normal` 等非向量任务穿插，相位错乱，直到末尾 A3 结束才到达同步点（黄虚线）。
+右栏是 `scx-llm-pin`：同一 server 的 A0–A3 **各占一个 CPU 且稳定不被迁移**，只在
+`normal`（非向量任务）和早期自旋结束处发生少量上下文切换；A1–A3 各自在自己的分片
+上以相近节奏推进，并在第一个同步点（黄虚线，贯穿 A0–A3）对齐、同步完成。
+
+这正是**相位同步推进**的实现路径：`select_cpu`/`enqueue` 把每核唯一定位与
+per-team/per-CPU VDSQ 结合，使每个 worker 稳定回到自己的 CPU、不被其它 team 顶替，
+于是同一 server 的这组 worker 以相近速率推进并在 graph barrier 上同步到达，而不是
+靠拉长时间片。其直接结果是上下文切换大幅下降：板端 dual-sync 短测中本策略把切换
+从 CFS 的 40 万级降到 1.3 万级（见下方“上下文切换对比”）。
+
 ### 实验数据对比
 
 以下正式 campaign 使用两个 llama-server 各 8 个 worker 共享 CPU0-7。四个默认

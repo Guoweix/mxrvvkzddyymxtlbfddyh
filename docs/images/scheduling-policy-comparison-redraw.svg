@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="648" viewBox="0 0 820 648" font-family="Segoe UI, PingFang SC, Microsoft YaHei, Noto Sans CJK SC, sans-serif">
+<desc>两种调度策略时间轴对比。左：CFS，每个 worker 计算→spin→futex，futex 后上下文切换（红虚线），末尾 A3 到达同步点（黄虚线）。右：scx-llm-pin，A0–A3 各占一个 CPU，同步点（黄虚线）从 A0 贯穿到 A3。</desc>
+<defs>
+  <filter id="sh" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="1" stdDeviation="1.6" flood-color="#1f2328" flood-opacity="0.18"/></filter>
+</defs>
+<style>
+  .t-title{font-size:21px;font-weight:700;fill:#1f2328}
+  .t-sub{font-size:13.5px;fill:#57606a}
+  .p-title{font-size:14.5px;font-weight:700}
+  .cap{font-size:12.5px;fill:#57606a}
+  .hd{font-size:12px;fill:#57606a}
+  .lbl{font-weight:700}
+  .leg-t{font-size:13px;font-weight:700;fill:#1f2328}
+  .leg-l{font-size:12.5px;fill:#24292f}
+</style>
+<rect x="0" y="0" width="820" height="648" fill="#ffffff"/>
+<text x="410" y="46" text-anchor="middle" class="t-title">两种调度策略时间轴对比</text>
+<text x="410" y="74" text-anchor="middle" class="t-sub">纵轴为时间（向下）；每栏 CPU0–3；worker 顺序：计算 → spin → futex</text>
+<line x1="22" y1="188.0" x2="22" y2="440.0" stroke="#8c959f" stroke-width="1.4"/>
+<polygon points="22,449.0 18,440.0 26,440.0" fill="#8c959f"/>
+<text x="22" y="314" text-anchor="middle" font-size="12" fill="#57606a" transform="rotate(-90 22 314)">时间</text>
+<rect x="40" y="120" width="344" height="336.0" rx="10" fill="#ffffff" stroke="#bc4c00" stroke-width="1.6"/>
+<text x="56" y="146" class="p-title" fill="#bc4c00">CFS（时间片中断）</text>
+<line x1="41" y1="158" x2="383" y2="158" stroke="#bc4c00" stroke-opacity="0.35"/>
+<text x="74" y="179" text-anchor="middle" class="hd">CPU</text>
+<rect x="96" y="188" width="60" height="252.0" fill="#f6f8fa"/>
+<text x="126" y="179" text-anchor="middle" class="hd">0</text>
+<text x="198" y="179" text-anchor="middle" class="hd">1</text>
+<rect x="240" y="188" width="60" height="252.0" fill="#f6f8fa"/>
+<text x="270" y="179" text-anchor="middle" class="hd">2</text>
+<text x="342" y="179" text-anchor="middle" class="hd">3</text>
+<rect x="424" y="120" width="344" height="336.0" rx="10" fill="#ffffff" stroke="#1a7f37" stroke-width="1.6"/>
+<text x="440" y="146" class="p-title" fill="#1a7f37">scx-llm-pin（相位对齐）</text>
+<line x1="425" y1="158" x2="767" y2="158" stroke="#1a7f37" stroke-opacity="0.35"/>
+<text x="458" y="179" text-anchor="middle" class="hd">CPU</text>
+<rect x="480" y="188" width="60" height="252.0" fill="#f6f8fa"/>
+<text x="510" y="179" text-anchor="middle" class="hd">0</text>
+<text x="582" y="179" text-anchor="middle" class="hd">1</text>
+<rect x="624" y="188" width="60" height="252.0" fill="#f6f8fa"/>
+<text x="654" y="179" text-anchor="middle" class="hd">2</text>
+<text x="726" y="179" text-anchor="middle" class="hd">3</text>
+<rect x="96" y="188.0" width="60" height="72.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="126" y="228.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A0</text>
+<rect x="96" y="260.0" width="60" height="36.0" rx="4" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.5" filter="url(#sh)"/>
+<text x="126" y="282.0" text-anchor="middle" font-size="11" class="lbl" fill="#7d4e00">SPIN</text>
+<rect x="96" y="296.0" width="60" height="72.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="126" y="336.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A1</text>
+<rect x="96" y="368.0" width="60" height="30.0" rx="4" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.5" filter="url(#sh)"/>
+<text x="126" y="387.0" text-anchor="middle" font-size="11" class="lbl" fill="#7d4e00">SPIN</text>
+<rect x="168" y="188.0" width="60" height="132.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="198" y="258.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A2</text>
+<rect x="168" y="320.0" width="60" height="36.0" rx="4" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.5" filter="url(#sh)"/>
+<text x="198" y="342.0" text-anchor="middle" font-size="11" class="lbl" fill="#7d4e00">SPIN</text>
+<rect x="240" y="188.0" width="60" height="132.0" rx="4" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5" filter="url(#sh)"/>
+<text x="270" y="258.7" text-anchor="middle" font-size="13" class="lbl" fill="#0a3069">B0</text>
+<rect x="312" y="188.0" width="60" height="72.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="342" y="228.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A3</text>
+<rect x="312" y="266.0" width="60" height="54.0" rx="4" fill="#eaeef2" stroke="#8c959f" stroke-width="1.5" filter="url(#sh)"/>
+<text x="342" y="297.7" text-anchor="middle" font-size="13" class="lbl" fill="#42526b">normal</text>
+<rect x="312" y="326.0" width="60" height="72.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="342" y="366.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A3</text>
+<rect x="480" y="188.0" width="60" height="72.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="510" y="228.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A0</text>
+<rect x="480" y="260.0" width="60" height="36.0" rx="4" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.5" filter="url(#sh)"/>
+<text x="510" y="282.0" text-anchor="middle" font-size="11" class="lbl" fill="#7d4e00">SPIN</text>
+<rect x="480" y="302.0" width="60" height="72.0" rx="4" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5" filter="url(#sh)"/>
+<text x="510" y="342.7" text-anchor="middle" font-size="13" class="lbl" fill="#0a3069">B0</text>
+<rect x="552" y="188.0" width="60" height="54.0" rx="4" fill="#eaeef2" stroke="#8c959f" stroke-width="1.5" filter="url(#sh)"/>
+<text x="582" y="219.7" text-anchor="middle" font-size="13" class="lbl" fill="#42526b">normal</text>
+<rect x="552" y="248.0" width="60" height="72.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="582" y="288.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A1</text>
+<rect x="552" y="320.0" width="60" height="12.0" rx="4" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.5" filter="url(#sh)"/>
+<rect x="552" y="332.0" width="60" height="108.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="582" y="390.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A1</text>
+<rect x="624" y="188.0" width="60" height="132.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="654" y="259" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A2</text>
+<rect x="624" y="320.0" width="60" height="12.0" rx="4" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.5" filter="url(#sh)"/>
+<rect x="624" y="332.0" width="60" height="108.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="654" y="390.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A2</text>
+<rect x="696" y="188.0" width="60" height="252.0" rx="4" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5" filter="url(#sh)"/>
+<text x="726" y="318.7" text-anchor="middle" font-size="13" class="lbl" fill="#1a7f37">A3</text>
+<line x1="96" y1="398.0" x2="372" y2="398.0" stroke="#d4a72c" stroke-width="2.6" stroke-dasharray="9 5"/>
+<text x="376" y="402.0" font-size="10.5" fill="#8a6100">同步点</text>
+<line x1="480" y1="332.0" x2="756" y2="332.0" stroke="#d4a72c" stroke-width="2.6" stroke-dasharray="9 5"/>
+<text x="760" y="336.0" font-size="10.5" fill="#8a6100">同步点</text>
+<line x1="93" y1="296.0" x2="159" y2="296.0" stroke="#cf222e" stroke-width="1.8" stroke-dasharray="4 3"/>
+<line x1="93" y1="398.0" x2="159" y2="398.0" stroke="#cf222e" stroke-width="1.8" stroke-dasharray="4 3"/>
+<line x1="165" y1="356.0" x2="231" y2="356.0" stroke="#cf222e" stroke-width="1.8" stroke-dasharray="4 3"/>
+<line x1="309" y1="260.0" x2="375" y2="260.0" stroke="#cf222e" stroke-width="1.8" stroke-dasharray="4 3"/>
+<line x1="309" y1="320.0" x2="375" y2="320.0" stroke="#cf222e" stroke-width="1.8" stroke-dasharray="4 3"/>
+<line x1="549" y1="242.0" x2="615" y2="242.0" stroke="#cf222e" stroke-width="1.8" stroke-dasharray="4 3"/>
+<line x1="477" y1="296.0" x2="543" y2="296.0" stroke="#cf222e" stroke-width="1.8" stroke-dasharray="4 3"/>
+<rect x="40" y="506" width="740" height="104" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+<text x="56" y="533" class="leg-t">图例</text>
+<rect x="114" y="521" width="20" height="14" rx="3" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5"/>
+<text x="141" y="533" class="leg-l">team A worker（A0–A3）</text>
+<rect x="318.5" y="521" width="20" height="14" rx="3" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+<text x="345.5" y="533" class="leg-l">team B worker（B0）</text>
+<rect x="501.25" y="521" width="20" height="14" rx="3" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.5"/>
+<text x="528.25" y="533" class="leg-l">SPIN 自旋等待</text>
+<rect x="114" y="549" width="20" height="14" rx="3" fill="#eaeef2" stroke="#8c959f" stroke-width="1.5"/>
+<text x="141" y="561" class="leg-l">normal 非向量任务</text>
+<line x1="276.25" y1="554" x2="296.25" y2="554" stroke="#cf222e" stroke-width="1.8" stroke-dasharray="4 3"/>
+<text x="303.25" y="561" class="leg-l">红虚线 = 上下文切换（futex 后）</text>
+<line x1="114" y1="582" x2="134" y2="582" stroke="#d4a72c" stroke-width="2.6" stroke-dasharray="9 5"/>
+<text x="141" y="589" class="leg-l">黄虚线 = 同步点</text>
+</svg>
