@@ -40,24 +40,34 @@ __u64 enqueue_count, placed_count, running_count, wrong_cpu_count, stale_identit
 __u32 exit_kind;
 char exit_reason[128];
 
-static __always_inline int target_cpu(struct task_struct *p)
+/* Resolve the granting team for a managed worker. On success writes the
+   target CPU to *cpu and returns the grant; returns NULL when the task is not
+   a currently-published member. */
+static __always_inline struct dt_bpf_grant *target_grant(struct task_struct *p, int *cpu)
 {
     __u32 tid = p->pid;
     struct dt_bpf_member *m = bpf_map_lookup_elem(&members, &tid);
     if (!m || m->slot >= DT_TEAMS || m->cpu >= DT_WORKERS)
-        return -1;
+        return NULL;
     __u32 slot = m->slot;
     struct dt_bpf_grant *g = bpf_map_lookup_elem(&grants, &slot);
     if (!g || !g->ready || !g->pin || g->tgid != p->tgid ||
         g->session != m->session || g->epoch != m->epoch ||
         !(g->cpu_mask & (1ULL << m->cpu)) ||
         !bpf_cpumask_test_cpu(m->cpu, p->cpus_ptr))
-        return -1;
+        return NULL;
     if (m->start_boottime != p->start_boottime) {
         __sync_fetch_and_add(&stale_identity_count, 1);
-        return -1;
+        return NULL;
     }
-    return m->cpu;
+    *cpu = m->cpu;
+    return g;
+}
+
+static __always_inline int target_cpu(struct task_struct *p)
+{
+    int cpu = -1;
+    return target_grant(p, &cpu) ? cpu : -1;
 }
 
 SEC("struct_ops/dtc_enable")
@@ -87,11 +97,13 @@ SEC("struct_ops/dtc_enqueue")
 void BPF_PROG(dtc_enqueue, struct task_struct *p, __u64 flags)
 {
     __sync_fetch_and_add(&enqueue_count, 1);
-    int cpu = target_cpu(p);
-    if (cpu >= 0) {
+    int cpu = -1;
+    struct dt_bpf_grant *g = target_grant(p, &cpu);
+    if (g) {
+        __u64 slice = g->slice_ns ? g->slice_ns : SCX_SLICE_DFL;
         __sync_fetch_and_add(&placed_count, 1);
         /* LOCAL_ON is illegal for direct dispatch from enqueue on this ABI. */
-        scx_bpf_dispatch(p, DT_DSQ(cpu), SCX_SLICE_DFL, flags);
+        scx_bpf_dispatch(p, DT_DSQ(cpu), slice, flags);
     } else {
         scx_bpf_dispatch(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, flags);
     }

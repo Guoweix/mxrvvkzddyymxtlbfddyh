@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* Local SOCK_SEQPACKET protocol. Fixed-width, native-endian on one machine. */
 #ifndef DT_CONTROL_H
 #define DT_CONTROL_H
@@ -52,9 +53,12 @@ struct dt_msg {
     uint32_t allocation, phase, prompt_tokens, decode_tokens;
 };
 
-/* Loader is the only writer; BPF only reads. ready is published after members. */
+/* Loader is the only writer; BPF only reads. ready is published after members.
+   slice_ns is the per-CPU DSQ time slice for managed workers; 0 means the
+   sched_ext default (SCX_SLICE_DFL). */
 struct dt_bpf_grant {
     uint64_t session, epoch, cpu_mask;
+    uint64_t slice_ns;
     uint32_t tgid, workers, ready, pin;
 };
 struct dt_bpf_member {

@@ -51,6 +51,7 @@ static unsigned lifetime, allocation;
 static uint64_t order, grants_total;
 static uint32_t next_generation;
 static uint64_t decode_wait_budget_ns = 2000000000ULL;
+static uint64_t slice_ns;
 static FILE *events;
 #ifndef DT_NO_BPF
 static struct control_bpf *bpf;
@@ -129,7 +130,8 @@ static int publish(unsigned slot, bool ready)
     if (use_scx) {
         struct dt_bpf_grant g = { .session = p->session, .epoch = p->epoch,
             .cpu_mask = p->grant.cpu_mask, .tgid = p->pid,
-            .workers = p->grant.workers, .ready = ready, .pin = p->grant.pin };
+            .workers = p->grant.workers, .ready = ready, .pin = p->grant.pin,
+            .slice_ns = slice_ns };
         if (bpf_map_update_elem(bpf_map__fd(bpf->maps.grants), &slot, &g, BPF_ANY))
             return -1;
     }
@@ -529,6 +531,17 @@ int main(int argc, char **argv)
             }
             decode_wait_budget_ns = (uint64_t)ms * 1000000;
         }
+        else if (!strcmp(argv[i], "--slice-ms") && i + 1 < argc) {
+            const char *value = argv[++i];
+            char *end;
+            errno = 0;
+            unsigned long ms = strtoul(value, &end, 10);
+            if (errno || !*value || *value == '-' || *end || ms > 100000) {
+                fprintf(stderr, "slice-ms must be 0..100000 (0 uses sched_ext default)\n");
+                return 2;
+            }
+            slice_ns = (uint64_t)ms * 1000000;
+        }
         else if (!strcmp(argv[i], "--decode-floor-on-prefill"))
             decode_floor_on_prefill = true;
         else if (!strcmp(argv[i], "--grant-lifetime") && i + 1 < argc) {
@@ -599,11 +612,11 @@ int main(int argc, char **argv)
     if (use_scx) { fprintf(stderr, "host build has no BPF support\n"); fatal = true; goto out; }
 #endif
     printf("READY socket=%s mode=%s lifetime=%s allocation=%s decode_wait_ms=%" PRIu64
-           " decode_floor_on_prefill=%d scx=%d pid=%d\n", socket_path, mode,
+           " decode_floor_on_prefill=%d scx=%d slice_ms=%" PRIu64 " pid=%d\n", socket_path, mode,
            lifetime == DT_PERSISTENT ? "persistent" : "graph",
            allocation == DT_PREFILL_FIRST ? "prefill-first" : "equal",
            allocation == DT_PREFILL_FIRST ? decode_wait_budget_ns / 1000000 : 0,
-           decode_floor_on_prefill, use_scx, getpid());
+           decode_floor_on_prefill, use_scx, slice_ns / 1000000, getpid());
     bool stopping = false;
     while (!fatal && !stopping) {
         struct epoll_event ev[3 + 2 * DT_TEAMS];
