@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
 # Export only this experiment's llama.cpp delta relative to the original dirty tree.
 set -eu
 

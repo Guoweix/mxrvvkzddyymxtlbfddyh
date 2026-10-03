@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
 # x86 demo 配置：指向 demo 内的二进制与 runtime（相对 demo 根目录）。
 # 唯一需要按环境修改的是模型路径 DT_X86_MODEL。
 

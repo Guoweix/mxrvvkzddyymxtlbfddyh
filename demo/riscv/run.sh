@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0
 # RISC-V 功能验证：无需源码/编译，直接用 demo/riscv/bin 的二进制部署到板端。
 # 前置：板端已挂载 bpffs（mount -t bpf bpf /sys/fs/bpf）。
 set -euo pipefail

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Partial returns retain ownership; stale targets never authorize overlap."""
 import unittest
 

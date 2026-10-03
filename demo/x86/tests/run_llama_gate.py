@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Validate dynamic worker grants with two real llama-server processes on the board."""
 import argparse
 import concurrent.futures

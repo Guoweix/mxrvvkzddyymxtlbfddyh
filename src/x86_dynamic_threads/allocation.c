@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #include "allocation.h"
 
 #define X86_LANE_PRIMARY 0x0fULL

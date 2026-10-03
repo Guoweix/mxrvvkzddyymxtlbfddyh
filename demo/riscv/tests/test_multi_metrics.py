@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
 import unittest
 
 from multi_workload import calculate_metrics

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Strict prefill priority, safe phase handoffs and real runtime boundary tests."""
 
 import csv

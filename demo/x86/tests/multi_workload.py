@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """One request per independent llama server, with paired two-wave arrivals."""
 import argparse
 import json

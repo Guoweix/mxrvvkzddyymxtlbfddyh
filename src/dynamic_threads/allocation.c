@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #include "allocation.h"
 
 void dt_allocate(const struct dt_demand *in, struct dt_target *out, size_t count,

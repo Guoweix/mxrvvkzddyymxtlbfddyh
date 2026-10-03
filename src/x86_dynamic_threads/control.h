@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* Local SOCK_SEQPACKET protocol. Fixed-width, native-endian on one machine. */
 #ifndef DT_CONTROL_H
 #define DT_CONTROL_H

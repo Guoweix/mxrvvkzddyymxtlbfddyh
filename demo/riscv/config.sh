@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
 # RISC-V demo 配置：demo 内的二进制 + runtime（相对 demo 根目录）。
 # 板端连接按环境修改。
 

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* Deterministic socket backpressure and client notification/reply interleaving. */
 #define DT_NO_BPF
 #define main dt_controller_main

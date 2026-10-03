@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Isolated 2/4/8-process experiments; each llama server handles one request."""
 import argparse
 import csv

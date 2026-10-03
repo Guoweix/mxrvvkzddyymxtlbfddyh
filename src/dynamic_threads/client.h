@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef DT_CLIENT_H
 #define DT_CLIENT_H
 #include "control.h"

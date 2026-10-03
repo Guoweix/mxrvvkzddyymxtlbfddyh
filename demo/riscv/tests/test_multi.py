@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
 """Real socket peers and OpenMP runtimes exercising multi-process ownership."""
 
 import os

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Metric calculations shared by the dual-model report and unit tests."""
 
 import math

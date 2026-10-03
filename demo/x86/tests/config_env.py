@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
 """Single source of truth for board/paths: reads tests/config.sh.
 
 Lookup order is: process environment -> tests/config.sh -> fallback.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
 # 统一从 tests/config.sh 取配置（环境变量优先）；其中相对路径以仓库根为基准。
 CFG := ../../tests/config.sh
 REPO := ../..

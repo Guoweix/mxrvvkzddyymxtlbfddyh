@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0
 # x86 功能验证：无需源码/编译，直接用 demo/x86/bin 的二进制。
 # 1) 启动 dt_controller（dynamic + sched_ext + persistent）
 # 2) 运行 dt_persistent_probe

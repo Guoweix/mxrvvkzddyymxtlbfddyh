@@ -1,0 +1,32 @@
+INFERSCHED — 面向 RISC-V 的 LLM 推理调度器
+Copyright (C) 2026 the INFERSCHED authors
+
+本仓库是一个「混合许可证」作品：它整合、打补丁、链接并再分发了多个上游项目，
+每个上游项目遵循各自的许可证。因此不存在一个覆盖全部文件的单一许可证。
+
+默认许可证
+----------
+除文件头部另有 `SPDX-License-Identifier` 声明外，本项目原创代码采用
+GNU General Public License, version 2 only（SPDX：`GPL-2.0-only`），
+全文见 `LICENSES/GPL-2.0-only.txt`。
+
+  关于本仓库使用的 SPDX 标识：`GPL-2.0` 是 `GPL-2.0-only` 的已弃用别名，
+  二者表示同一许可证。
+
+其他许可证的文件
+----------------
+派生自上游项目、或需要与上游/内核混合使用的文件，保留其上游许可证，
+以文件自身的 SPDX 标识为准：
+
+  - llama.cpp 用户态补丁与新增文件 ................ MIT
+  - 共享 ABI 头文件（scx-rvv-lease-control.h 等） .. GPL-2.0 OR MIT
+  - libbpf 生成的骨架（*.skel.h） .................. LGPL-2.1 OR BSD-2-Clause
+  - src/rvv_sched_cost/* ........................... GPL-2.0 OR BSD-2-Clause
+  - MIT 测试辅助（worker_probe.c、test_hint_client.c） MIT
+
+第三方组件
+----------
+上游组件、版本/基线提交、版权人与许可证正文见 `THIRD_PARTY_NOTICES.md`；
+项目级摘要见 `README.md` 的「上游项目与许可证」一节。
+
+在适用法律允许的最大范围内，本软件不提供任何担保（NO WARRANTY）。

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Board test: eight actual runtime/OpenMP clients under sched_ext."""
 import csv
 import datetime

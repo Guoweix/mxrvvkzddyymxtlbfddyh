@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Compare CFS and the dynamic controller with N t4 llama-server teams on x86.
 
 N is 3 or 4 (12/16 workers on 8 SMT logical CPUs -> scheduling-induced

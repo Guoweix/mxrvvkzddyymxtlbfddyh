@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Decode wait -> sticky floor, graph-boundary ownership, and readiness timing."""
 import time
 import unittest

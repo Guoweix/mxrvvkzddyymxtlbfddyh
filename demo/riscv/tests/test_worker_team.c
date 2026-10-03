@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* Real OpenMP + affinity syscalls; only the protocol endpoint is stubbed.
  * Count actual sched_setaffinity calls, including redundant singleton pins. */
 #define _GNU_SOURCE

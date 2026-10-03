@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* Exercise the exact llama runtime adapter with real persistent OpenMP teams. */
 #define _GNU_SOURCE
 #include "dynamic-grant-client.h"

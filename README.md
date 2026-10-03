@@ -551,6 +551,11 @@ Aggregate TPS、逐请求 TTFT、pooled p95 TTFT 和上下文切换。
 - sched_ext 内核发布：<https://github.com/sched-ext/scx-kernel-releases>
 - llama.cpp：<https://github.com/ggerganov/llama.cpp>
 
+本项目为**混合许可证**作品：默认许可证为 `GPL-2.0-only`，其余文件以上游许可证或
+文件头部 `SPDX-License-Identifier` 标识为准。顶层声明见 [`LICENSE`](LICENSE)，
+第三方组件、版本/基线与版权人见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)，
+许可证正文见 [`LICENSES/`](LICENSES/)。
+
 内核补丁遵循 Linux 内核 GPL-2.0-only 许可证。llama.cpp 修改遵循上游 MIT
 License，共享 ABI 头文件使用 `GPL-2.0 OR MIT`。`scx_llm_pin` BPF 调度器和 loader
 使用 GPL-2.0，`rvv_sched_cost` 各文件的许可证以其 SPDX 标识为准。补丁来源、版权

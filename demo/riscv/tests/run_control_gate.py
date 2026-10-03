@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Build and validate the event-driven controller on the target board."""
 
 import argparse

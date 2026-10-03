@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef DT_ALLOCATION_H
 #define DT_ALLOCATION_H
 #include <stdbool.h>

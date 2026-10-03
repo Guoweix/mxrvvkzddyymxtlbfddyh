@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Run the deterministic dual-model workload on the local x86 host with the
 dynamic_threads controller (baseline / dynamic / dynamic-phase)."""
 
