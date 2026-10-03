@@ -52,6 +52,25 @@ cd demo/riscv/tests && sudo -n python3 run_control_gate.py \
     --decode-wait-ms 0 --decode-floor-on-prefill --iterations 200
 ```
 
+## 统一 benchmark（仅用 demo 二进制）
+
+`tests/benchmark` 的默认路径已指向本 demo，**无需源码或 `experiments/`**：
+
+```bash
+# x86 本机（需 root 加载 sched_ext）
+sudo python3 tests/benchmark/benchmark.py --local --scenario dual-sync \
+    --strategy x86-dynamic --concurrency 2 --output-tokens 16
+
+# RISC-V 板端（默认从 tests/config.sh 读板卡信息）
+python3 tests/benchmark/benchmark.py --scenario dual-sync \
+    --strategy dynamic --concurrency 2 --output-tokens 16
+```
+
+`dynamic` 使用 `demo/riscv/{bin,runtime}`，`x86-dynamic` 使用
+`demo/x86/{bin,runtime}`；可用 `--dynamic-controller/--dynamic-runtime-bin` 与
+`--x86-dynamic-controller/--x86-runtime-bin` 覆盖。demo 内的二进制由提交仓库
+`src/` 构建，二者逐字节一致。
+
 ## 说明
 
 - 二进制为对应架构的最终构建产物；`tests/` 内的 runner 已指向本 demo 的

@@ -27,13 +27,18 @@ DEFAULT_CONFIG_SH = SCRIPT_DIR.parent / "config.sh"
 DEFAULT_MODEL_FILENAME = "Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 # Submission repo layout: this file lives at <repo>/tests/benchmark.
 REPO_DIR = SCRIPT_DIR.parent.parent
-# Patched llama runtimes live in the sibling working repository (as tests/config.sh does).
+# Prebuilt, self-contained demo artifacts (see demo/README.md). The benchmark
+# defaults to these so that "benchmark + demo" runs without any source tree.
+DEMO_DIR = REPO_DIR / "demo"
+DYNAMIC_RUNTIME_BIN = DEMO_DIR / "riscv" / "runtime"
+DYNAMIC_CONTROLLER = DEMO_DIR / "riscv" / "bin" / "dt_controller"
+# Patched llama runtimes in the sibling working repository (dev tree).
 WORK_DIR = REPO_DIR.parent / "experiments"
 DYNAMIC_DIR = WORK_DIR / "dynamic_threads"
 SCX_DIR = REPO_DIR / "src" / "scx_llm_pin"
-X86_RUNTIME_BIN = WORK_DIR / "x86_dynamic_threads" / "llama" / "build-x86" / "bin"
+X86_RUNTIME_BIN = DEMO_DIR / "x86" / "runtime"
 X86_MODEL = REPO_DIR.parent / "riscv-linux" / "host-share" / DEFAULT_MODEL_FILENAME
-X86_DYNAMIC_CONTROLLER = REPO_DIR / "src" / "x86_dynamic_threads" / "build" / "dt_controller"
+X86_DYNAMIC_CONTROLLER = DEMO_DIR / "x86" / "bin" / "dt_controller"
 X86_SCX_LLM_BIN = REPO_DIR / "src" / "x86_scx_llm_pin" / "x86_scx_llm"
 
 CONFIG_SH_KEYS = {
@@ -141,12 +146,12 @@ def build_parser():
     dynamic = parser.add_argument_group("dynamic strategy")
     dynamic.add_argument(
         "--dynamic-runtime-bin",
-        default=str(DYNAMIC_DIR / "llama.cpp" / "build-dynamic-riscv" / "bin"),
+        default=str(DYNAMIC_RUNTIME_BIN),
         help="local patched llama-server runtime directory to deploy",
     )
     dynamic.add_argument(
         "--dynamic-controller",
-        default=str(DYNAMIC_DIR / "build" / "dt_controller"),
+        default=str(DYNAMIC_CONTROLLER),
         help="local dt_controller binary to deploy",
     )
     dynamic.add_argument("--dynamic-mode", default="dynamic")
